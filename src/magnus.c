@@ -1,5 +1,6 @@
 #include "magnus_phase.h"
 #include "magnus_http.h"
+#include "magnus_policy.h"
 #include "magnus_proxy.h"
 
 #include <arpa/inet.h>
@@ -34,6 +35,11 @@
 #define MAGNUS_PROXY_READ_TIMEOUT_SECONDS 10
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
+#define MAGNUS_PROXY_MAX_ATTEMPTS 2
+#define MAGNUS_HEALTH_CHECK_INTERVAL_SECONDS 5
+#define MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS 2
+#define MAGNUS_CLUSTER_FAILURE_THRESHOLD 3
+#define MAGNUS_CLUSTER_COOLDOWN_MS 5000
 
 typedef struct {
     int fd;
@@ -72,6 +78,8 @@ typedef struct {
     char proxy_request_id[33];
     time_t proxy_connect_started;
     time_t proxy_last_activity;
+    size_t proxy_endpoint_index;
+    unsigned proxy_attempt;
     time_t last_active;
 } magnus_connection_t;
 
@@ -80,9 +88,17 @@ static magnus_phase_engine_t magnus_phases;
 static magnus_connection_t *magnus_connections[MAGNUS_MAX_FDS];
 static int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
-static struct sockaddr_in magnus_upstream_address;
+static magnus_cluster_t magnus_cluster;
 static bool magnus_upstream_enabled;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
+/* Health-probe fds share the same epoll_fd as client/upstream connections.
+ * Index i+1 (0 means "not a probe fd") names the cluster endpoint a given
+ * fd is probing, so the main dispatch loop can route its events here
+ * instead of treating it as client or proxied-upstream traffic. */
+static int magnus_health_probe_owner[MAGNUS_MAX_FDS];
+static int magnus_health_probe_fd[MAGNUS_MAX_UPSTREAMS];
+static time_t magnus_health_probe_started[MAGNUS_MAX_UPSTREAMS];
+static time_t magnus_health_last_probe[MAGNUS_MAX_UPSTREAMS];
 static uint64_t magnus_connections_total;
 static uint64_t magnus_connections_active;
 static uint64_t magnus_requests_total;
@@ -101,6 +117,10 @@ static void magnus_prepare_response(magnus_connection_t *connection,
                                     bool head_only, bool close_connection,
                                     magnus_request_t *request);
 static char *magnus_find_header_end(char *buffer, size_t length);
+static uint64_t magnus_now_ms(void);
+static int magnus_proxy_pick_and_start(int epoll_fd,
+                                       magnus_connection_t *connection,
+                                       const magnus_request_t *request);
 
 static void
 magnus_signal_handler(int signal_number)
@@ -162,30 +182,53 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection);
 }
 
-static int
-magnus_start_proxy(int epoll_fd, magnus_connection_t *connection,
-                   const magnus_request_t *request)
+static uint64_t
+magnus_now_ms(void)
 {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000 + (uint64_t) now.tv_nsec / 1000000;
+}
+
+static bool
+magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
+{
+    if (index >= magnus_cluster.count) return false;
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port = htons((uint16_t) magnus_cluster.endpoints[index].port);
+    return inet_pton(AF_INET, magnus_cluster.endpoints[index].address,
+                     &out->sin_addr) == 1;
+}
+
+/* Opens a non-blocking connect() to cluster endpoint `endpoint_index`,
+ * reusing connection->proxy_request (already built by the caller) and
+ * (re)allocating connection->proxy_buffer if needed, and registers the
+ * socket with epoll. Resets every per-attempt proxy_* field, so this is
+ * safe to call again for a retry once the previous attempt's upstream has
+ * been torn down via magnus_proxy_teardown_upstream(). Returns 0 once the
+ * attempt is in flight, -1 on immediate failure (the caller records the
+ * failure and decides whether to retry or give up). */
+static int
+magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
+                              size_t endpoint_index)
+{
+    struct sockaddr_in address;
     struct epoll_event event;
     int result;
-    int written;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0 || fd >= MAGNUS_MAX_FDS
-        || (connection->proxy_buffer = malloc(MAGNUS_PROXY_BUFFER)) == NULL) {
+    int fd;
+
+    if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
+    if (connection->proxy_buffer == NULL) {
+        connection->proxy_buffer = malloc(MAGNUS_PROXY_BUFFER);
+        if (connection->proxy_buffer == NULL) return -1;
+    }
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
         if (fd >= 0) close(fd);
         return -1;
     }
-    written = snprintf(connection->proxy_request,
-                       sizeof(connection->proxy_request),
-                       "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                       "Connection: close\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-                       request->method, request->path + 6, request->request_id);
-    if (written < 0 || (size_t) written >= sizeof(connection->proxy_request)) {
-        close(fd);
-        return -1;
-    }
-    result = connect(fd, (struct sockaddr *) &magnus_upstream_address,
-                     sizeof(magnus_upstream_address));
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
     if (result < 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
@@ -193,15 +236,16 @@ magnus_start_proxy(int epoll_fd, magnus_connection_t *connection,
     connection->upstream_fd = fd;
     connection->proxy_active = true;
     connection->proxy_connected = result == 0;
-    connection->proxy_request_length = (size_t) written;
-    connection->close_after_write = true;
+    connection->proxy_request_sent = 0;
+    connection->proxy_headers_sent = false;
     connection->proxy_headers_received = false;
     connection->proxy_header_accum = 0;
+    connection->proxy_eof = false;
     connection->proxy_response_started = false;
+    connection->proxy_endpoint_index = endpoint_index;
     connection->proxy_connect_started = time(NULL);
     connection->proxy_last_activity = connection->proxy_connect_started;
-    memcpy(connection->proxy_request_id, request->request_id,
-          sizeof(connection->proxy_request_id));
+    connection->close_after_write = true;
     magnus_upstream_owner[fd] = connection;
     event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
                                    .data.fd = fd };
@@ -212,7 +256,47 @@ magnus_start_proxy(int epoll_fd, magnus_connection_t *connection,
         connection->proxy_active = false;
         return -1;
     }
-    return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
+    return 0;
+}
+
+/* Builds the outbound proxy request once, then selects a healthy cluster
+ * endpoint (smooth weighted round-robin, skipping endpoints still in their
+ * passive-health cooldown) and connects to it, retrying against a
+ * different endpoint -- up to MAGNUS_PROXY_MAX_ATTEMPTS total attempts --
+ * if the connect itself fails immediately. Returns 0 if an attempt is now
+ * in flight (client interest already updated to watch for abort), -1 if no
+ * healthy endpoint was available or the retry budget was exhausted. */
+static int
+magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
+                            const magnus_request_t *request)
+{
+    int written;
+
+    written = snprintf(connection->proxy_request,
+                       sizeof(connection->proxy_request),
+                       "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                       "Connection: close\r\nX-Magnus-Request-Id: %s\r\n\r\n",
+                       request->method, request->path + 6, request->request_id);
+    if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
+        return -1;
+    connection->proxy_request_length = (size_t) written;
+    memcpy(connection->proxy_request_id, request->request_id,
+          sizeof(connection->proxy_request_id));
+    connection->proxy_attempt = 0;
+
+    for (;;) {
+        int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
+                                             NULL);
+        if (endpoint < 0) return -1;
+        connection->proxy_attempt++;
+        if (magnus_proxy_connect_endpoint(epoll_fd, connection,
+                                          (size_t) endpoint) == 0) {
+            return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
+        }
+        magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                              magnus_now_ms());
+        if (connection->proxy_attempt >= MAGNUS_PROXY_MAX_ATTEMPTS) return -1;
+    }
 }
 
 static void
@@ -263,6 +347,39 @@ magnus_proxy_abort(int epoll_fd, magnus_connection_t *connection)
 {
     magnus_proxy_teardown_upstream(epoll_fd, connection);
     return -1;
+}
+
+/* Records a connect-stage failure for the endpoint currently in flight and
+ * either retries against a different healthy endpoint -- bounded by
+ * MAGNUS_PROXY_MAX_ATTEMPTS total attempts -- or gives up with a clean
+ * status-coded error. Must only be called while
+ * connection->proxy_response_started is still false: a connect-stage
+ * failure by definition means no response bytes have reached the client
+ * yet, so retrying (or eventually failing cleanly) is always safe here. */
+static int
+magnus_proxy_connect_failed(int epoll_fd, magnus_connection_t *connection,
+                            unsigned give_up_status,
+                            const char *give_up_reason)
+{
+    magnus_cluster_result(&magnus_cluster, connection->proxy_endpoint_index,
+                          false, magnus_now_ms());
+    magnus_proxy_teardown_upstream(epoll_fd, connection);
+    if (connection->proxy_attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
+        int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
+                                             NULL);
+        if (endpoint >= 0) {
+            connection->proxy_attempt++;
+            if (magnus_proxy_connect_endpoint(epoll_fd, connection,
+                                              (size_t) endpoint) == 0) {
+                return magnus_update_interest(epoll_fd, connection,
+                                              EPOLLRDHUP);
+            }
+            magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                                  magnus_now_ms());
+        }
+    }
+    return magnus_proxy_fail(epoll_fd, connection, give_up_status,
+                             give_up_reason);
 }
 
 static int
@@ -338,7 +455,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     unsigned upstream_status;
     int sanitized_length;
 
-    for (;;) {
+    while (connection->proxy_header_accum < MAGNUS_PROXY_BUFFER) {
         ssize_t received = recv(connection->upstream_fd,
             connection->proxy_buffer + connection->proxy_header_accum,
             MAGNUS_PROXY_BUFFER - connection->proxy_header_accum, 0);
@@ -346,6 +463,20 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             connection->proxy_header_accum += (size_t) received;
             connection->last_active = time(NULL);
             connection->proxy_last_activity = connection->last_active;
+            /* Stop as soon as the header block is complete instead of
+             * greedily draining the socket: for a fast/bursty upstream
+             * (the whole response already sitting in the kernel receive
+             * buffer) that avoids reading all the way up to
+             * MAGNUS_PROXY_BUFFER, which would otherwise make the next
+             * recv() request zero bytes -- and recv() with length 0
+             * legitimately returns 0, indistinguishable here from a real
+             * peer close, which would misreport upstream EOF and truncate
+             * the response. Any body bytes left unread simply stay in the
+             * kernel buffer for the normal body-relay path to pick up. */
+            if (magnus_find_header_end(connection->proxy_buffer,
+                                       connection->proxy_header_accum) != NULL) {
+                break;
+            }
             continue;
         }
         if (received == 0) {
@@ -354,33 +485,39 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
         }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
     }
 
     body_start = magnus_find_header_end(connection->proxy_buffer,
                                         connection->proxy_header_accum);
     if (body_start == NULL) {
         if (connection->proxy_eof)
-            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
         if (connection->proxy_header_accum == MAGNUS_PROXY_BUFFER)
-            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
         return 1;
     }
 
     header_length = (size_t) (body_start - connection->proxy_buffer);
     leftover = connection->proxy_header_accum - header_length;
     if (header_length > MAGNUS_PROXY_HEADER_LIMIT)
-        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
     memcpy(header_copy, connection->proxy_buffer, header_length);
     header_copy[header_length] = '\0';
     sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
         header_length, sanitized, sizeof(sanitized), &upstream_status);
     if (sanitized_length < 0)
-        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
 
     connection->proxy_header_out = malloc((size_t) sanitized_length);
     if (connection->proxy_header_out == NULL)
-        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
     memcpy(connection->proxy_header_out, sanitized, (size_t) sanitized_length);
     connection->proxy_header_out_length = (size_t) sanitized_length;
     connection->proxy_header_out_sent = 0;
@@ -388,6 +525,8 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     connection->proxy_buffer_length = leftover;
     connection->proxy_buffer_sent = 0;
     connection->proxy_headers_received = true;
+    magnus_cluster_result(&magnus_cluster, connection->proxy_endpoint_index,
+                          true, magnus_now_ms());
     magnus_requests_total++;
     if (upstream_status >= 500) magnus_responses_5xx++;
     else if (upstream_status >= 400) magnus_responses_4xx++;
@@ -402,14 +541,16 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
     if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
         if (connection->proxy_response_started)
             return magnus_proxy_abort(epoll_fd, connection);
-        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                           "Bad Gateway");
     }
     if (!connection->proxy_connected) {
         int error = 0;
         socklen_t length = sizeof(error);
         if (getsockopt(connection->upstream_fd, SOL_SOCKET, SO_ERROR,
                        &error, &length) < 0 || error != 0)
-            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
         connection->proxy_connected = true;
         connection->proxy_last_activity = time(NULL);
     }
@@ -426,7 +567,8 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
         } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return 0;
         } else {
-            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
         }
         if (connection->proxy_request_sent == connection->proxy_request_length)
             connection->proxy_headers_sent = true;
@@ -707,8 +849,18 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
                                 "magnus: ok\n", head_only, close_connection,
                                 &request);
     } else if (strcmp(request.path, "/metrics") == 0) {
-        char metrics[768];
-        snprintf(metrics, sizeof(metrics),
+        /* Sized to stay well clear of MAGNUS_OUTPUT_LIMIT once wrapped in
+         * response headers; the per-endpoint loop below stops appending
+         * once it runs out of room rather than risk overflowing the
+         * response envelope, so the fixed aggregate lines are always
+         * present even for a cluster too large to fully detail here. */
+        char metrics[700];
+        size_t written;
+        size_t healthy = 0;
+        for (size_t index = 0; index < magnus_cluster.count; index++) {
+            if (magnus_cluster.endpoints[index].healthy) healthy++;
+        }
+        written = (size_t) snprintf(metrics, sizeof(metrics),
             "# TYPE magnus_connections_total counter\n"
             "magnus_connections_total %llu\n"
             "# TYPE magnus_connections_active gauge\n"
@@ -717,20 +869,34 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
             "magnus_requests_total %llu\n"
             "magnus_responses_4xx_total %llu\n"
             "magnus_responses_5xx_total %llu\n"
-            "magnus_bytes_sent_total %llu\n",
+            "magnus_bytes_sent_total %llu\n"
+            "# TYPE magnus_upstream_endpoints gauge\n"
+            "magnus_upstream_endpoints_total %zu\n"
+            "magnus_upstream_endpoints_healthy %zu\n",
             (unsigned long long) magnus_connections_total,
             (unsigned long long) magnus_connections_active,
             (unsigned long long) magnus_requests_total,
             (unsigned long long) magnus_responses_4xx,
             (unsigned long long) magnus_responses_5xx,
-            (unsigned long long) magnus_bytes_sent);
+            (unsigned long long) magnus_bytes_sent,
+            magnus_cluster.count, healthy);
+        for (size_t index = 0; index < magnus_cluster.count
+             && written < sizeof(metrics); index++) {
+            int line = snprintf(metrics + written, sizeof(metrics) - written,
+                "magnus_upstream_healthy{endpoint=\"%s:%u\"} %d\n",
+                magnus_cluster.endpoints[index].address,
+                magnus_cluster.endpoints[index].port,
+                magnus_cluster.endpoints[index].healthy ? 1 : 0);
+            if (line < 0 || (size_t) line >= sizeof(metrics) - written) break;
+            written += (size_t) line;
+        }
         magnus_prepare_response(connection, 200, "OK",
                                 "text/plain; version=0.0.4", metrics,
                                 head_only, close_connection, &request);
     } else if (magnus_upstream_enabled
                && strncmp(request.path, "/proxy", 6) == 0
                && (request.path[6] == '/' || request.path[6] == '\0')) {
-        if (magnus_start_proxy(epoll_fd, connection, &request) == 0) {
+        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request) == 0) {
             fprintf(stderr,
                     "access request_id=%s method=%s target=%s status=proxy\n",
                     request.request_id, request.method, request.path);
@@ -997,7 +1163,15 @@ magnus_expire_idle(int epoll_fd, time_t now)
  * (or a stalled write to a slow client while relaying) is reported as 504
  * after MAGNUS_PROXY_READ_TIMEOUT_SECONDS of proxy inactivity. Once
  * response bytes have already reached the client a clean status can no
- * longer be sent, so the connection is aborted instead. */
+ * longer be sent, so the connection is aborted instead.
+ *
+ * Only the connect-stage timeout retries against a different endpoint: a
+ * connect() that never completed is exactly the "try elsewhere" case a
+ * retry budget exists for. A connected-but-silent upstream is deliberately
+ * NOT retried here -- the endpoint already accepted the connection, so
+ * retrying would only double the wait (another full read timeout) without
+ * addressing a slow responder, which is precisely the retry-storm/tail-
+ * latency amplification the retry budget must avoid. */
 static void
 magnus_expire_proxies(int epoll_fd, time_t now)
 {
@@ -1009,19 +1183,119 @@ magnus_expire_proxies(int epoll_fd, time_t now)
         if (!connection->proxy_connected) {
             if (now - connection->proxy_connect_started
                 < MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS) continue;
-            result = magnus_proxy_fail(epoll_fd, connection, 504,
-                                       "Gateway Timeout");
+            result = magnus_proxy_connect_failed(epoll_fd, connection, 504,
+                                                 "Gateway Timeout");
         } else if (now - connection->proxy_last_activity
                    >= MAGNUS_PROXY_READ_TIMEOUT_SECONDS) {
-            result = connection->proxy_response_started
-                ? magnus_proxy_abort(epoll_fd, connection)
-                : magnus_proxy_fail(epoll_fd, connection, 504,
-                                    "Gateway Timeout");
+            if (connection->proxy_response_started) {
+                result = magnus_proxy_abort(epoll_fd, connection);
+            } else {
+                /* still counts as a passive-health failure even though we
+                 * do not retry this request against another endpoint. */
+                magnus_cluster_result(&magnus_cluster,
+                                      connection->proxy_endpoint_index, false,
+                                      magnus_now_ms());
+                result = magnus_proxy_fail(epoll_fd, connection, 504,
+                                           "Gateway Timeout");
+            }
         } else {
             continue;
         }
         if (result < 0 && magnus_connections[connection->fd] != NULL) {
             magnus_close_connection(epoll_fd, connection);
+        }
+    }
+}
+
+/* Active health checking: independent of live traffic, periodically opens
+ * a bare non-blocking TCP connect() to each cluster endpoint and feeds the
+ * outcome into the same magnus_cluster_result() passive-health state that
+ * real proxy traffic feeds, so an endpoint can be found (and recover) even
+ * while it is receiving no requests at all. */
+
+static void
+magnus_health_close_probe(int epoll_fd, size_t index)
+{
+    int fd = magnus_health_probe_fd[index];
+    if (fd < 0) return;
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    magnus_health_probe_owner[fd] = 0;
+    close(fd);
+    magnus_health_probe_fd[index] = -1;
+}
+
+static void
+magnus_health_start_probe(int epoll_fd, size_t index, time_t now)
+{
+    struct sockaddr_in address;
+    struct epoll_event event;
+    int fd;
+    int result;
+
+    if (!magnus_endpoint_sockaddr(index, &address)) return;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        magnus_cluster_result(&magnus_cluster, index, false, magnus_now_ms());
+        return;
+    }
+    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
+                                   .data.fd = fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        close(fd);
+        return;
+    }
+    magnus_health_probe_fd[index] = fd;
+    magnus_health_probe_owner[fd] = (int) (index + 1);
+    magnus_health_probe_started[index] = now;
+    if (result == 0) {
+        /* connected synchronously (typical for loopback/LAN targets):
+         * resolve immediately instead of waiting on an epoll event that a
+         * level-triggered, already-satisfied condition may not re-deliver. */
+        magnus_cluster_result(&magnus_cluster, index, true, magnus_now_ms());
+        magnus_health_close_probe(epoll_fd, index);
+    }
+}
+
+static void
+magnus_health_handle_probe(int epoll_fd, size_t index, uint32_t flags)
+{
+    int fd = magnus_health_probe_fd[index];
+    bool success = false;
+    if (fd < 0) return;
+    if ((flags & (EPOLLERR | EPOLLHUP)) == 0) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        success = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0
+                   && error == 0;
+    }
+    magnus_cluster_result(&magnus_cluster, index, success, magnus_now_ms());
+    magnus_health_close_probe(epoll_fd, index);
+}
+
+static void
+magnus_health_tick(int epoll_fd, time_t now)
+{
+    size_t index;
+    for (index = 0; index < magnus_cluster.count; index++) {
+        if (magnus_health_probe_fd[index] >= 0) {
+            if (now - magnus_health_probe_started[index]
+                >= MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS) {
+                magnus_cluster_result(&magnus_cluster, index, false,
+                                      magnus_now_ms());
+                magnus_health_close_probe(epoll_fd, index);
+            }
+            continue;
+        }
+        if (now - magnus_health_last_probe[index]
+            >= MAGNUS_HEALTH_CHECK_INTERVAL_SECONDS) {
+            magnus_health_last_probe[index] = now;
+            magnus_health_start_probe(epoll_fd, index, now);
         }
     }
 }
@@ -1064,6 +1338,8 @@ magnus_parse_options(int argc, char **argv)
     }
     const char *certificate = NULL;
     const char *private_key = NULL;
+    magnus_cluster_init(&magnus_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS);
     for (index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) break;
         if (strcmp(argv[index], "--port") == 0) {
@@ -1086,23 +1362,36 @@ magnus_parse_options(int argc, char **argv)
         } else if (strcmp(argv[index], "--tls-key") == 0) {
             private_key = argv[index + 1];
         } else if (strcmp(argv[index], "--upstream") == 0) {
-            char address[64];
-            char *separator;
+            /* host:port or host:port:weight; repeatable to build a cluster. */
+            char spec[80];
+            char *saveptr = NULL;
+            char *address;
+            char *port_text;
+            char *weight_text;
             char *end;
             unsigned long upstream_port;
-            if (strlen(argv[index + 1]) >= sizeof(address)) break;
-            strcpy(address, argv[index + 1]);
-            separator = strrchr(address, ':');
-            if (separator == NULL) break;
-            *separator++ = '\0';
+            unsigned long weight = 1;
+            struct in_addr probe;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
+            strcpy(spec, argv[index + 1]);
+            address = strtok_r(spec, ":", &saveptr);
+            port_text = strtok_r(NULL, ":", &saveptr);
+            weight_text = strtok_r(NULL, ":", &saveptr);
+            if (address == NULL || port_text == NULL
+                || inet_pton(AF_INET, address, &probe) != 1) break;
             errno = 0;
-            upstream_port = strtoul(separator, &end, 10);
+            upstream_port = strtoul(port_text, &end, 10);
             if (errno != 0 || *end != '\0' || upstream_port == 0
-                || upstream_port > 65535
-                || inet_pton(AF_INET, address,
-                             &magnus_upstream_address.sin_addr) != 1) break;
-            magnus_upstream_address.sin_family = AF_INET;
-            magnus_upstream_address.sin_port = htons((uint16_t) upstream_port);
+                || upstream_port > 65535) break;
+            if (weight_text != NULL) {
+                errno = 0;
+                weight = strtoul(weight_text, &end, 10);
+                if (errno != 0 || *end != '\0' || weight == 0
+                    || weight > 1000) break;
+            }
+            if (magnus_cluster_add(&magnus_cluster, address,
+                                   (unsigned) upstream_port,
+                                   (unsigned) weight) != 0) break;
             magnus_upstream_enabled = true;
         } else {
             break;
@@ -1130,7 +1419,7 @@ magnus_parse_options(int argc, char **argv)
     }
     fprintf(stderr, "usage: %s --port <1-65535> [--root <directory>] "
                     "[--tls-cert <pem> --tls-key <pem>] "
-                    "[--upstream <ipv4:port>] | --version\n",
+                    "[--upstream <ipv4:port[:weight]> ...] | --version\n",
             argv[0]);
     exit(2);
 }
@@ -1173,6 +1462,9 @@ main(int argc, char **argv)
     signal(SIGINT, magnus_signal_handler);
     signal(SIGTERM, magnus_signal_handler);
     signal(SIGPIPE, SIG_IGN);
+    for (size_t index = 0; index < MAGNUS_MAX_UPSTREAMS; index++) {
+        magnus_health_probe_fd[index] = -1;
+    }
     fprintf(stderr, "magnus: native engine listening on 0.0.0.0:%u\n", port);
 
     while (magnus_running) {
@@ -1204,6 +1496,12 @@ main(int argc, char **argv)
                     magnus_close_connection(epoll_fd, connection);
                 continue;
             }
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_health_probe_owner[fd] != 0) {
+                magnus_health_handle_probe(epoll_fd,
+                    (size_t) (magnus_health_probe_owner[fd] - 1), flags);
+                continue;
+            }
             if (fd < 0 || fd >= MAGNUS_MAX_FDS
                 || (connection = magnus_connections[fd]) == NULL) {
                 continue;
@@ -1230,6 +1528,7 @@ main(int argc, char **argv)
         if (now != last_sweep) {
             magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
+            magnus_health_tick(epoll_fd, now);
             last_sweep = now;
         }
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[ -n "${TRACE:-}" ] && set -x
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary="$project_dir/build/magnus"
@@ -8,6 +9,11 @@ log=$(mktemp)
 web_root=$(mktemp -d)
 
 cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    cp "$log" /tmp/magnus-test-core-failure.log 2>/dev/null || true
+    echo "test-core.sh failed; magnus stderr preserved at /tmp/magnus-test-core-failure.log" >&2
+  fi
   if [ -n "${server_pid:-}" ]; then
     kill -TERM "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" 2>/dev/null || true
@@ -15,6 +21,10 @@ cleanup() {
   if [ -n "${backend_pid:-}" ]; then
     kill -TERM "$backend_pid" >/dev/null 2>&1 || true
     wait "$backend_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend2_pid:-}" ]; then
+    kill -TERM "$backend2_pid" >/dev/null 2>&1 || true
+    wait "$backend2_pid" 2>/dev/null || true
   fi
   rm -f "$log"
   rm -rf "$web_root"
@@ -141,6 +151,124 @@ for attempt in 1 2 3 4 5; do
 done
 test "$(curl --silent --max-time 15 --output /dev/null --write-out '%{http_code}' \
   "http://127.0.0.1:$port_504/proxy/hello.txt")" = 504
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+
+# M3: multi-endpoint cluster -- smooth weighted round-robin (equal weight 1)
+# alternates strictly between two live endpoints, so two requests are enough
+# to prove both are actually reachable through the cluster, not just the
+# first one configured.
+mkdir -p "$web_root/cluster-a" "$web_root/cluster-b"
+printf '%s\n' 'endpoint-a' >"$web_root/cluster-a/id.txt"
+printf '%s\n' 'endpoint-b' >"$web_root/cluster-b/id.txt"
+upstream_a=$((port + 7))
+upstream_b=$((port + 8))
+python3 -m http.server "$upstream_a" --bind 127.0.0.1 \
+  --directory "$web_root/cluster-a" >/dev/null 2>&1 &
+backend_pid=$!
+python3 -m http.server "$upstream_b" --bind 127.0.0.1 \
+  --directory "$web_root/cluster-b" >/dev/null 2>&1 &
+backend2_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_a/id.txt" >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:$upstream_b/id.txt" >/dev/null \
+    && break
+  sleep 1
+done
+port_cluster=$((port + 9))
+"$binary" --port "$port_cluster" --root "$web_root/cluster-a" \
+  --upstream "127.0.0.1:$upstream_a" --upstream "127.0.0.1:$upstream_b" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_cluster/healthz" >/dev/null && break
+  sleep 1
+done
+curl --fail --silent "http://127.0.0.1:$port_cluster/metrics" \
+  | grep -Eq '^magnus_upstream_endpoints_total 2$'
+first_endpoint=$(curl --fail --silent "http://127.0.0.1:$port_cluster/proxy/id.txt")
+second_endpoint=$(curl --fail --silent "http://127.0.0.1:$port_cluster/proxy/id.txt")
+test "$first_endpoint" != "$second_endpoint"
+case "$first_endpoint" in endpoint-a|endpoint-b) : ;; *) exit 1 ;; esac
+case "$second_endpoint" in endpoint-a|endpoint-b) : ;; *) exit 1 ;; esac
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# M3: retry budget -- the first endpoint refuses every connection, so a
+# request must transparently retry against the second (live) endpoint and
+# still complete successfully instead of surfacing 502.
+port_retry=$((port + 10))
+dead_upstream=$((port + 11))
+"$binary" --port "$port_retry" --root "$web_root/cluster-a" \
+  --upstream "127.0.0.1:$dead_upstream" --upstream "127.0.0.1:$upstream_a" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_retry/healthz" >/dev/null && break
+  sleep 1
+done
+retried_ok=0
+for attempt in 1 2 3 4; do
+  code=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:$port_retry/proxy/id.txt")
+  test "$code" = 200 && retried_ok=$((retried_ok + 1))
+done
+test "$retried_ok" -ge 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$backend2_pid"
+wait "$backend2_pid" 2>/dev/null || true
+backend2_pid=
+
+# M3: active health check finds a dead endpoint, and recovers it, purely in
+# the background -- no proxy traffic is sent at all during this block, so
+# only the periodic probe (independent of live requests) can move the
+# metric.
+port_health=$((port + 12))
+probe_upstream=$((port + 13))
+"$binary" --port "$port_health" --root "$web_root/cluster-a" \
+  --upstream "127.0.0.1:$probe_upstream" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_health/healthz" >/dev/null && break
+  sleep 1
+done
+# three consecutive failed probes (~5s apart, failure_threshold=3) are
+# needed before the shared passive/active health state flips unhealthy --
+# give it comfortable margin over the ~11-15s that takes.
+unhealthy_seen=0
+for attempt in $(seq 1 18); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_health/metrics" \
+      | grep -Eq '^magnus_upstream_endpoints_healthy 0$'; then
+    unhealthy_seen=1
+    break
+  fi
+done
+test "$unhealthy_seen" = 1
+
+python3 -m http.server "$probe_upstream" --bind 127.0.0.1 \
+  --directory "$web_root/cluster-a" >/dev/null 2>&1 &
+backend_pid=$!
+recovered=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_health/metrics" \
+      | grep -Eq '^magnus_upstream_endpoints_healthy 1$'; then
+    recovered=1
+    break
+  fi
+done
+test "$recovered" = 1
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
