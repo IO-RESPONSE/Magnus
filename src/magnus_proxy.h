@@ -20,13 +20,17 @@ bool magnus_proxy_is_hop_by_hop(const char *name);
  * `raw` must be NUL-terminated and is mutated in place (tokenized).
  * `header_length` is the length of `raw` up to and including the trailing
  * blank line's CRLFCRLF. `out_status` receives the parsed upstream status
- * code on success.
+ * code on success. If `affinity_cookie_value` is non-NULL, a
+ * `Set-Cookie: MAGNUS_AFFINITY=<value>` line is appended so the client
+ * sticks to this cluster endpoint on future requests; pass NULL when the
+ * client already carries a valid affinity cookie.
  *
  * Returns the number of bytes written to `out` (excluding the NUL
  * terminator) on success, or -1 if the status line is malformed or `out`
  * is too small to hold the sanitized block. */
 int magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                            char *out, size_t out_capacity,
-                                           unsigned *out_status);
+                                           unsigned *out_status,
+                                           const char *affinity_cookie_value);
 
 #endif

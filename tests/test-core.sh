@@ -276,6 +276,104 @@ kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
 
+# M4: cookie-based session affinity -- a client with no MAGNUS_AFFINITY
+# cookie gets round-robined and issued one; presenting that cookie back
+# keeps every subsequent request on the same endpoint.
+python3 -m http.server "$upstream_a" --bind 127.0.0.1 \
+  --directory "$web_root/cluster-a" >/dev/null 2>&1 &
+backend_pid=$!
+python3 -m http.server "$upstream_b" --bind 127.0.0.1 \
+  --directory "$web_root/cluster-b" >/dev/null 2>&1 &
+backend2_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_a/id.txt" >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:$upstream_b/id.txt" >/dev/null \
+    && break
+  sleep 1
+done
+port_affinity=$((port + 14))
+"$binary" --port "$port_affinity" --root "$web_root/cluster-a" \
+  --upstream "127.0.0.1:$upstream_a" --upstream "127.0.0.1:$upstream_b" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_affinity/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+
+jar=$(mktemp)
+sticky_endpoint=$(curl --fail --silent --cookie-jar "$jar" \
+  "http://127.0.0.1:$port_affinity/proxy/id.txt")
+grep -qi 'MAGNUS_AFFINITY' "$jar"
+for attempt in 1 2 3; do
+  test "$(curl --fail --silent --cookie "$jar" \
+    "http://127.0.0.1:$port_affinity/proxy/id.txt")" = "$sticky_endpoint"
+done
+
+# M4: affinity + circuit breaker together -- once the sticky endpoint's
+# backend is gone, the very same cookie must fail over to the surviving
+# endpoint (via the connect-stage retry budget) instead of the request
+# failing, and the response must issue a refreshed cookie for it.
+if [ "$sticky_endpoint" = "endpoint-a" ]; then
+  kill -TERM "$backend_pid"
+  wait "$backend_pid" 2>/dev/null || true
+  backend_pid=
+  expect_after=endpoint-b
+else
+  kill -TERM "$backend2_pid"
+  wait "$backend2_pid" 2>/dev/null || true
+  backend2_pid=
+  expect_after=endpoint-a
+fi
+failover_body_file=$(mktemp)
+failover_headers=$(curl --fail --silent --cookie "$jar" --dump-header - \
+  --output "$failover_body_file" \
+  "http://127.0.0.1:$port_affinity/proxy/id.txt")
+test "$(cat "$failover_body_file")" = "$expect_after"
+printf '%s' "$failover_headers" | grep -qi '^Set-Cookie: MAGNUS_AFFINITY='
+rm -f "$failover_body_file" "$jar"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+if [ -n "${backend_pid:-}" ]; then
+  kill -TERM "$backend_pid"
+  wait "$backend_pid" 2>/dev/null || true
+  backend_pid=
+fi
+if [ -n "${backend2_pid:-}" ]; then
+  kill -TERM "$backend2_pid"
+  wait "$backend2_pid" 2>/dev/null || true
+  backend2_pid=
+fi
+
+# M4: per-client-IP ingress rate limiting -- a burst above the configured
+# rate is rejected with 429 and recovers once tokens refill.
+port_rl=$((port + 15))
+"$binary" --port "$port_rl" --root "$web_root" --rate-limit 0.5:2 \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_rl/healthz" >/dev/null && break
+  sleep 1
+done
+# /healthz is exempt from rate limiting, so the full burst of 2 is still
+# available: the first two requests succeed and the third is rejected.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_rl/hello.txt")" = 200
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_rl/hello.txt")" = 200
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_rl/hello.txt")" = 429
+curl --fail --silent "http://127.0.0.1:$port_rl/metrics" \
+  | grep -Eq '^magnus_rate_limited_total [1-9][0-9]*$'
+sleep 3
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_rl/hello.txt")" = 200
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
 tls_port=$((port + 1))
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
   -keyout "$web_root/server.key" -out "$web_root/server.crt" >/dev/null 2>&1

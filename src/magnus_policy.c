@@ -38,12 +38,27 @@ magnus_cluster_add(magnus_cluster_t *cluster, const char *address,
     return 0;
 }
 
+static int
+magnus_cluster_select_round_robin(magnus_cluster_t *cluster, uint64_t now_ms)
+{
+    unsigned total = 0;
+    int selected = -1;
+    for (size_t index = 0; index < cluster->count; index++) {
+        magnus_endpoint_t *endpoint = &cluster->endpoints[index];
+        if (!endpoint->healthy && now_ms < endpoint->retry_after_ms) continue;
+        endpoint->current_weight += (int) endpoint->weight;
+        total += endpoint->weight;
+        if (selected < 0 || endpoint->current_weight
+            > cluster->endpoints[selected].current_weight) selected = (int) index;
+    }
+    if (selected >= 0) cluster->endpoints[selected].current_weight -= (int) total;
+    return selected;
+}
+
 int
 magnus_cluster_select(magnus_cluster_t *cluster, uint64_t now_ms,
                       const char *affinity_key)
 {
-    unsigned total = 0;
-    int selected = -1;
     if (cluster->count == 0) return -1;
     if (affinity_key != NULL && *affinity_key != '\0') {
         uint64_t start = magnus_hash(affinity_key) % cluster->count;
@@ -55,16 +70,20 @@ magnus_cluster_select(magnus_cluster_t *cluster, uint64_t now_ms,
         }
         return -1;
     }
-    for (size_t index = 0; index < cluster->count; index++) {
-        magnus_endpoint_t *endpoint = &cluster->endpoints[index];
-        if (!endpoint->healthy && now_ms < endpoint->retry_after_ms) continue;
-        endpoint->current_weight += (int) endpoint->weight;
-        total += endpoint->weight;
-        if (selected < 0 || endpoint->current_weight
-            > cluster->endpoints[selected].current_weight) selected = (int) index;
+    return magnus_cluster_select_round_robin(cluster, now_ms);
+}
+
+int
+magnus_cluster_select_sticky(magnus_cluster_t *cluster, uint64_t now_ms,
+                             size_t preferred_index)
+{
+    if (cluster->count == 0) return -1;
+    if (preferred_index < cluster->count) {
+        magnus_endpoint_t *endpoint = &cluster->endpoints[preferred_index];
+        if (endpoint->healthy || now_ms >= endpoint->retry_after_ms)
+            return (int) preferred_index;
     }
-    if (selected >= 0) cluster->endpoints[selected].current_weight -= (int) total;
-    return selected;
+    return magnus_cluster_select_round_robin(cluster, now_ms);
 }
 
 void

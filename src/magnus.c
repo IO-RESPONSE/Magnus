@@ -40,6 +40,7 @@
 #define MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS 2
 #define MAGNUS_CLUSTER_FAILURE_THRESHOLD 3
 #define MAGNUS_CLUSTER_COOLDOWN_MS 5000
+#define MAGNUS_RATE_TABLE_SIZE 512
 
 typedef struct {
     int fd;
@@ -80,6 +81,9 @@ typedef struct {
     time_t proxy_last_activity;
     size_t proxy_endpoint_index;
     unsigned proxy_attempt;
+    char proxy_affinity_key[64];
+    bool proxy_issue_affinity_cookie;
+    struct in_addr client_address;
     time_t last_active;
 } magnus_connection_t;
 
@@ -105,6 +109,24 @@ static uint64_t magnus_requests_total;
 static uint64_t magnus_responses_4xx;
 static uint64_t magnus_responses_5xx;
 static uint64_t magnus_bytes_sent;
+static uint64_t magnus_rate_limited_total;
+
+/* Per-client-IP ingress rate limiting. Disabled unless --rate-limit is
+ * given. A bounded linear-scan table keeps memory flat regardless of how
+ * many distinct clients are ever seen; once full, the least-recently-seen
+ * entry is evicted to make room for a new client -- acceptable for a
+ * lightweight gateway's admission control, not a precise per-IP ledger. */
+typedef struct {
+    struct in_addr address;
+    bool in_use;
+    time_t last_seen;
+    magnus_rate_limit_t limiter;
+} magnus_rate_entry_t;
+
+static bool magnus_rate_limit_enabled;
+static double magnus_rate_limit_rps;
+static double magnus_rate_limit_burst;
+static magnus_rate_entry_t magnus_rate_table[MAGNUS_RATE_TABLE_SIZE];
 
 static int magnus_update_interest(int epoll_fd,
                                   magnus_connection_t *connection,
@@ -120,7 +142,8 @@ static char *magnus_find_header_end(char *buffer, size_t length);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
-                                       const magnus_request_t *request);
+                                       const magnus_request_t *request,
+                                       const char *client_affinity_key);
 
 static void
 magnus_signal_handler(int signal_number)
@@ -129,15 +152,17 @@ magnus_signal_handler(int signal_number)
     magnus_running = 0;
 }
 
-static int
-magnus_trace_handler(magnus_request_t *request, void *data)
+/* Fills `out[32]` (plus a NUL terminator, so `out` must be at least 33
+ * bytes) with a random 128-bit value hex-encoded. Used both for the
+ * per-request trace id and for freshly minted cluster affinity tokens. */
+static void
+magnus_generate_token(char *out)
 {
     unsigned char random_bytes[16];
     static const char hex[] = "0123456789abcdef";
     static uint64_t fallback_counter;
     size_t index;
 
-    (void) data;
     if (getrandom(random_bytes, sizeof(random_bytes), GRND_NONBLOCK)
         != (ssize_t) sizeof(random_bytes)) {
         struct timespec now;
@@ -153,10 +178,17 @@ magnus_trace_handler(magnus_request_t *request, void *data)
         }
     }
     for (index = 0; index < sizeof(random_bytes); index++) {
-        request->request_id[index * 2] = hex[random_bytes[index] >> 4];
-        request->request_id[index * 2 + 1] = hex[random_bytes[index] & 0x0f];
+        out[index * 2] = hex[random_bytes[index] >> 4];
+        out[index * 2 + 1] = hex[random_bytes[index] & 0x0f];
     }
-    request->request_id[32] = '\0';
+    out[32] = '\0';
+}
+
+static int
+magnus_trace_handler(magnus_request_t *request, void *data)
+{
+    (void) data;
+    magnus_generate_token(request->request_id);
     return 0;
 }
 
@@ -188,6 +220,45 @@ magnus_now_ms(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t) now.tv_sec * 1000 + (uint64_t) now.tv_nsec / 1000000;
+}
+
+/* Admits or rejects one request from `address` against the shared
+ * per-client-IP token bucket table. Always returns true when rate
+ * limiting is disabled. Finds (or creates, evicting the oldest entry if
+ * the bounded table is full) that client's bucket and consumes a token. */
+static bool
+magnus_rate_check(struct in_addr address, time_t now)
+{
+    uint64_t now_ms = (uint64_t) now * 1000;
+    size_t free_slot = MAGNUS_RATE_TABLE_SIZE;
+    size_t oldest_slot = 0;
+    time_t oldest_seen = 0;
+    size_t index;
+
+    if (!magnus_rate_limit_enabled) return true;
+
+    for (index = 0; index < MAGNUS_RATE_TABLE_SIZE; index++) {
+        magnus_rate_entry_t *entry = &magnus_rate_table[index];
+        if (entry->in_use && entry->address.s_addr == address.s_addr) {
+            entry->last_seen = now;
+            return magnus_rate_allow(&entry->limiter, now_ms);
+        }
+        if (!entry->in_use && free_slot == MAGNUS_RATE_TABLE_SIZE) {
+            free_slot = index;
+        }
+        if (index == 0 || entry->last_seen < oldest_seen) {
+            oldest_seen = entry->last_seen;
+            oldest_slot = index;
+        }
+    }
+
+    index = free_slot != MAGNUS_RATE_TABLE_SIZE ? free_slot : oldest_slot;
+    magnus_rate_table[index].address = address;
+    magnus_rate_table[index].in_use = true;
+    magnus_rate_table[index].last_seen = now;
+    magnus_rate_init(&magnus_rate_table[index].limiter, magnus_rate_limit_rps,
+                     magnus_rate_limit_burst, now_ms);
+    return magnus_rate_allow(&magnus_rate_table[index].limiter, now_ms);
 }
 
 static bool
@@ -259,18 +330,62 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
     return 0;
 }
 
+/* The MAGNUS_AFFINITY cookie value this gateway issues encodes the target
+ * cluster endpoint directly as a 2-hex-digit prefix (e.g. "05-<random>"),
+ * so a returning client's sticky endpoint can be recovered by a plain
+ * integer parse instead of re-deriving it by hashing -- precise, and
+ * independent of magnus_cluster_select()'s unrelated hash-based affinity
+ * mode (kept for other potential callers). Returns false if `cookie` is
+ * NULL/empty or not in this format. */
+static bool
+magnus_decode_affinity_cookie(const char *cookie, size_t *out_index)
+{
+    char *end;
+    unsigned long value;
+    if (cookie == NULL || cookie[0] == '\0') return false;
+    errno = 0;
+    value = strtoul(cookie, &end, 16);
+    if (errno != 0 || end == cookie || *end != '-') return false;
+    *out_index = (size_t) value;
+    return true;
+}
+
+static void
+magnus_encode_affinity_cookie(char *out, size_t out_capacity,
+                              size_t endpoint_index)
+{
+    char token[33];
+    magnus_generate_token(token);
+    snprintf(out, out_capacity, "%02zx-%s", endpoint_index, token);
+}
+
 /* Builds the outbound proxy request once, then selects a healthy cluster
- * endpoint (smooth weighted round-robin, skipping endpoints still in their
- * passive-health cooldown) and connects to it, retrying against a
- * different endpoint -- up to MAGNUS_PROXY_MAX_ATTEMPTS total attempts --
- * if the connect itself fails immediately. Returns 0 if an attempt is now
- * in flight (client interest already updated to watch for abort), -1 if no
- * healthy endpoint was available or the retry budget was exhausted. */
+ * endpoint and connects to it, retrying against a different endpoint -- up
+ * to MAGNUS_PROXY_MAX_ATTEMPTS total attempts -- if the connect itself
+ * fails immediately. Returns 0 if an attempt is now in flight (client
+ * interest already updated to watch for abort), -1 if no healthy endpoint
+ * was available or the retry budget was exhausted.
+ *
+ * Selection uses session affinity: if the client's request carried a valid
+ * MAGNUS_AFFINITY cookie, its encoded endpoint is preferred for this first
+ * attempt only (magnus_cluster_select_sticky() itself already falls back
+ * to round-robin if that endpoint is unavailable); a client with no cookie
+ * gets a plain round-robin pick, exactly as if affinity did not exist.
+ * Either way, any retry after a failed attempt always falls back to plain
+ * round-robin rather than insisting on the same (just-failed) endpoint
+ * again -- a single connect failure does not yet flip passive health
+ * unhealthy, so re-trying "sticky" here would silently double the wait
+ * instead of actually finding a working endpoint. A fresh cookie is minted
+ * (for magnus_proxy_receive_headers() to issue via Set-Cookie once headers
+ * arrive) whenever the client did not already carry a usable one. */
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
-                            const magnus_request_t *request)
+                            const magnus_request_t *request,
+                            const char *client_affinity_cookie)
 {
     int written;
+    size_t preferred_index;
+    bool sticky;
 
     written = snprintf(connection->proxy_request,
                        sizeof(connection->proxy_request),
@@ -283,14 +398,33 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
     memcpy(connection->proxy_request_id, request->request_id,
           sizeof(connection->proxy_request_id));
     connection->proxy_attempt = 0;
+    sticky = magnus_decode_affinity_cookie(client_affinity_cookie,
+                                           &preferred_index);
+    connection->proxy_issue_affinity_cookie = !sticky;
 
     for (;;) {
-        int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
-                                             NULL);
+        int endpoint = sticky
+            ? magnus_cluster_select_sticky(&magnus_cluster, magnus_now_ms(),
+                                           preferred_index)
+            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL);
         if (endpoint < 0) return -1;
+        if (sticky) {
+            sticky = false;
+        } else if (connection->proxy_attempt > 0) {
+            /* deviating from the client's original sticky target (or from
+             * plain round-robin) because a previous attempt failed: the
+             * cookie must be refreshed to reflect the endpoint actually
+             * used, not what a retried/failed attempt implied. */
+            connection->proxy_issue_affinity_cookie = true;
+        }
         connection->proxy_attempt++;
         if (magnus_proxy_connect_endpoint(epoll_fd, connection,
                                           (size_t) endpoint) == 0) {
+            if (connection->proxy_issue_affinity_cookie) {
+                magnus_encode_affinity_cookie(connection->proxy_affinity_key,
+                                              sizeof(connection->proxy_affinity_key),
+                                              (size_t) endpoint);
+            }
             return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
         }
         magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
@@ -365,12 +499,21 @@ magnus_proxy_connect_failed(int epoll_fd, magnus_connection_t *connection,
                           false, magnus_now_ms());
     magnus_proxy_teardown_upstream(epoll_fd, connection);
     if (connection->proxy_attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
+        /* never sticky here: this is already a retry after a failure, so
+         * insisting on the original (just-failed) preferred endpoint again
+         * would only waste the remaining attempt budget on it. */
         int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
                                              NULL);
         if (endpoint >= 0) {
             connection->proxy_attempt++;
             if (magnus_proxy_connect_endpoint(epoll_fd, connection,
                                               (size_t) endpoint) == 0) {
+                /* deviated from whatever selection strategy produced the
+                 * failed attempt: refresh the cookie to match reality. */
+                connection->proxy_issue_affinity_cookie = true;
+                magnus_encode_affinity_cookie(connection->proxy_affinity_key,
+                                              sizeof(connection->proxy_affinity_key),
+                                              (size_t) endpoint);
                 return magnus_update_interest(epoll_fd, connection,
                                               EPOLLRDHUP);
             }
@@ -509,7 +652,9 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     memcpy(header_copy, connection->proxy_buffer, header_length);
     header_copy[header_length] = '\0';
     sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
-        header_length, sanitized, sizeof(sanitized), &upstream_status);
+        header_length, sanitized, sizeof(sanitized), &upstream_status,
+        connection->proxy_issue_affinity_cookie
+            ? connection->proxy_affinity_key : NULL);
     if (sanitized_length < 0)
         return magnus_proxy_connect_failed(epoll_fd, connection, 502,
                                            "Bad Gateway");
@@ -840,6 +985,20 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
         return 0;
     }
 
+    /* /healthz and /metrics stay exempt: they are exactly what an operator
+     * or monitoring system needs to reach to see *why* real traffic is
+     * being throttled, so gating them behind the same limiter would be
+     * self-defeating. */
+    if (strcmp(request.path, "/healthz") != 0
+        && strcmp(request.path, "/metrics") != 0
+        && !magnus_rate_check(connection->client_address, time(NULL))) {
+        magnus_rate_limited_total++;
+        magnus_prepare_response(connection, 429, "Too Many Requests",
+                                "text/plain", "rate limit exceeded\n", head_only,
+                                true, &request);
+        return 0;
+    }
+
     if (strcmp(request.method, "GET") != 0 && !head_only) {
         magnus_prepare_response(connection, 405, "Method Not Allowed",
                                 "text/plain", "method not allowed\n", false,
@@ -870,6 +1029,7 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
             "magnus_responses_4xx_total %llu\n"
             "magnus_responses_5xx_total %llu\n"
             "magnus_bytes_sent_total %llu\n"
+            "magnus_rate_limited_total %llu\n"
             "# TYPE magnus_upstream_endpoints gauge\n"
             "magnus_upstream_endpoints_total %zu\n"
             "magnus_upstream_endpoints_healthy %zu\n",
@@ -879,6 +1039,7 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
             (unsigned long long) magnus_responses_4xx,
             (unsigned long long) magnus_responses_5xx,
             (unsigned long long) magnus_bytes_sent,
+            (unsigned long long) magnus_rate_limited_total,
             magnus_cluster.count, healthy);
         for (size_t index = 0; index < magnus_cluster.count
              && written < sizeof(metrics); index++) {
@@ -896,7 +1057,8 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
     } else if (magnus_upstream_enabled
                && strncmp(request.path, "/proxy", 6) == 0
                && (request.path[6] == '/' || request.path[6] == '\0')) {
-        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request) == 0) {
+        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
+                                        parsed.affinity_key) == 0) {
             fprintf(stderr,
                     "access request_id=%s method=%s target=%s status=proxy\n",
                     request.request_id, request.method, request.path);
@@ -1080,7 +1242,10 @@ static int
 magnus_accept_connections(int epoll_fd, int listener)
 {
     for (;;) {
-        int client = accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        struct sockaddr_in peer_address;
+        socklen_t peer_length = sizeof(peer_address);
+        int client = accept4(listener, (struct sockaddr *) &peer_address,
+                             &peer_length, SOCK_NONBLOCK | SOCK_CLOEXEC);
         magnus_connection_t *connection;
         struct epoll_event event;
 
@@ -1111,6 +1276,7 @@ magnus_accept_connections(int epoll_fd, int listener)
         connection->input_capacity = MAGNUS_INITIAL_INPUT;
         connection->fd = client;
         connection->file_fd = -1;
+        connection->client_address = peer_address.sin_addr;
         if (magnus_tls_context != NULL) {
             connection->tls = SSL_new(magnus_tls_context);
             if (connection->tls == NULL
@@ -1393,6 +1559,32 @@ magnus_parse_options(int argc, char **argv)
                                    (unsigned) upstream_port,
                                    (unsigned) weight) != 0) break;
             magnus_upstream_enabled = true;
+        } else if (strcmp(argv[index], "--rate-limit") == 0) {
+            /* requests-per-second, or requests-per-second:burst */
+            char spec[32];
+            char *saveptr = NULL;
+            char *rps_text;
+            char *burst_text;
+            char *end;
+            double rps;
+            double burst;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
+            strcpy(spec, argv[index + 1]);
+            rps_text = strtok_r(spec, ":", &saveptr);
+            burst_text = strtok_r(NULL, ":", &saveptr);
+            if (rps_text == NULL) break;
+            errno = 0;
+            rps = strtod(rps_text, &end);
+            if (errno != 0 || *end != '\0' || !(rps > 0.0)) break;
+            burst = rps;
+            if (burst_text != NULL) {
+                errno = 0;
+                burst = strtod(burst_text, &end);
+                if (errno != 0 || *end != '\0' || !(burst > 0.0)) break;
+            }
+            magnus_rate_limit_rps = rps;
+            magnus_rate_limit_burst = burst;
+            magnus_rate_limit_enabled = true;
         } else {
             break;
         }
@@ -1419,7 +1611,8 @@ magnus_parse_options(int argc, char **argv)
     }
     fprintf(stderr, "usage: %s --port <1-65535> [--root <directory>] "
                     "[--tls-cert <pem> --tls-key <pem>] "
-                    "[--upstream <ipv4:port[:weight]> ...] | --version\n",
+                    "[--upstream <ipv4:port[:weight]> ...] "
+                    "[--rate-limit <rps[:burst]>] | --version\n",
             argv[0]);
     exit(2);
 }

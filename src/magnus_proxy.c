@@ -1,4 +1,5 @@
 #include "magnus_proxy.h"
+#include "magnus_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +47,8 @@ magnus_proxy_parse_status_line(char *line, unsigned *status, char *reason,
 int
 magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                        char *out, size_t out_capacity,
-                                       unsigned *out_status)
+                                       unsigned *out_status,
+                                       const char *affinity_cookie_value)
 {
     char *saveptr = NULL;
     char *line;
@@ -80,6 +82,15 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
         if (magnus_proxy_is_hop_by_hop(name)) continue;
 
         written = snprintf(out + total, out_capacity - total, "%s\r\n", line);
+        if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+        total += (size_t) written;
+    }
+
+    if (affinity_cookie_value != NULL) {
+        written = snprintf(out + total, out_capacity - total,
+                           "Set-Cookie: " MAGNUS_AFFINITY_COOKIE_NAME
+                           "=%s; Path=/; HttpOnly; SameSite=Lax\r\n",
+                           affinity_cookie_value);
         if (written < 0 || (size_t) written >= out_capacity - total) return -1;
         total += (size_t) written;
     }

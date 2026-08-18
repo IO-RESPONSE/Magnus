@@ -28,7 +28,7 @@ main(void)
         "X-Debug: value\r\n"
         "\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-                                                      sizeof(out), &status);
+                                                      sizeof(out), &status, NULL);
     assert(written > 0);
     assert(status == 200);
     assert(strncmp(out, "HTTP/1.1 200 OK\r\n", 17) == 0);
@@ -49,15 +49,25 @@ main(void)
 
     strcpy(raw, "not-a-status-line\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-                                                   sizeof(out), &status) == -1);
+                                                   sizeof(out), &status, NULL)
+           == -1);
 
     strcpy(raw, "HTTP/1.1 abc OK\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-                                                   sizeof(out), &status) == -1);
+                                                   sizeof(out), &status, NULL)
+           == -1);
 
     strcpy(raw, "HTTP/1.1 200 OK\r\nX-Long: value\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out, 8,
-                                                   &status) == -1);
+                                                   &status, NULL) == -1);
+
+    strcpy(raw, "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+    written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
+                                                      sizeof(out), &status,
+                                                      "sess-token-abc");
+    assert(written > 0);
+    assert(strstr(out, "Set-Cookie: MAGNUS_AFFINITY=sess-token-abc; "
+                       "Path=/; HttpOnly; SameSite=Lax\r\n") != NULL);
 
     return 0;
 }

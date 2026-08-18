@@ -25,5 +25,31 @@ int main(void)
     assert(magnus_rate_allow(&rate, 0));
     assert(!magnus_rate_allow(&rate, 0));
     assert(magnus_rate_allow(&rate, 500));
+
+    /* sticky selection: an in-range, available preferred index is returned
+     * directly and does not disturb the round-robin weight ledger. */
+    {
+        magnus_cluster_t sticky;
+        int a;
+        int b;
+        magnus_cluster_init(&sticky, 3, 1000);
+        assert(magnus_cluster_add(&sticky, "127.0.0.1", 9001, 1) == 0);
+        assert(magnus_cluster_add(&sticky, "127.0.0.1", 9002, 1) == 0);
+        assert(magnus_cluster_select_sticky(&sticky, 0, 1) == 1);
+        assert(magnus_cluster_select_sticky(&sticky, 0, 1) == 1);
+        assert(magnus_cluster_select_sticky(&sticky, 0, 0) == 0);
+        /* out of range: falls back to plain round robin instead of erroring */
+        assert(magnus_cluster_select_sticky(&sticky, 0, 99) >= 0);
+        /* preferred endpoint down (3 strikes): falls back to the other one */
+        magnus_cluster_result(&sticky, 1, false, 100);
+        magnus_cluster_result(&sticky, 1, false, 100);
+        magnus_cluster_result(&sticky, 1, false, 100);
+        assert(!sticky.endpoints[1].healthy);
+        a = magnus_cluster_select_sticky(&sticky, 200, 1);
+        assert(a == 0);
+        /* once its cooldown passes, the preferred endpoint is honored again */
+        b = magnus_cluster_select_sticky(&sticky, 2000, 1);
+        assert(b == 1);
+    }
     return 0;
 }

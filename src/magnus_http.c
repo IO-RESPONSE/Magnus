@@ -17,6 +17,38 @@ magnus_equal_ci(const char *left, size_t left_length, const char *right)
         && strncasecmp(left, right, left_length) == 0;
 }
 
+/* Finds `name=value` within a `Cookie:` header's value (";"-separated
+ * pairs, optional leading space after each ";") and copies `value` into
+ * `out`. Returns false if the cookie is absent or its value does not fit
+ * in `out_capacity` (including the NUL terminator). */
+static bool
+magnus_extract_cookie(const char *value, size_t value_length, const char *name,
+                      char *out, size_t out_capacity)
+{
+    size_t name_length = strlen(name);
+    const char *cursor = value;
+    const char *end = value + value_length;
+
+    while (cursor < end) {
+        const char *pair_end = memchr(cursor, ';', (size_t) (end - cursor));
+        const char *stop = pair_end != NULL ? pair_end : end;
+        const char *scan = cursor;
+        const char *eq;
+        while (scan < stop && *scan == ' ') scan++;
+        eq = memchr(scan, '=', (size_t) (stop - scan));
+        if (eq != NULL && (size_t) (eq - scan) == name_length
+            && strncasecmp(scan, name, name_length) == 0) {
+            size_t token_length = (size_t) (stop - (eq + 1));
+            if (token_length >= out_capacity) return false;
+            memcpy(out, eq + 1, token_length);
+            out[token_length] = '\0';
+            return true;
+        }
+        cursor = pair_end != NULL ? pair_end + 1 : end;
+    }
+    return false;
+}
+
 magnus_http_result_t
 magnus_http_parse(const char *data, size_t length, magnus_http_request_t *request)
 {
@@ -88,6 +120,13 @@ magnus_http_parse(const char *data, size_t length, magnus_http_request_t *reques
             else if (!request->http_11
                      && magnus_equal_ci(value, value_length, "keep-alive"))
                 request->close_connection = false;
+        }
+        if (magnus_equal_ci(cursor, name_length, "cookie")) {
+            size_t value_length = (size_t) (line_end - value);
+            (void) magnus_extract_cookie(value, value_length,
+                                         MAGNUS_AFFINITY_COOKIE_NAME,
+                                         request->affinity_key,
+                                         sizeof(request->affinity_key));
         }
         cursor = line_end + 2;
     }
