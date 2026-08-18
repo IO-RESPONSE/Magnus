@@ -1,5 +1,6 @@
 #include "magnus_phase.h"
 #include "magnus_http.h"
+#include "magnus_proxy.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -29,6 +30,10 @@
 #define MAGNUS_IDLE_SECONDS 30
 #define MAGNUS_PROXY_BUFFER 16384
 #define MAGNUS_INITIAL_INPUT 2048
+#define MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS 5
+#define MAGNUS_PROXY_READ_TIMEOUT_SECONDS 10
+#define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
+#define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 
 typedef struct {
     int fd;
@@ -58,6 +63,15 @@ typedef struct {
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
+    bool proxy_headers_received;
+    size_t proxy_header_accum;
+    char *proxy_header_out;
+    size_t proxy_header_out_length;
+    size_t proxy_header_out_sent;
+    bool proxy_response_started;
+    char proxy_request_id[33];
+    time_t proxy_connect_started;
+    time_t proxy_last_activity;
     time_t last_active;
 } magnus_connection_t;
 
@@ -81,6 +95,12 @@ static int magnus_update_interest(int epoll_fd,
                                   uint32_t events);
 static ssize_t magnus_socket_write(magnus_connection_t *connection,
                                    const void *buffer, size_t length);
+static void magnus_prepare_response(magnus_connection_t *connection,
+                                    unsigned status, const char *reason,
+                                    const char *content_type, const char *body,
+                                    bool head_only, bool close_connection,
+                                    magnus_request_t *request);
+static char *magnus_find_header_end(char *buffer, size_t length);
 
 static void
 magnus_signal_handler(int signal_number)
@@ -131,6 +151,7 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->input);
     free(connection->file_buffer);
     free(connection->proxy_buffer);
+    free(connection->proxy_header_out);
     if (magnus_connections_active > 0) magnus_connections_active--;
     if (connection->upstream_fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->upstream_fd, NULL);
@@ -174,6 +195,13 @@ magnus_start_proxy(int epoll_fd, magnus_connection_t *connection,
     connection->proxy_connected = result == 0;
     connection->proxy_request_length = (size_t) written;
     connection->close_after_write = true;
+    connection->proxy_headers_received = false;
+    connection->proxy_header_accum = 0;
+    connection->proxy_response_started = false;
+    connection->proxy_connect_started = time(NULL);
+    connection->proxy_last_activity = connection->proxy_connect_started;
+    memcpy(connection->proxy_request_id, request->request_id,
+          sizeof(connection->proxy_request_id));
     magnus_upstream_owner[fd] = connection;
     event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
                                    .data.fd = fd };
@@ -187,26 +215,103 @@ magnus_start_proxy(int epoll_fd, magnus_connection_t *connection,
     return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
 }
 
+static void
+magnus_proxy_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
+{
+    if (connection->upstream_fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->upstream_fd, NULL);
+        magnus_upstream_owner[connection->upstream_fd] = NULL;
+        close(connection->upstream_fd);
+        connection->upstream_fd = -1;
+    }
+    connection->proxy_active = false;
+    free(connection->proxy_buffer);
+    connection->proxy_buffer = NULL;
+    free(connection->proxy_header_out);
+    connection->proxy_header_out = NULL;
+}
+
+/* Ends an in-flight proxy attempt before any response bytes have reached
+ * the client: tears the upstream connection down and switches the client
+ * connection to a synthesized error response. Must only be called while
+ * connection->proxy_response_started is still false -- once the status
+ * line has been forwarded downstream a clean status-coded error is no
+ * longer possible and magnus_proxy_abort() must be used instead. */
+static int
+magnus_proxy_fail(int epoll_fd, magnus_connection_t *connection,
+                  unsigned status, const char *reason)
+{
+    magnus_request_t request = {0};
+    magnus_proxy_teardown_upstream(epoll_fd, connection);
+    memcpy(request.request_id, connection->proxy_request_id,
+          sizeof(request.request_id));
+    magnus_prepare_response(connection, status, reason, "text/plain",
+                            status == 504 ? "gateway timeout\n"
+                                          : "bad gateway\n",
+                            false, true, &request);
+    fprintf(stderr,
+            "access request_id=%s method=PROXY target=upstream status=%u\n",
+            request.request_id, status);
+    return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
+}
+
+/* Ends an in-flight proxy attempt after response bytes were already
+ * forwarded to the client, so the connection can only be aborted (client
+ * abort / truncated response), not answered with a fresh status code. */
+static int
+magnus_proxy_abort(int epoll_fd, magnus_connection_t *connection)
+{
+    magnus_proxy_teardown_upstream(epoll_fd, connection);
+    return -1;
+}
+
 static int
 magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
 {
-    while (connection->proxy_buffer_sent < connection->proxy_buffer_length) {
+    while (connection->proxy_header_out != NULL
+           && connection->proxy_header_out_sent
+              < connection->proxy_header_out_length) {
         ssize_t sent = magnus_socket_write(connection,
-            connection->proxy_buffer + connection->proxy_buffer_sent,
-            connection->proxy_buffer_length - connection->proxy_buffer_sent);
+            connection->proxy_header_out + connection->proxy_header_out_sent,
+            connection->proxy_header_out_length
+                - connection->proxy_header_out_sent);
         if (sent > 0) {
-            connection->proxy_buffer_sent += (size_t) sent;
+            connection->proxy_header_out_sent += (size_t) sent;
+            connection->last_active = time(NULL);
+            connection->proxy_last_activity = connection->last_active;
             continue;
         }
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return magnus_update_interest(epoll_fd, connection,
                                           EPOLLOUT | EPOLLRDHUP);
-        return -1;
+        return magnus_proxy_abort(epoll_fd, connection);
+    }
+    if (connection->proxy_header_out != NULL) {
+        free(connection->proxy_header_out);
+        connection->proxy_header_out = NULL;
+        connection->proxy_response_started = true;
+    }
+    while (connection->proxy_buffer_sent < connection->proxy_buffer_length) {
+        ssize_t sent = magnus_socket_write(connection,
+            connection->proxy_buffer + connection->proxy_buffer_sent,
+            connection->proxy_buffer_length - connection->proxy_buffer_sent);
+        if (sent > 0) {
+            connection->proxy_buffer_sent += (size_t) sent;
+            connection->last_active = time(NULL);
+            connection->proxy_last_activity = connection->last_active;
+            connection->proxy_response_started = true;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return magnus_update_interest(epoll_fd, connection,
+                                          EPOLLOUT | EPOLLRDHUP);
+        return magnus_proxy_abort(epoll_fd, connection);
     }
     connection->proxy_buffer_length = 0;
     connection->proxy_buffer_sent = 0;
-    if (connection->proxy_eof) return -1;
+    if (connection->proxy_eof) return magnus_proxy_abort(epoll_fd, connection);
     if (connection->upstream_fd >= 0) {
         struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
                                      .data.fd = connection->upstream_fd };
@@ -215,39 +320,139 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
     return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
 }
 
+/* Accumulates the upstream response's status line + header block (which
+ * may arrive split across several recv() calls) into connection->proxy_buffer,
+ * then rewrites it via magnus_proxy_sanitize_response_headers() once the
+ * terminating blank line is found. Leftover bytes already read past the
+ * header block are preserved as the first chunk of body. Returns 1 while
+ * still waiting for more header bytes, 0 once handed off to
+ * magnus_proxy_flush(), or a magnus_proxy_fail()/-1 result on error. */
+static int
+magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
+{
+    char *body_start;
+    size_t header_length;
+    size_t leftover;
+    char header_copy[MAGNUS_PROXY_HEADER_LIMIT + 1];
+    char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
+    unsigned upstream_status;
+    int sanitized_length;
+
+    for (;;) {
+        ssize_t received = recv(connection->upstream_fd,
+            connection->proxy_buffer + connection->proxy_header_accum,
+            MAGNUS_PROXY_BUFFER - connection->proxy_header_accum, 0);
+        if (received > 0) {
+            connection->proxy_header_accum += (size_t) received;
+            connection->last_active = time(NULL);
+            connection->proxy_last_activity = connection->last_active;
+            continue;
+        }
+        if (received == 0) {
+            connection->proxy_eof = true;
+            break;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
+
+    body_start = magnus_find_header_end(connection->proxy_buffer,
+                                        connection->proxy_header_accum);
+    if (body_start == NULL) {
+        if (connection->proxy_eof)
+            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        if (connection->proxy_header_accum == MAGNUS_PROXY_BUFFER)
+            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        return 1;
+    }
+
+    header_length = (size_t) (body_start - connection->proxy_buffer);
+    leftover = connection->proxy_header_accum - header_length;
+    if (header_length > MAGNUS_PROXY_HEADER_LIMIT)
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+    memcpy(header_copy, connection->proxy_buffer, header_length);
+    header_copy[header_length] = '\0';
+    sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
+        header_length, sanitized, sizeof(sanitized), &upstream_status);
+    if (sanitized_length < 0)
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+
+    connection->proxy_header_out = malloc((size_t) sanitized_length);
+    if (connection->proxy_header_out == NULL)
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+    memcpy(connection->proxy_header_out, sanitized, (size_t) sanitized_length);
+    connection->proxy_header_out_length = (size_t) sanitized_length;
+    connection->proxy_header_out_sent = 0;
+    memmove(connection->proxy_buffer, body_start, leftover);
+    connection->proxy_buffer_length = leftover;
+    connection->proxy_buffer_sent = 0;
+    connection->proxy_headers_received = true;
+    magnus_requests_total++;
+    if (upstream_status >= 500) magnus_responses_5xx++;
+    else if (upstream_status >= 400) magnus_responses_4xx++;
+    return magnus_proxy_flush(epoll_fd, connection);
+}
+
 static int
 magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
                        uint32_t flags)
 {
     struct epoll_event event;
-    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) return -1;
+    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        if (connection->proxy_response_started)
+            return magnus_proxy_abort(epoll_fd, connection);
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
     if (!connection->proxy_connected) {
         int error = 0;
         socklen_t length = sizeof(error);
         if (getsockopt(connection->upstream_fd, SOL_SOCKET, SO_ERROR,
-                       &error, &length) < 0 || error != 0) return -1;
+                       &error, &length) < 0 || error != 0)
+            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
         connection->proxy_connected = true;
+        connection->proxy_last_activity = time(NULL);
     }
     while (!connection->proxy_headers_sent) {
         ssize_t sent = send(connection->upstream_fd,
             connection->proxy_request + connection->proxy_request_sent,
             connection->proxy_request_length - connection->proxy_request_sent,
             MSG_NOSIGNAL);
-        if (sent > 0) connection->proxy_request_sent += (size_t) sent;
-        else if (sent < 0 && errno == EINTR) continue;
-        else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
-        else return -1;
+        if (sent > 0) {
+            connection->proxy_request_sent += (size_t) sent;
+            connection->proxy_last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        } else {
+            return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+        }
         if (connection->proxy_request_sent == connection->proxy_request_length)
             connection->proxy_headers_sent = true;
+    }
+    if (!connection->proxy_headers_received) {
+        if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+            return magnus_proxy_receive_headers(epoll_fd, connection);
+        }
+        event = (struct epoll_event) { .events = EPOLLIN | EPOLLRDHUP,
+                                       .data.fd = connection->upstream_fd };
+        return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->upstream_fd,
+                         &event);
     }
     if (connection->proxy_buffer_length != 0) return 0;
     if ((flags & EPOLLIN) != 0 || (flags & EPOLLRDHUP) != 0) {
         ssize_t received = recv(connection->upstream_fd, connection->proxy_buffer,
                                 MAGNUS_PROXY_BUFFER, 0);
-        if (received > 0) connection->proxy_buffer_length = (size_t) received;
-        else if (received == 0) connection->proxy_eof = true;
-        else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-            return -1;
+        if (received > 0) {
+            connection->proxy_buffer_length = (size_t) received;
+            connection->last_active = time(NULL);
+            connection->proxy_last_activity = connection->last_active;
+        } else if (received == 0) {
+            connection->proxy_eof = true;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            return magnus_proxy_abort(epoll_fd, connection);
+        }
         if (connection->proxy_buffer_length != 0 || connection->proxy_eof)
             return magnus_proxy_flush(epoll_fd, connection);
     }
@@ -786,6 +991,41 @@ magnus_expire_idle(int epoll_fd, time_t now)
     }
 }
 
+/* Bounds how long a proxied request may spend connecting to, or waiting on,
+ * an upstream: a stalled connect() is reported as 504 after
+ * MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS, and a connected-but-silent upstream
+ * (or a stalled write to a slow client while relaying) is reported as 504
+ * after MAGNUS_PROXY_READ_TIMEOUT_SECONDS of proxy inactivity. Once
+ * response bytes have already reached the client a clean status can no
+ * longer be sent, so the connection is aborted instead. */
+static void
+magnus_expire_proxies(int epoll_fd, time_t now)
+{
+    int fd;
+    for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
+        magnus_connection_t *connection = magnus_connections[fd];
+        int result;
+        if (connection == NULL || !connection->proxy_active) continue;
+        if (!connection->proxy_connected) {
+            if (now - connection->proxy_connect_started
+                < MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS) continue;
+            result = magnus_proxy_fail(epoll_fd, connection, 504,
+                                       "Gateway Timeout");
+        } else if (now - connection->proxy_last_activity
+                   >= MAGNUS_PROXY_READ_TIMEOUT_SECONDS) {
+            result = connection->proxy_response_started
+                ? magnus_proxy_abort(epoll_fd, connection)
+                : magnus_proxy_fail(epoll_fd, connection, 504,
+                                    "Gateway Timeout");
+        } else {
+            continue;
+        }
+        if (result < 0 && magnus_connections[connection->fd] != NULL) {
+            magnus_close_connection(epoll_fd, connection);
+        }
+    }
+}
+
 static int
 magnus_create_listener(unsigned port)
 {
@@ -978,12 +1218,17 @@ main(int argc, char **argv)
                 result = magnus_proxy_flush(epoll_fd, connection);
             } else if ((flags & EPOLLOUT) != 0) {
                 result = magnus_handle_write(epoll_fd, connection);
+            } else if ((flags & EPOLLRDHUP) != 0 && connection->proxy_active) {
+                /* client aborted while we were only watching for hangup
+                 * (connecting to, or waiting on headers from, upstream) */
+                result = -1;
             }
             if (result < 0 && magnus_connections[fd] != NULL) {
                 magnus_close_connection(epoll_fd, connection);
             }
         }
         if (now != last_sweep) {
+            magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             last_sweep = now;
         }

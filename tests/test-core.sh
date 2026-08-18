@@ -69,6 +69,23 @@ test "$(curl --fail --silent "http://127.0.0.1:$port/proxy/hello.txt")" \
 curl --fail --silent "http://127.0.0.1:$port/metrics" \
   | grep -Eq '^magnus_connections_active [0-9]+'
 
+# M2: upstream response headers are sanitized -- hop-by-hop headers dropped,
+# framing normalized to a single Connection: close, via marker present.
+proxy_headers=$(curl --fail --silent --dump-header - --output /dev/null \
+  "http://127.0.0.1:$port/proxy/hello.txt")
+test "$(printf '%s' "$proxy_headers" | grep -ic '^Connection:')" = 1
+printf '%s' "$proxy_headers" | grep -qi '^Connection: close'
+printf '%s' "$proxy_headers" | grep -qi '^X-Magnus-Via: magnus-proxy/0.1'
+
+# M2: large body relayed through the bounded proxy buffer across multiple
+# recv/flush cycles must be byte-for-byte identical to a direct fetch.
+head -c 2000000 /dev/urandom >"$web_root/big.bin"
+direct_sha=$(curl --fail --silent "http://127.0.0.1:$upstream_port/big.bin" \
+  | sha256sum | cut -d' ' -f1)
+proxy_sha=$(curl --fail --silent "http://127.0.0.1:$port/proxy/big.bin" \
+  | sha256sum | cut -d' ' -f1)
+test "$proxy_sha" = "$direct_sha"
+
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
@@ -77,6 +94,59 @@ wait "$backend_pid" 2>/dev/null || true
 backend_pid=
 grep -q 'magnus: stopped' "$log"
 grep -Eq 'access request_id=[0-9a-f]{32} method=GET target=/hello.txt status=200' "$log"
+
+# M2: connect() failure surfaces as a clean 502, not a dropped connection.
+port_502=$((port + 3))
+upstream_502=$((port + 4))
+"$binary" --port "$port_502" --root "$web_root" \
+  --upstream "127.0.0.1:$upstream_502" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_502/healthz" >/dev/null && break
+  sleep 1
+done
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_502/proxy/hello.txt")" = 502
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# M2: an upstream that accepts but never answers surfaces as 504 once the
+# proxy read timeout elapses, instead of hanging the connection forever.
+port_504=$((port + 5))
+upstream_504=$((port + 6))
+python3 -c "
+import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $upstream_504))
+s.listen(1)
+while True:
+    conn, _ = s.accept()
+    time.sleep(30)
+    conn.close()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  python3 -c "import socket; socket.create_connection(('127.0.0.1', $upstream_504), timeout=1).close()" \
+    >/dev/null 2>&1 && break
+  sleep 1
+done
+"$binary" --port "$port_504" --root "$web_root" \
+  --upstream "127.0.0.1:$upstream_504" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_504/healthz" >/dev/null && break
+  sleep 1
+done
+test "$(curl --silent --max-time 15 --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_504/proxy/hello.txt")" = 504
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
 
 tls_port=$((port + 1))
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \

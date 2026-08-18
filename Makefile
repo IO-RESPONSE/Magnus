@@ -4,7 +4,8 @@ CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
 LDLIBS ?= -lssl -lcrypto
 
-SOURCES := src/magnus.c src/magnus_http.c src/magnus_phase.c src/magnus_policy.c
+SOURCES := src/magnus.c src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
+           src/magnus_proxy.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test
@@ -17,9 +18,10 @@ build/%.o: src/%.c
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-test: all build/test-http build/test-policy
+test: all build/test-http build/test-policy build/test-proxy
 	./build/test-http
 	./build/test-policy
+	./build/test-proxy
 	./tests/test-core.sh
 
 build/test-http: tests/test-http.c src/magnus_http.c src/magnus_http.h
@@ -29,6 +31,10 @@ build/test-http: tests/test-http.c src/magnus_http.c src/magnus_http.h
 build/test-policy: tests/test-policy.c src/magnus_policy.c src/magnus_policy.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-policy.c src/magnus_policy.c -o $@
+
+build/test-proxy: tests/test-proxy.c src/magnus_proxy.c src/magnus_proxy.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-proxy.c src/magnus_proxy.c -o $@
 
 clean:
 	rm -rf build
