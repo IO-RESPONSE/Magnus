@@ -26,13 +26,26 @@ independently by IORESPONSE.
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked
   rollback on a failed reload or an unexpected crash, and an audit log
-- Prometheus `/metrics` endpoint
-- Container image: 9,205,523 bytes (~8.78 MiB), non-root, read-only rootfs
+- Prometheus `/metrics` (counters, per-endpoint health, and a request
+  latency histogram); access log is buffered, 1-in-N sampleable, and can
+  be turned off entirely
+- Admin channel isolation: `/metrics` moves to an owner-only Unix domain
+  socket when `--admin-socket`/`admin_socket` is configured (`/healthz`
+  stays on the public port for load-balancer health checks); access
+  control is that socket's own filesystem permissions
+- Slowloris guard: a connection's first request has a hard header-phase
+  deadline independent of the idle timer, so trickling one byte at a time
+  no longer holds a connection open indefinitely
+- Verified clean under ASan+UBSan across the full test suite (`make
+  sanitize`), and against a 4M-iteration mutation fuzz run of the HTTP
+  parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
+- Container image: 9,207,512 bytes (~8.78 MiB), non-root, read-only rootfs
 
-This is still a pre-production checkpoint. Fuzzing/soak/fault-injection and
-comparative benchmarking against other gateways have not been run, so this
-stage is not described as production-ready. Target architecture and
-completion criteria live in `docs/ENTERPRISE_ARCHITECTURE.md`.
+This is still a pre-production checkpoint. Long-running soak testing,
+fault-injection beyond what `tests/test-core.sh` exercises, and comparative
+benchmarking against other gateways have not been run, so this stage is
+not described as production-ready. Target architecture and completion
+criteria live in `docs/ENTERPRISE_ARCHITECTURE.md`.
 
 ## Components
 

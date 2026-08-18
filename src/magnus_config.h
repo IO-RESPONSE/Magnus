@@ -30,6 +30,10 @@ typedef struct {
     bool has_rate_limit;
     double rate_limit_rps;
     double rate_limit_burst;
+    bool access_log_enabled;
+    unsigned access_log_sample;
+    bool has_admin_socket;
+    char admin_socket[MAGNUS_CONFIG_PATH_MAX];
 } magnus_config_t;
 
 typedef enum {
@@ -41,8 +45,10 @@ typedef enum {
  *   - unknown keys are rejected (no silently-ignored typos)
  *   - every value is range/format checked (port, ipv4:port[:weight],
  *     file existence for root/tls_cert/tls_key, tls_cert and tls_key must
- *     be given together, rate_limit_burst requires rate_limit_rps)
- *   - `port` is required
+ *     be given together, rate_limit_burst requires rate_limit_rps,
+ *     access_log is 'on'/'off', access_log_sample is a positive integer)
+ *   - `port` is required; access_log defaults to "on" and
+ *     access_log_sample defaults to 1 (log every request) when omitted
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

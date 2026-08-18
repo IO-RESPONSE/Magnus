@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,8 +29,9 @@
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
-#define MAGNUS_OUTPUT_LIMIT 1024
+#define MAGNUS_OUTPUT_LIMIT 2048
 #define MAGNUS_IDLE_SECONDS 30
+#define MAGNUS_HEADER_TIMEOUT_SECONDS 10
 #define MAGNUS_PROXY_BUFFER 16384
 #define MAGNUS_INITIAL_INPUT 2048
 #define MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS 5
@@ -84,7 +86,29 @@ typedef struct {
     unsigned proxy_attempt;
     char proxy_affinity_key[64];
     bool proxy_issue_affinity_cookie;
+    /* client-side method/target of the request currently being proxied,
+     * captured at proxy start so the completion access-log line (written
+     * later, asynchronously, once the upstream response arrives) can
+     * still report what the client actually asked for. */
+    char proxy_log_method[8];
+    char proxy_log_target[256];
     struct in_addr client_address;
+    /* set when this connection was accepted on the admin-only Unix
+     * socket listener (see magnus_admin_listener): restricted to
+     * /healthz and /metrics, and exempt from rate limiting since access
+     * is already gated by that socket's filesystem permissions. */
+    bool admin_only;
+    uint64_t request_started_ms;
+    /* Absolute deadline (from accept time) for finishing the *first*
+     * request's headers, checked in magnus_expire_idle() independently of
+     * MAGNUS_IDLE_SECONDS: the idle timer resets on every byte received,
+     * so a slowloris-style client trickling one byte every few seconds
+     * would never trip it and could hold a connection (and its input
+     * buffer and fd) open indefinitely. No longer enforced once
+     * request_started_ms shows a request has actually completed --
+     * legitimate keep-alive idling between requests is fine and is what
+     * MAGNUS_IDLE_SECONDS is for. */
+    time_t header_deadline;
     time_t last_active;
 } magnus_connection_t;
 
@@ -111,6 +135,44 @@ static uint64_t magnus_responses_4xx;
 static uint64_t magnus_responses_5xx;
 static uint64_t magnus_bytes_sent;
 static uint64_t magnus_rate_limited_total;
+
+/* Access log: off/on, and 1-in-N sampling, both configurable (magnus_config
+ * access_log / access_log_sample) so a busy deployment can turn the log
+ * down instead of paying a syscall per request. Buffered in memory and
+ * flushed with a single write() -- on the once-a-second sweep, when the
+ * buffer is nearly full, and at shutdown -- rather than one fprintf() per
+ * request; a full buffer at flush time is handled by flushing first and
+ * retrying rather than silently growing without bound. */
+#define MAGNUS_ACCESS_LOG_BUFFER 8192
+static bool magnus_access_log_enabled = true;
+static unsigned magnus_access_log_sample = 1;
+static uint64_t magnus_access_log_seen;
+static char magnus_access_log_buffer[MAGNUS_ACCESS_LOG_BUFFER];
+static size_t magnus_access_log_length;
+
+/* Request latency histogram (milliseconds, from "headers fully parsed" to
+ * "response prepared" -- for a proxied request that means through to the
+ * upstream's response headers arriving, not just the connect). Bucket
+ * boundaries are intentionally coarse and few: this is a lightweight
+ * gateway's own view of its tail, not a general-purpose metrics library. */
+static const double magnus_latency_bucket_bounds_ms[] =
+    { 1, 5, 10, 50, 100, 500, 1000, 5000 };
+#define MAGNUS_LATENCY_BUCKETS \
+    (sizeof(magnus_latency_bucket_bounds_ms) \
+     / sizeof(magnus_latency_bucket_bounds_ms[0]))
+static uint64_t magnus_latency_bucket_counts[MAGNUS_LATENCY_BUCKETS];
+static uint64_t magnus_latency_count;
+static double magnus_latency_sum_ms;
+
+/* Admin-only Unix domain socket listener (magnus_config admin_socket /
+ * --admin-socket): serves only /healthz and /metrics, exempt from rate
+ * limiting, access controlled by the socket file's own permissions rather
+ * than an in-process RBAC layer. When enabled, /metrics is withdrawn from
+ * the regular (TCP) listener entirely -- /healthz stays there too, since
+ * that is what a load balancer on the public port needs to reach. */
+static int magnus_admin_listener = -1;
+static bool magnus_admin_enabled;
+static char magnus_admin_socket_path[MAGNUS_CONFIG_PATH_MAX];
 
 /* Per-client-IP ingress rate limiting. Disabled unless --rate-limit is
  * given. A bounded linear-scan table keeps memory flat regardless of how
@@ -236,6 +298,61 @@ magnus_now_ms(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t) now.tv_sec * 1000 + (uint64_t) now.tv_nsec / 1000000;
+}
+
+static void
+magnus_access_log_flush(void)
+{
+    if (magnus_access_log_length == 0) return;
+    /* Best-effort: a partial or failed write() here would otherwise mean
+     * looping or blocking in the middle of the event loop over a log
+     * sink under pressure, which the event loop must never do. Dropping
+     * log bytes beats stalling every connection to protect them. */
+    ssize_t ignored = write(STDERR_FILENO, magnus_access_log_buffer,
+                            magnus_access_log_length);
+    (void) ignored;
+    magnus_access_log_length = 0;
+}
+
+static void
+magnus_access_log(const char *request_id, const char *method,
+                  const char *target, unsigned status, double latency_ms)
+{
+    int written;
+    if (!magnus_access_log_enabled) return;
+    magnus_access_log_seen++;
+    if (magnus_access_log_sample > 1
+        && (magnus_access_log_seen % magnus_access_log_sample) != 0) return;
+    written = snprintf(magnus_access_log_buffer + magnus_access_log_length,
+        sizeof(magnus_access_log_buffer) - magnus_access_log_length,
+        "access request_id=%s method=%s target=%s status=%u "
+        "latency_ms=%.2f\n", request_id, method, target, status, latency_ms);
+    if (written < 0) return;
+    if ((size_t) written >= sizeof(magnus_access_log_buffer)
+                            - magnus_access_log_length) {
+        magnus_access_log_flush();
+        written = snprintf(magnus_access_log_buffer,
+            sizeof(magnus_access_log_buffer),
+            "access request_id=%s method=%s target=%s status=%u "
+            "latency_ms=%.2f\n", request_id, method, target, status,
+            latency_ms);
+        if (written > 0 && (size_t) written < sizeof(magnus_access_log_buffer))
+            magnus_access_log_length = (size_t) written;
+        return;
+    }
+    magnus_access_log_length += (size_t) written;
+}
+
+static void
+magnus_record_latency(double latency_ms)
+{
+    size_t index;
+    magnus_latency_count++;
+    magnus_latency_sum_ms += latency_ms;
+    for (index = 0; index < MAGNUS_LATENCY_BUCKETS; index++) {
+        if (latency_ms <= magnus_latency_bucket_bounds_ms[index])
+            magnus_latency_bucket_counts[index]++;
+    }
 }
 
 /* Admits or rejects one request from `address` against the shared
@@ -483,9 +600,13 @@ magnus_proxy_fail(int epoll_fd, magnus_connection_t *connection,
                             status == 504 ? "gateway timeout\n"
                                           : "bad gateway\n",
                             false, true, &request);
-    fprintf(stderr,
-            "access request_id=%s method=PROXY target=upstream status=%u\n",
-            request.request_id, status);
+    {
+        double latency_ms = (double) (magnus_now_ms()
+                                      - connection->request_started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(request.request_id, connection->proxy_log_method,
+                          connection->proxy_log_target, status, latency_ms);
+    }
     return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
 }
 
@@ -691,6 +812,15 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     magnus_requests_total++;
     if (upstream_status >= 500) magnus_responses_5xx++;
     else if (upstream_status >= 400) magnus_responses_4xx++;
+    {
+        double latency_ms = (double) (magnus_now_ms()
+                                      - connection->request_started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(connection->proxy_request_id,
+                          connection->proxy_log_method,
+                          connection->proxy_log_target, upstream_status,
+                          latency_ms);
+    }
     return magnus_proxy_flush(epoll_fd, connection);
 }
 
@@ -1004,8 +1134,10 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
     /* /healthz and /metrics stay exempt: they are exactly what an operator
      * or monitoring system needs to reach to see *why* real traffic is
      * being throttled, so gating them behind the same limiter would be
-     * self-defeating. */
-    if (strcmp(request.path, "/healthz") != 0
+     * self-defeating. The admin channel is exempt outright -- access to
+     * it is already gated by its socket's own file permissions. */
+    if (!connection->admin_only
+        && strcmp(request.path, "/healthz") != 0
         && strcmp(request.path, "/metrics") != 0
         && !magnus_rate_check(connection->client_address, time(NULL))) {
         magnus_rate_limited_total++;
@@ -1023,13 +1155,14 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
         magnus_prepare_response(connection, 200, "OK", "text/plain",
                                 "magnus: ok\n", head_only, close_connection,
                                 &request);
-    } else if (strcmp(request.path, "/metrics") == 0) {
+    } else if (strcmp(request.path, "/metrics") == 0
+               && (connection->admin_only || !magnus_admin_enabled)) {
         /* Sized to stay well clear of MAGNUS_OUTPUT_LIMIT once wrapped in
-         * response headers; the per-endpoint loop below stops appending
-         * once it runs out of room rather than risk overflowing the
-         * response envelope, so the fixed aggregate lines are always
-         * present even for a cluster too large to fully detail here. */
-        char metrics[700];
+         * response headers; the per-endpoint/per-bucket loops below stop
+         * appending once they run out of room rather than risk
+         * overflowing the response envelope, so the fixed aggregate lines
+         * are always present even when there is not room for full detail. */
+        char metrics[1536];
         size_t written;
         size_t healthy = 0;
         for (size_t index = 0; index < magnus_cluster.count; index++) {
@@ -1067,17 +1200,58 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
             if (line < 0 || (size_t) line >= sizeof(metrics) - written) break;
             written += (size_t) line;
         }
+        if (written < sizeof(metrics)) {
+            int line = snprintf(metrics + written, sizeof(metrics) - written,
+                "# TYPE magnus_request_duration_milliseconds histogram\n");
+            if (line > 0 && (size_t) line < sizeof(metrics) - written)
+                written += (size_t) line;
+        }
+        for (size_t index = 0; index < MAGNUS_LATENCY_BUCKETS
+             && written < sizeof(metrics); index++) {
+            int line = snprintf(metrics + written, sizeof(metrics) - written,
+                "magnus_request_duration_milliseconds_bucket{le=\"%g\"} %llu\n",
+                magnus_latency_bucket_bounds_ms[index],
+                (unsigned long long) magnus_latency_bucket_counts[index]);
+            if (line < 0 || (size_t) line >= sizeof(metrics) - written) break;
+            written += (size_t) line;
+        }
+        if (written < sizeof(metrics)) {
+            int line = snprintf(metrics + written, sizeof(metrics) - written,
+                "magnus_request_duration_milliseconds_bucket{le=\"+Inf\"} %llu\n"
+                "magnus_request_duration_milliseconds_sum %.2f\n"
+                "magnus_request_duration_milliseconds_count %llu\n",
+                (unsigned long long) magnus_latency_count,
+                magnus_latency_sum_ms,
+                (unsigned long long) magnus_latency_count);
+            if (line > 0 && (size_t) line < sizeof(metrics) - written)
+                written += (size_t) line;
+        }
         magnus_prepare_response(connection, 200, "OK",
                                 "text/plain; version=0.0.4", metrics,
                                 head_only, close_connection, &request);
+    } else if (connection->admin_only) {
+        /* Everything else is off-limits on the admin channel. */
+        magnus_prepare_response(connection, 404, "Not Found", "text/plain",
+                                "not found\n", head_only, close_connection,
+                                &request);
     } else if (magnus_upstream_enabled
                && strncmp(request.path, "/proxy", 6) == 0
                && (request.path[6] == '/' || request.path[6] == '\0')) {
         if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
                                         parsed.affinity_key) == 0) {
-            fprintf(stderr,
-                    "access request_id=%s method=%s target=%s status=proxy\n",
-                    request.request_id, request.method, request.path);
+            /* No access-log line here: the request has not completed yet
+             * (that happens later, asynchronously, once the upstream
+             * responds -- see magnus_proxy_receive_headers/_fail). Just
+             * remember what the client asked for so that completion line
+             * can still report it. */
+            strncpy(connection->proxy_log_method, request.method,
+                   sizeof(connection->proxy_log_method) - 1);
+            connection->proxy_log_method[
+                sizeof(connection->proxy_log_method) - 1] = '\0';
+            strncpy(connection->proxy_log_target, request.path,
+                   sizeof(connection->proxy_log_target) - 1);
+            connection->proxy_log_target[
+                sizeof(connection->proxy_log_target) - 1] = '\0';
             return 1;
         }
         magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
@@ -1098,8 +1272,13 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
                                     &request);
     }
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_LOG, &request);
-    fprintf(stderr, "access request_id=%s method=%s target=%s status=%u\n",
-            request.request_id, request.method, request.path, request.status);
+    {
+        double latency_ms = (double) (magnus_now_ms()
+                                      - connection->request_started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(request.request_id, request.method, request.path,
+                          request.status, latency_ms);
+    }
     return 0;
 }
 
@@ -1124,6 +1303,7 @@ magnus_process_input(int epoll_fd, magnus_connection_t *connection)
     }
 
     request_length = (size_t) (end - connection->input);
+    connection->request_started_ms = magnus_now_ms();
     int process_result = magnus_process_request(epoll_fd, connection,
                                                 request_length);
     memmove(connection->input, connection->input + request_length,
@@ -1255,13 +1435,18 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
 }
 
 static int
-magnus_accept_connections(int epoll_fd, int listener)
+magnus_accept_connections(int epoll_fd, int listener, bool admin)
 {
     for (;;) {
-        struct sockaddr_in peer_address;
+        struct sockaddr_in peer_address = {0};
         socklen_t peer_length = sizeof(peer_address);
-        int client = accept4(listener, (struct sockaddr *) &peer_address,
-                             &peer_length, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        /* The admin listener is a Unix domain socket: it has no IPv4 peer
+         * address, and access to it is already controlled by the socket
+         * file's own permissions, so we do not bother asking for one. */
+        int client = admin
+            ? accept4(listener, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)
+            : accept4(listener, (struct sockaddr *) &peer_address,
+                      &peer_length, SOCK_NONBLOCK | SOCK_CLOEXEC);
         magnus_connection_t *connection;
         struct epoll_event event;
 
@@ -1305,7 +1490,12 @@ magnus_accept_connections(int epoll_fd, int listener)
          * ending up on 0, breaking static file lookups. */
         connection->upstream_fd = -1;
         connection->client_address = peer_address.sin_addr;
-        if (magnus_tls_context != NULL) {
+        connection->admin_only = admin;
+        /* No TLS on the admin channel: it is a local Unix socket, already
+         * confidential and access-controlled by filesystem permissions,
+         * and keeping it TLS-free keeps the isolation story simple (one
+         * fewer thing that could be misconfigured to leak metrics). */
+        if (!admin && magnus_tls_context != NULL) {
             connection->tls = SSL_new(magnus_tls_context);
             if (connection->tls == NULL
                 || SSL_set_fd(connection->tls, client) != 1) {
@@ -1320,6 +1510,8 @@ magnus_accept_connections(int epoll_fd, int listener)
             connection->tls_ready = true;
         }
         connection->last_active = time(NULL);
+        connection->header_deadline =
+            connection->last_active + MAGNUS_HEADER_TIMEOUT_SECONDS;
         magnus_connections[client] = connection;
         event = (struct epoll_event) {
             .events = EPOLLIN | EPOLLRDHUP,
@@ -1344,8 +1536,19 @@ magnus_expire_idle(int epoll_fd, time_t now)
     int fd;
     for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
         magnus_connection_t *connection = magnus_connections[fd];
-        if (connection != NULL
-            && now - connection->last_active > MAGNUS_IDLE_SECONDS) {
+        if (connection == NULL) continue;
+        if (now - connection->last_active > MAGNUS_IDLE_SECONDS) {
+            magnus_close_connection(epoll_fd, connection);
+            continue;
+        }
+        /* Slowloris guard: a trickle of bytes keeps resetting last_active
+         * above without ever finishing a request, so it alone cannot
+         * catch this. Only applies before the first request on this
+         * connection has ever completed (request_started_ms == 0) --
+         * legitimate keep-alive idling between later requests is exactly
+         * what MAGNUS_IDLE_SECONDS above is for. */
+        if (connection->request_started_ms == 0
+            && now > connection->header_deadline) {
             magnus_close_connection(epoll_fd, connection);
         }
     }
@@ -1521,6 +1724,33 @@ magnus_create_listener(unsigned port)
     return listener;
 }
 
+/* Binds the admin-only Unix domain socket listener at `path`: mode 0700
+ * (owner-only) is the access control for /healthz and /metrics on this
+ * channel, in place of an in-process RBAC layer -- whoever can reach this
+ * socket file can reach admin endpoints, same as any other Unix socket
+ * service. A stale socket file from a previous run (e.g. an unclean
+ * shutdown) is removed first so bind() does not fail with EADDRINUSE. */
+static int
+magnus_create_admin_listener(const char *path)
+{
+    int listener;
+    struct sockaddr_un address = {0};
+
+    if (strlen(path) >= sizeof(address.sun_path)) return -1;
+    listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (listener < 0) return -1;
+    unlink(path);
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, path);
+    if (bind(listener, (struct sockaddr *) &address, sizeof(address)) < 0
+        || chmod(path, 0700) < 0 || listen(listener, SOMAXCONN) < 0) {
+        close(listener);
+        unlink(path);
+        return -1;
+    }
+    return listener;
+}
+
 /* Builds new root-fd/TLS-context/cluster/rate-limit state from a validated
  * config and, only once every referenced resource actually opened
  * successfully, swaps it into the live globals in one shot. Since magnus
@@ -1590,6 +1820,8 @@ magnus_apply_config(const magnus_config_t *config)
         magnus_rate_limit_rps = config->rate_limit_rps;
         magnus_rate_limit_burst = config->rate_limit_burst;
     }
+    magnus_access_log_enabled = config->access_log_enabled;
+    magnus_access_log_sample = config->access_log_sample;
     return 0;
 }
 
@@ -1613,6 +1845,13 @@ magnus_handle_reload(void)
         fprintf(stderr, "magnus: reload rejected: changing the listening "
                         "port requires a restart (running on %u, config "
                         "has %u)\n", magnus_listen_port, config.port);
+        return;
+    }
+    if (config.has_admin_socket != magnus_admin_enabled
+        || (config.has_admin_socket
+            && strcmp(config.admin_socket, magnus_admin_socket_path) != 0)) {
+        fprintf(stderr, "magnus: reload rejected: changing admin_socket "
+                        "requires a restart\n");
         return;
     }
     if (magnus_apply_config(&config) != 0) {
@@ -1655,6 +1894,10 @@ magnus_parse_options(int argc, char **argv)
             fprintf(stderr, "magnus: config: a referenced root/tls "
                             "resource could not be opened\n");
             exit(2);
+        }
+        if (config.has_admin_socket) {
+            strcpy(magnus_admin_socket_path, config.admin_socket);
+            magnus_admin_enabled = true;
         }
         return config.port;
     }
@@ -1741,6 +1984,27 @@ magnus_parse_options(int argc, char **argv)
             magnus_rate_limit_rps = rps;
             magnus_rate_limit_burst = burst;
             magnus_rate_limit_enabled = true;
+        } else if (strcmp(argv[index], "--admin-socket") == 0) {
+            if (strlen(argv[index + 1]) >= sizeof(magnus_admin_socket_path))
+                break;
+            strcpy(magnus_admin_socket_path, argv[index + 1]);
+            magnus_admin_enabled = true;
+        } else if (strcmp(argv[index], "--access-log") == 0) {
+            if (strcmp(argv[index + 1], "on") == 0) {
+                magnus_access_log_enabled = true;
+            } else if (strcmp(argv[index + 1], "off") == 0) {
+                magnus_access_log_enabled = false;
+            } else {
+                break;
+            }
+        } else if (strcmp(argv[index], "--access-log-sample") == 0) {
+            char *end;
+            unsigned long sample;
+            errno = 0;
+            sample = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || sample == 0
+                || sample > 1000000) break;
+            magnus_access_log_sample = (unsigned) sample;
         } else {
             break;
         }
@@ -1769,6 +2033,8 @@ magnus_parse_options(int argc, char **argv)
                     "[--tls-cert <pem> --tls-key <pem>] "
                     "[--upstream <ipv4:port[:weight]> ...] "
                     "[--rate-limit <rps[:burst]>] "
+                    "[--admin-socket <path>] "
+                    "[--access-log on|off] [--access-log-sample <n>] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
     exit(2);
@@ -1831,6 +2097,27 @@ main(int argc, char **argv)
         close(listener);
         return 1;
     }
+    if (magnus_admin_enabled) {
+        struct epoll_event admin_event;
+        magnus_admin_listener =
+            magnus_create_admin_listener(magnus_admin_socket_path);
+        if (magnus_admin_listener < 0) {
+            perror("magnus: admin-socket");
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+        admin_event = (struct epoll_event) { .events = EPOLLIN,
+                                             .data.fd = magnus_admin_listener };
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, magnus_admin_listener,
+                      &admin_event) < 0) {
+            perror("magnus: admin-socket epoll_ctl");
+            close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+    }
 
     magnus_phase_init(&magnus_phases);
     if (magnus_phase_register(&magnus_phases, MAGNUS_PHASE_INGRESS, 100,
@@ -1870,7 +2157,12 @@ main(int argc, char **argv)
             magnus_connection_t *connection;
             int result = 0;
             if (fd == listener) {
-                (void) magnus_accept_connections(epoll_fd, listener);
+                (void) magnus_accept_connections(epoll_fd, listener, false);
+                continue;
+            }
+            if (magnus_admin_enabled && fd == magnus_admin_listener) {
+                (void) magnus_accept_connections(epoll_fd, magnus_admin_listener,
+                                                 true);
                 continue;
             }
             if (fd >= 0 && fd < MAGNUS_MAX_FDS
@@ -1915,6 +2207,7 @@ main(int argc, char **argv)
             magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             magnus_health_tick(epoll_fd, now);
+            magnus_access_log_flush();
             last_sweep = now;
         }
     }
@@ -1926,8 +2219,13 @@ main(int argc, char **argv)
     }
     close(epoll_fd);
     close(listener);
+    if (magnus_admin_listener >= 0) {
+        close(magnus_admin_listener);
+        unlink(magnus_admin_socket_path);
+    }
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
+    magnus_access_log_flush();
     fprintf(stderr, "magnus: stopped\n");
     return 0;
 }

@@ -115,6 +115,8 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     bool port_seen = false;
 
     memset(config, 0, sizeof(*config));
+    config->access_log_enabled = true;
+    config->access_log_sample = 1;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     file = fopen(path, "r");
@@ -236,6 +238,38 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+        } else if (strcmp(key, "access_log") == 0) {
+            if (strcmp(value, "on") == 0) {
+                config->access_log_enabled = true;
+            } else if (strcmp(value, "off") == 0) {
+                config->access_log_enabled = false;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'access_log' must be 'on' or "
+                                        "'off', got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+        } else if (strcmp(key, "access_log_sample") == 0) {
+            unsigned long sample;
+            if (!magnus_config_parse_uint(value, 1, 1000000, &sample)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'access_log_sample' must be a "
+                                        "positive integer, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->access_log_sample = (unsigned) sample;
+        } else if (strcmp(key, "admin_socket") == 0) {
+            if (*value == '\0' || strlen(value) >= sizeof(config->admin_socket)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'admin_socket' path too long or "
+                                        "empty");
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(config->admin_socket, value);
+            config->has_admin_socket = true;
         } else {
             magnus_config_set_error(error, error_capacity, line_number,
                                     "unknown key '%s'", key);

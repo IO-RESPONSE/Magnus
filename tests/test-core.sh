@@ -374,6 +374,188 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 
+# M6: admin channel isolation -- /metrics is withdrawn from the main (TCP)
+# listener once --admin-socket is configured, but /healthz stays; the
+# Unix socket serves /metrics (with the latency histogram) but rejects
+# anything else, and is created with owner-only permissions.
+port_admin=$((port + 16))
+admin_socket="$web_root/admin.sock"
+"$binary" --port "$port_admin" --root "$web_root" \
+  --admin-socket "$admin_socket" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_admin/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_admin/metrics")" = 404
+test "$(curl --fail --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_admin/healthz")" = 200
+test "$(curl --unix-socket "$admin_socket" --silent --output /dev/null \
+  --write-out '%{http_code}' http://localhost/metrics)" = 200
+curl --unix-socket "$admin_socket" --fail --silent http://localhost/metrics \
+  | grep -q '^magnus_request_duration_milliseconds_bucket{le="1"}'
+test "$(curl --unix-socket "$admin_socket" --silent --output /dev/null \
+  --write-out '%{http_code}' http://localhost/hello.txt)" = 404
+stat -c '%a' "$admin_socket" | grep -q '^700$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# M6: access log off and 1-in-N sampling.
+port_noaccess=$((port + 17))
+"$binary" --port "$port_noaccess" --root "$web_root" --access-log off \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_noaccess/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+before_lines=$(wc -l < "$log")
+curl --fail --silent -o /dev/null "http://127.0.0.1:$port_noaccess/hello.txt"
+curl --fail --silent -o /dev/null "http://127.0.0.1:$port_noaccess/hello.txt"
+sleep 2
+after_lines=$(wc -l < "$log")
+test "$before_lines" = "$after_lines"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+port_sample=$((port + 18))
+sample_log=$(mktemp)
+"$binary" --port "$port_sample" --root "$web_root" --access-log-sample 3 \
+  2>"$sample_log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_sample/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+for attempt in 1 2 3 4 5 6; do
+  curl --fail --silent -o /dev/null "http://127.0.0.1:$port_sample/hello.txt"
+done
+sleep 2
+test "$(grep -c '^access ' "$sample_log")" = 2
+rm -f "$sample_log"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# M6: slowloris -- a client that trickles request bytes one at a time,
+# never idling long enough to trip MAGNUS_IDLE_SECONDS, must still be cut
+# off by the header-phase deadline instead of holding the connection (and
+# its fd) open indefinitely.
+port_slow=$((port + 19))
+"$binary" --port "$port_slow" --root "$web_root" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_slow/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+slowloris_start=$(date +%s)
+python3 -c "
+import socket, time
+s = socket.create_connection(('127.0.0.1', $port_slow), timeout=15)
+line = b'GET /hello.txt HTTP/1.1\r\n'
+for byte in line:
+    s.send(bytes([byte]))
+    time.sleep(0.3)
+try:
+    s.settimeout(15)
+    remaining = s.recv(4096)
+except socket.timeout:
+    remaining = b''
+s.close()
+import sys
+sys.stdout.write(remaining.decode('latin1'))
+" > "$web_root/slowloris-response.txt" 2>&1 || true
+slowloris_elapsed=$(( $(date +%s) - slowloris_start ))
+# the connection must have been closed (headers never completed) well
+# under the 30s idle timeout, proving the header-phase deadline -- not
+# idle expiry -- is what ended it.
+test "$slowloris_elapsed" -lt 20
+test ! -s "$web_root/slowloris-response.txt"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# M6: malformed request handling -- raw garbage bytes over the wire (never
+# something curl itself would ever construct) must not crash the server,
+# and it must keep serving legitimate requests afterward.
+port_malformed=$((port + 20))
+"$binary" --port "$port_malformed" --root "$web_root" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_malformed/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+python3 -c "
+import socket
+payloads = [
+    bytes(range(256)) * 4,
+    b'GET ' + b'A' * 5000 + b' HTTP/1.1\r\n\r\n',
+    b'GET / HTTP/9.9\r\n\r\n',
+    b'\r\n\r\n\r\n\r\n',
+    b'not even close to http',
+    b'GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n',
+    b'G\x00T / HTTP/1.1\r\nHost: a\r\n\r\n',
+]
+for payload in payloads:
+    s = socket.create_connection(('127.0.0.1', $port_malformed), timeout=5)
+    s.sendall(payload)
+    try:
+        s.settimeout(2)
+        s.recv(4096)
+    except socket.timeout:
+        pass
+    s.close()
+print('sent', len(payloads), 'malformed payloads')
+"
+test "$(curl --fail --silent "http://127.0.0.1:$port_malformed/healthz")" \
+  = 'magnus: ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+grep -q 'magnus: stopped' "$log"
+
+# M6: fd exhaustion -- under a tight per-process fd limit, magnus must
+# keep running (not crash) and recover once connections close, even
+# though it cannot accept everything while the limit is being hit.
+port_fdlimit=$((port + 21))
+(
+  ulimit -n 40
+  exec "$binary" --port "$port_fdlimit" --root "$web_root"
+) 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_fdlimit/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+python3 -c "
+import socket
+socks = []
+try:
+    for _ in range(80):
+        s = socket.create_connection(('127.0.0.1', $port_fdlimit), timeout=2)
+        socks.append(s)
+except OSError:
+    pass
+print('opened', len(socks), 'connections under fd pressure')
+for s in socks:
+    s.close()
+"
+sleep 1
+test "$(curl --fail --silent "http://127.0.0.1:$port_fdlimit/healthz")" \
+  = 'magnus: ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
 tls_port=$((port + 1))
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
   -keyout "$web_root/server.key" -out "$web_root/server.crt" >/dev/null 2>&1

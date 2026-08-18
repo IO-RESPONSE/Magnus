@@ -50,6 +50,9 @@ main(void)
     assert(!config.has_tls);
     assert(config.upstream_count == 0);
     assert(!config.has_rate_limit);
+    assert(config.access_log_enabled);
+    assert(config.access_log_sample == 1);
+    assert(!config.has_admin_socket);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -64,14 +67,20 @@ main(void)
             "upstream = 10.0.0.1:8001:2\n"
             "upstream = 10.0.0.2:8002\n"
             "rate_limit_rps = 50\n"
-            "rate_limit_burst = 100\n",
-            scratch_dir, cert_path, key_path);
+            "rate_limit_burst = 100\n"
+            "access_log = off\n"
+            "access_log_sample = 20\n"
+            "admin_socket = %s/admin.sock\n",
+            scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
     }
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_OK);
     assert(config.port == 9090);
     assert(config.has_root && strcmp(config.root, scratch_dir) == 0);
+    assert(!config.access_log_enabled);
+    assert(config.access_log_sample == 20);
+    assert(config.has_admin_socket);
     assert(config.has_tls);
     assert(strcmp(config.tls_cert, cert_path) == 0);
     assert(strcmp(config.tls_key, key_path) == 0);
@@ -129,6 +138,17 @@ main(void)
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
     assert(strstr(error, "rate_limit") != NULL);
+
+    /* access_log must be exactly on/off */
+    write_file(config_path, "port = 8080\naccess_log = sometimes\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "access_log") != NULL);
+
+    /* access_log_sample must be a positive integer */
+    write_file(config_path, "port = 8080\naccess_log_sample = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
 
     /* file that does not exist at all */
     assert(magnus_config_load(path_in_scratch("missing.conf"), &config,
