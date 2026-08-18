@@ -25,7 +25,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "0.2.0-dev"
+#define MAGNUS_VERSION "1.0.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192

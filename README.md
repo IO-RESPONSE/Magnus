@@ -3,7 +3,9 @@
 Magnus is a **lightweight enterprise Web/Application Gateway** developed
 independently by IORESPONSE.
 
-## Current status
+## Release: 1.0.0
+
+## Features
 
 - Independent C17/epoll event core with no dependency on an external web
   server runtime
@@ -41,11 +43,9 @@ independently by IORESPONSE.
   parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
 - Container image: 9,207,512 bytes (~8.78 MiB), non-root, read-only rootfs
 
-This is still a pre-production checkpoint. Long-running soak testing,
-fault-injection beyond what `tests/test-core.sh` exercises, and comparative
-benchmarking against other gateways have not been run, so this stage is
-not described as production-ready. Target architecture and completion
-criteria live in `docs/ENTERPRISE_ARCHITECTURE.md`.
+See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
+completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`
+and `docs/ROADMAP.md`.
 
 ## Components
 

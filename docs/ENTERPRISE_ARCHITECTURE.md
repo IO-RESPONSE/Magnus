@@ -38,14 +38,9 @@ magnusd control plane
 data plane은 요청 경로에서 파일 I/O와 동적 할당을 최소화한다. 설정은 불변 snapshot으로
 컴파일한 뒤 generation 단위로 교체하며, 기존 연결은 이전 generation에서 배출한다.
 
-## 단계별 개발 순서
+## 개발 순서
 
-1. **M0 Native Core** — epoll, HTTP/1.1, keep-alive, phase API, graceful shutdown.
-2. **M1 Edge Server** — 안전한 parser, static files, sendfile, access/error log, TLS 1.3.
-3. **M2 Gateway** — reverse proxy, streaming, timeout/circuit breaker, active/passive health.
-4. **M3 Service Groups** — 격리된 pool, weighted routing, session affinity, retry budget.
-5. **M4 Control Plane** — config transaction, hot reload, certificate rotation, audit/RBAC.
-6. **M5 Enterprise Release** — stable module ABI, metrics/tracing, HA tests, fuzzing, SBOM.
+1.0.0까지 실제로 구현·검증된 범위와 그 이후 순서는 `docs/ROADMAP.md`에 정리한다.
 
 ## 엔터프라이즈 완료 기준
 
@@ -75,7 +70,6 @@ routing, audit다. 기능별 모듈은 이 Phase Engine SDK에 handler를 등록
 
 ## 크기 예산
 
-현재 0.1 native 이미지는 약 5.65MiB다. Core+HTTP/1.1은 7MiB 이하, TLS와 proxy를
-포함한 edge profile은 10MiB 전후를 목표로 한다. 관리 console과 control plane은
-data-plane 이미지에 넣지 않는다. 크기보다 메모리 상한, tail latency, 안전성을 우선하며
-각 profile의 기능과 크기를 함께 공개한다.
+1.0.0 data-plane 이미지는 9,207,512 bytes(약 8.78MiB)다. 관리 console과 control
+plane은 data-plane 이미지에 넣지 않는다. 크기보다 메모리 상한, tail latency, 안전성을
+우선하며 각 profile의 기능과 크기를 함께 공개한다.
