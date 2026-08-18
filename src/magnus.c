@@ -1,4 +1,5 @@
 #include "magnus_phase.h"
+#include "magnus_config.h"
 #include "magnus_http.h"
 #include "magnus_policy.h"
 #include "magnus_proxy.h"
@@ -128,6 +129,14 @@ static double magnus_rate_limit_rps;
 static double magnus_rate_limit_burst;
 static magnus_rate_entry_t magnus_rate_table[MAGNUS_RATE_TABLE_SIZE];
 
+/* --config <path> mode: magnus_config_path holds the file SIGHUP reload
+ * re-reads. Without it (plain --port/--root/... flags), SIGHUP has
+ * nothing to reload against and is a documented no-op. */
+static bool magnus_config_mode;
+static char magnus_config_path[MAGNUS_CONFIG_PATH_MAX];
+static unsigned magnus_listen_port;
+static volatile sig_atomic_t magnus_reload_requested;
+
 static int magnus_update_interest(int epoll_fd,
                                   magnus_connection_t *connection,
                                   uint32_t events);
@@ -150,6 +159,13 @@ magnus_signal_handler(int signal_number)
 {
     (void) signal_number;
     magnus_running = 0;
+}
+
+static void
+magnus_reload_signal_handler(int signal_number)
+{
+    (void) signal_number;
+    magnus_reload_requested = 1;
 }
 
 /* Fills `out[32]` (plus a NUL terminator, so `out` must be at least 33
@@ -1276,6 +1292,18 @@ magnus_accept_connections(int epoll_fd, int listener)
         connection->input_capacity = MAGNUS_INITIAL_INPUT;
         connection->fd = client;
         connection->file_fd = -1;
+        /* calloc() zero-initializes the rest of the struct, so without
+         * this, upstream_fd defaults to 0 (not "no upstream") for every
+         * connection that never proxies. magnus_close_connection()'s only
+         * "no upstream" check is `>= 0`, so that 0 reads as a real fd to
+         * tear down -- silently close()ing fd 0 on every ordinary
+         * connection's cleanup. Harmless by pure accident as long as fd 0
+         * was inherited stdin magnus never reads -- but the very next
+         * unrelated open() elsewhere (SIGHUP reload re-opening the root
+         * directory, in particular) then silently lands on fd 0 instead,
+         * which is exactly what surfaced this: a reload's new root fd
+         * ending up on 0, breaking static file lookups. */
+        connection->upstream_fd = -1;
         connection->client_address = peer_address.sin_addr;
         if (magnus_tls_context != NULL) {
             connection->tls = SSL_new(magnus_tls_context);
@@ -1493,6 +1521,109 @@ magnus_create_listener(unsigned port)
     return listener;
 }
 
+/* Builds new root-fd/TLS-context/cluster/rate-limit state from a validated
+ * config and, only once every referenced resource actually opened
+ * successfully, swaps it into the live globals in one shot. Since magnus
+ * is single-threaded (epoll, no worker threads), this swap is atomic from
+ * every other execution point's perspective -- there is no window in
+ * which another code path could observe half-old/half-new state. It
+ * intentionally never touches the listening port or in-flight
+ * connections: existing proxy attempts already hold their own connected
+ * upstream fd and never re-consult magnus_cluster, and already-open
+ * static-file fds and already-established TLS sessions keep working via
+ * OpenSSL's own SSL_CTX refcounting -- so in-flight requests "drain"
+ * naturally against whatever generation they started under, while every
+ * request that begins after this function returns sees the new one.
+ * Returns 0 on success, -1 if a filesystem/TLS resource named in the
+ * config could not actually be opened despite passing
+ * magnus_config_load()'s validation (e.g. removed between check and
+ * apply); nothing is changed in that case. */
+static int
+magnus_apply_config(const magnus_config_t *config)
+{
+    int new_root_fd = -1;
+    SSL_CTX *new_tls_context = NULL;
+    magnus_cluster_t new_cluster;
+    size_t index;
+
+    if (config->has_root) {
+        new_root_fd = open(config->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC
+                           | O_NOFOLLOW);
+        if (new_root_fd < 0) return -1;
+    }
+    if (config->has_tls) {
+        new_tls_context = SSL_CTX_new(TLS_server_method());
+        if (new_tls_context == NULL
+            || SSL_CTX_set_min_proto_version(new_tls_context,
+                                             TLS1_2_VERSION) != 1
+            || SSL_CTX_use_certificate_chain_file(new_tls_context,
+                                                  config->tls_cert) != 1
+            || SSL_CTX_use_PrivateKey_file(new_tls_context, config->tls_key,
+                                           SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_check_private_key(new_tls_context) != 1) {
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+        SSL_CTX_set_options(new_tls_context, SSL_OP_NO_COMPRESSION);
+    }
+    magnus_cluster_init(&new_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS);
+    for (index = 0; index < config->upstream_count; index++) {
+        if (magnus_cluster_add(&new_cluster, config->upstreams[index].address,
+                               config->upstreams[index].port,
+                               config->upstreams[index].weight) != 0) {
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+    }
+
+    if (magnus_root_fd >= 0) close(magnus_root_fd);
+    magnus_root_fd = new_root_fd;
+    if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
+    magnus_tls_context = new_tls_context;
+    magnus_cluster = new_cluster;
+    magnus_upstream_enabled = new_cluster.count > 0;
+    magnus_rate_limit_enabled = config->has_rate_limit;
+    if (config->has_rate_limit) {
+        magnus_rate_limit_rps = config->rate_limit_rps;
+        magnus_rate_limit_burst = config->rate_limit_burst;
+    }
+    return 0;
+}
+
+static void
+magnus_handle_reload(void)
+{
+    magnus_config_t config;
+    char error[192];
+
+    if (!magnus_config_mode) {
+        fprintf(stderr, "magnus: reload ignored: not started with "
+                        "--config, nothing to reload from\n");
+        return;
+    }
+    if (magnus_config_load(magnus_config_path, &config, error, sizeof(error))
+        != MAGNUS_CONFIG_OK) {
+        fprintf(stderr, "magnus: reload rejected: %s\n", error);
+        return;
+    }
+    if (config.port != magnus_listen_port) {
+        fprintf(stderr, "magnus: reload rejected: changing the listening "
+                        "port requires a restart (running on %u, config "
+                        "has %u)\n", magnus_listen_port, config.port);
+        return;
+    }
+    if (magnus_apply_config(&config) != 0) {
+        fprintf(stderr, "magnus: reload rejected: a referenced root/tls "
+                        "resource could not be opened\n");
+        return;
+    }
+    fprintf(stderr, "magnus: reload applied generation=%016llx\n",
+            (unsigned long long) magnus_config_hash(&config));
+}
+
 static unsigned
 magnus_parse_options(int argc, char **argv)
 {
@@ -1501,6 +1632,31 @@ magnus_parse_options(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         printf("Magnus Web Engine %s (native C17/epoll)\n", MAGNUS_VERSION);
         exit(0);
+    }
+    if (argc == 3 && strcmp(argv[1], "--config") == 0) {
+        /* Config-file mode replaces every other flag: port, root, TLS,
+         * upstream cluster and rate limit all come from the file, and the
+         * same path is remembered for SIGHUP to re-validate and apply
+         * later (magnus_handle_reload). */
+        magnus_config_t config;
+        char error[192];
+        if (magnus_config_load(argv[2], &config, error, sizeof(error))
+            != MAGNUS_CONFIG_OK) {
+            fprintf(stderr, "magnus: config: %s\n", error);
+            exit(2);
+        }
+        if (strlen(argv[2]) >= sizeof(magnus_config_path)) {
+            fprintf(stderr, "magnus: config: path too long\n");
+            exit(2);
+        }
+        strcpy(magnus_config_path, argv[2]);
+        magnus_config_mode = true;
+        if (magnus_apply_config(&config) != 0) {
+            fprintf(stderr, "magnus: config: a referenced root/tls "
+                            "resource could not be opened\n");
+            exit(2);
+        }
+        return config.port;
     }
     const char *certificate = NULL;
     const char *private_key = NULL;
@@ -1612,16 +1768,46 @@ magnus_parse_options(int argc, char **argv)
     fprintf(stderr, "usage: %s --port <1-65535> [--root <directory>] "
                     "[--tls-cert <pem> --tls-key <pem>] "
                     "[--upstream <ipv4:port[:weight]> ...] "
-                    "[--rate-limit <rps[:burst]>] | --version\n",
-            argv[0]);
+                    "[--rate-limit <rps[:burst]>] "
+                    "| %s --config <path> | %s --version\n",
+            argv[0], argv[0], argv[0]);
     exit(2);
+}
+
+/* Defense in depth alongside the upstream_fd fix above: magnus never
+ * reads stdin, so fd 0 is unconditionally pinned to our own /dev/null
+ * before anything else runs. A process spawned detached from a
+ * controlling terminal (magnusd's fork()+exec() child, in particular) can
+ * inherit fd 0 as something that looks valid at startup but turns out to
+ * be fragile; owning it ourselves from the very first instruction removes
+ * any dependency on what was inherited. stdout/stderr are left alone when
+ * already valid (used for logging); only a genuine gap there is filled. */
+static void
+magnus_ensure_standard_fds(void)
+{
+    int placeholder = open("/dev/null", O_RDWR);
+    if (placeholder < 0) return;
+    if (placeholder != 0) {
+        dup2(placeholder, 0);
+        close(placeholder);
+    }
+    for (int fd = 1; fd <= 2; fd++) {
+        if (fcntl(fd, F_GETFD) < 0 && errno == EBADF) {
+            int opened = open("/dev/null", O_RDWR);
+            if (opened >= 0 && opened != fd) close(opened);
+        }
+    }
 }
 
 int
 main(int argc, char **argv)
 {
-    unsigned port = magnus_parse_options(argc, argv);
-    int listener = magnus_create_listener(port);
+    unsigned port;
+    int listener;
+    magnus_ensure_standard_fds();
+    port = magnus_parse_options(argc, argv);
+    magnus_listen_port = port;
+    listener = magnus_create_listener(port);
     int epoll_fd;
     struct epoll_event listener_event;
     struct epoll_event events[MAGNUS_MAX_EVENTS];
@@ -1654,6 +1840,7 @@ main(int argc, char **argv)
     }
     signal(SIGINT, magnus_signal_handler);
     signal(SIGTERM, magnus_signal_handler);
+    signal(SIGHUP, magnus_reload_signal_handler);
     signal(SIGPIPE, SIG_IGN);
     for (size_t index = 0; index < MAGNUS_MAX_UPSTREAMS; index++) {
         magnus_health_probe_fd[index] = -1;
@@ -1661,9 +1848,15 @@ main(int argc, char **argv)
     fprintf(stderr, "magnus: native engine listening on 0.0.0.0:%u\n", port);
 
     while (magnus_running) {
-        int ready = epoll_wait(epoll_fd, events, MAGNUS_MAX_EVENTS, 1000);
+        int ready;
         int index;
-        time_t now = time(NULL);
+        time_t now;
+        if (magnus_reload_requested) {
+            magnus_reload_requested = 0;
+            magnus_handle_reload();
+        }
+        ready = epoll_wait(epoll_fd, events, MAGNUS_MAX_EVENTS, 1000);
+        now = time(NULL);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
