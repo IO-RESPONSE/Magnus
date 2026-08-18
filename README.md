@@ -1,32 +1,41 @@
 # Magnus
 
-Magnus는 IORESPONSE가 독립적으로 개발하는 **초경량 엔터프라이즈 Web/Application
-Gateway**다.
+Magnus is a **lightweight enterprise Web/Application Gateway** developed
+independently by IORESPONSE.
 
-## 현재 구현
+## Current status
 
-- 외부 웹서버 런타임에 의존하지 않는 독립 C17/epoll 이벤트 코어
-- 엄격한 HTTP/1.0·1.1 parser, keep-alive, 8KiB 요청 상한
-- 안전한 document root, MIME/HEAD, zero-copy `sendfile` 정적 파일 전송
-- 구조화된 요청 ID 기반 access log
-- ingress → route → response → log 네이티브 phase API
-- 요청별 128-bit 추적 ID, health endpoint, 명확한 오류 응답
-- SIGTERM/SIGINT graceful shutdown
-- RELRO/NOW, FORTIFY, 비루트 사용자, 읽기 전용 rootfs
-- Micro Linux 기반 0.2-edge 이미지: 5,927,988 bytes (약 5.65 MiB)
+- Independent C17/epoll event core with no dependency on an external web
+  server runtime
+- Strict HTTP/1.0/1.1 parser, keep-alive, 8KiB request cap
+- Safe document root, MIME/HEAD, zero-copy `sendfile` static delivery
+- Structured access log keyed by request ID
+- Native phase API: ingress → route → response → log
+- Per-request 128-bit trace ID, health endpoint, explicit error responses
+- Graceful shutdown on SIGTERM/SIGINT
+- RELRO/NOW, FORTIFY, non-root user, read-only rootfs
+- OpenSSL-based TLS 1.2/1.3 transport (TLS 1.1 rejected)
+- Non-blocking `/proxy/*` reverse proxy on the basic request/response path
+- Policy modules (weighted round-robin, affinity, circuit breaker, rate
+  limit) with unit tests, not yet wired to live routing
+- Prometheus `/metrics` endpoint
+- Container image: 9,197,428 bytes (~8.77 MiB), non-root, read-only rootfs
 
-현재 버전은 엔터프라이즈 제품의 M1a edge 코어다. TLS, reverse proxy, upstream cluster,
-동적 설정 반영과 관리 plane은 아직 구현되지 않았으므로 현 단계를 production-ready라고
-표현하지 않는다. 목표 구조와 완료 기준은 `docs/ENTERPRISE_ARCHITECTURE.md`에 있다.
+This is still a pre-production checkpoint. Proxy timeouts/502/504 handling,
+active/passive upstream health, session affinity, control plane
+(`magnusd`/`magnusctl`), fuzzing, and comparative benchmarking are not yet
+complete, so this stage is not described as production-ready. Target
+architecture and completion criteria live in `docs/ENTERPRISE_ARCHITECTURE.md`.
 
-## 제품 구성
+## Components
 
-- `magnus`: 독립 HTTP/event data plane
-- `magnusd`: 설정 검증, 배포, 인증서, cluster 상태를 다룰 control plane(계획)
-- `magnusctl`: 관리 CLI(계획)
-- `Magnus Module ABI`: 단계별 native extension 인터페이스(초기 API 구현)
+- `magnus`: the standalone HTTP/event data plane
+- `magnusd`: control plane for config validation, deployment, certificates,
+  and cluster state (planned)
+- `magnusctl`: management CLI (planned)
+- `Magnus Module ABI`: native extension interface per phase (early API)
 
-## 개발과 검증
+## Build and verify
 
 ```bash
 ./scripts/check.sh
@@ -36,11 +45,11 @@ make test
 docker compose config
 ```
 
-이전 초기 실험 코드는 `experiments/`에 격리했다. 기존 benchmark 결과는 역사적
-기준선일 뿐 현재 네이티브 Magnus의 성능 결과가 아니다.
+Earlier exploratory code is isolated under `experiments/` and excluded from
+this repository.
 
-## 라이선스 경계
+## License
 
-Magnus는 AI(Claude)의 지원을 받아 개발되었다. 사용은 자유롭게 허용하지만,
-소스 코드와 바이너리에 대한 수정은 누구에게도 허용되지 않는다. 자세한 조건은
-`LICENSE`를 따른다.
+Magnus was developed with AI assistance. Use is freely permitted, but no
+modification of the source code or binaries is permitted by anyone. See
+`LICENSE` for the full terms.
