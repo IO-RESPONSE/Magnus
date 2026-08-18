@@ -1,0 +1,23 @@
+services:
+  magnus:
+    image: ${MAGNUS_IMAGE:-ioresponse/magnus:0.2-edge}
+    container_name: magnus-dev
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 3

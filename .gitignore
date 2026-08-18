@@ -1,0 +1,8 @@
+build/
+dist/
+*.log
+.env
+.env.git-credentials
+.git-credentials-store
+experiments/nginx-wrapper/
+benchmark/
