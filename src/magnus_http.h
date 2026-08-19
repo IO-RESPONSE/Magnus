@@ -16,6 +16,12 @@ typedef struct {
     bool close_connection;
     bool head_only;
     char affinity_key[64];
+    /* Content-Length, if the request carried exactly one well-formed one.
+     * Transfer-Encoding is rejected outright (MAGNUS_HTTP_BAD_REQUEST) --
+     * chunked request bodies are not yet supported, and accepting the
+     * header without honoring it would be a framing hazard. */
+    bool has_content_length;
+    unsigned long content_length;
 } magnus_http_request_t;
 
 typedef enum {

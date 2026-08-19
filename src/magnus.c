@@ -26,10 +26,11 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.0.1"
+#define MAGNUS_VERSION "1.1.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
+#define MAGNUS_MAX_BODY (1 * 1024 * 1024)
 #define MAGNUS_OUTPUT_LIMIT 2048
 #define MAGNUS_IDLE_SECONDS 30
 #define MAGNUS_HEADER_TIMEOUT_SECONDS 10
@@ -71,6 +72,9 @@ typedef struct {
     char proxy_request[512];
     size_t proxy_request_length;
     size_t proxy_request_sent;
+    /* How much of `body` has been relayed to the upstream so far, once
+     * the proxy request's headers have gone out. */
+    size_t proxy_body_sent;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -111,6 +115,21 @@ typedef struct {
      * MAGNUS_IDLE_SECONDS is for. */
     time_t header_deadline;
     time_t last_active;
+    /* Request body (Content-Length only -- chunked is rejected by the
+     * parser). NULL/0 whenever the request in flight has none, which is
+     * also this struct's zero-initialized state from calloc() at accept
+     * time, so nothing here needs an explicit reset on plain connect. Owned
+     * by whichever of magnus_dispatch_request()'s callers still holds it:
+     * freed right after a non-proxy dispatch, or once fully relayed to (or
+     * abandoned by) the upstream -- see magnus_free_body_if_unowned(). */
+    char *body;
+    size_t body_capacity;
+    size_t body_length;
+    size_t body_needed;
+    bool reading_body;
+    /* The already-parsed request a body-bearing connection is waiting on
+     * more bytes for; only meaningful while reading_body is true. */
+    magnus_http_request_t pending_parsed;
 } magnus_connection_t;
 
 static volatile sig_atomic_t magnus_running = 1;
@@ -283,6 +302,11 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->file_buffer);
     free(connection->proxy_buffer);
     free(connection->proxy_header_out);
+    /* Safety net: normally already freed by magnus_free_body_if_unowned()
+     * or once fully relayed in magnus_handle_upstream(), but a connection
+     * can close mid-body (client abort, retry budget exhausted before any
+     * send) with it still attached. */
+    free(connection->body);
     if (magnus_connections_active > 0) magnus_connections_active--;
     if (connection->upstream_fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->upstream_fd, NULL);
@@ -442,6 +466,7 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
     connection->proxy_active = true;
     connection->proxy_connected = result == 0;
     connection->proxy_request_sent = 0;
+    connection->proxy_body_sent = 0;
     connection->proxy_headers_sent = false;
     connection->proxy_headers_received = false;
     connection->proxy_header_accum = 0;
@@ -521,11 +546,21 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
     size_t preferred_index;
     bool sticky;
 
-    written = snprintf(connection->proxy_request,
-                       sizeof(connection->proxy_request),
-                       "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                       "Connection: close\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-                       request->method, request->path + 6, request->request_id);
+    /* connection->body/body_length carry whatever request body was
+     * buffered before dispatch reached here (empty for GET/HEAD and any
+     * other request that had none). Relaying it is magnus_handle_upstream's
+     * job, once these headers have gone out. */
+    written = connection->body_length > 0
+        ? snprintf(connection->proxy_request, sizeof(connection->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: close\r\nContent-Length: %zu\r\n"
+                   "X-Magnus-Request-Id: %s\r\n\r\n",
+                   request->method, request->path + 6,
+                   connection->body_length, request->request_id)
+        : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: close\r\nX-Magnus-Request-Id: %s\r\n\r\n",
+                   request->method, request->path + 6, request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
         return -1;
     connection->proxy_request_length = (size_t) written;
@@ -865,6 +900,30 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
         if (connection->proxy_request_sent == connection->proxy_request_length)
             connection->proxy_headers_sent = true;
     }
+    while (connection->proxy_body_sent < connection->body_length) {
+        ssize_t sent = send(connection->upstream_fd,
+            connection->body + connection->proxy_body_sent,
+            connection->body_length - connection->proxy_body_sent,
+            MSG_NOSIGNAL);
+        if (sent > 0) {
+            connection->proxy_body_sent += (size_t) sent;
+            connection->proxy_last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        } else {
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
+        }
+    }
+    /* Fully relayed (or there never was one): this connection's copy is no
+     * longer needed regardless of how the upstream response turns out. */
+    free(connection->body);
+    connection->body = NULL;
+    connection->body_capacity = 0;
+    connection->body_length = 0;
+    connection->body_needed = 0;
     if (!connection->proxy_headers_received) {
         if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
             return magnus_proxy_receive_headers(epoll_fd, connection);
@@ -1097,33 +1156,32 @@ magnus_prepare_response(magnus_connection_t *connection, unsigned status,
     connection->close_after_write = close_connection;
 }
 
+/* Runs the already-parsed request through ingress/route, rate limiting,
+ * and the final route dispatch (static file, proxy, healthz/metrics,
+ * admin). connection->body/body_length carry whatever request body was
+ * buffered ahead of this call (empty for the overwhelmingly common
+ * no-body case) -- see magnus_begin_body()/magnus_continue_body() and
+ * magnus_process_request() below, which is what parses the request and
+ * decides whether a body needs buffering before dispatch can even run.
+ * Returns 1 if a reverse-proxy attempt is now in flight (body ownership,
+ * if any, has moved to it -- see magnus_free_body_if_unowned()), 0
+ * otherwise (fully handled synchronously, body if any no longer needed). */
 static int
-magnus_process_request(int epoll_fd, magnus_connection_t *connection,
-                       size_t request_length)
+magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
+                        const magnus_http_request_t *parsed)
 {
     magnus_request_t request = {0};
-    magnus_http_request_t parsed;
-    magnus_http_result_t parse_result;
-    bool close_connection;
-    bool head_only;
+    bool close_connection = parsed->close_connection;
+    bool head_only = parsed->head_only;
+    bool is_proxy_route;
 
-    parse_result = magnus_http_parse(connection->input, request_length, &parsed);
-    if (parse_result != MAGNUS_HTTP_OK) {
-        unsigned status = parse_result == MAGNUS_HTTP_URI_TOO_LONG ? 414
-            : parse_result == MAGNUS_HTTP_VERSION_UNSUPPORTED ? 505 : 400;
-        const char *reason = status == 414 ? "URI Too Long"
-            : status == 505 ? "HTTP Version Not Supported" : "Bad Request";
-        magnus_trace_handler(&request, NULL);
-        magnus_prepare_response(connection, status, reason, "text/plain",
-                                "bad request\n", false, true, &request);
-        return 0;
-    }
+    memcpy(request.method, parsed->method, sizeof(request.method));
+    memcpy(request.path, parsed->target, sizeof(request.path));
 
-    memcpy(request.method, parsed.method, sizeof(request.method));
-    memcpy(request.path, parsed.target, sizeof(request.path));
+    is_proxy_route = magnus_upstream_enabled && !connection->admin_only
+        && strncmp(request.path, "/proxy", 6) == 0
+        && (request.path[6] == '/' || request.path[6] == '\0');
 
-    close_connection = parsed.close_connection;
-    head_only = parsed.head_only;
     if (magnus_phase_run(&magnus_phases, MAGNUS_PHASE_INGRESS, &request) != 0
         || magnus_phase_run(&magnus_phases, MAGNUS_PHASE_ROUTE, &request) != 0) {
         magnus_prepare_response(connection, 500, "Internal Server Error",
@@ -1148,7 +1206,11 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
         return 0;
     }
 
-    if (strcmp(request.method, "GET") != 0 && !head_only) {
+    if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route) {
+        /* Static files, /healthz, and /metrics are inherently read-only;
+         * the reverse proxy is the one route that has always been meant
+         * to relay whatever method (and body) the client sent -- see the
+         * is_proxy_route branch below, which is why it is excluded here. */
         magnus_prepare_response(connection, 405, "Method Not Allowed",
                                 "text/plain", "method not allowed\n", false,
                                 close_connection, &request);
@@ -1235,11 +1297,9 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
         magnus_prepare_response(connection, 404, "Not Found", "text/plain",
                                 "not found\n", head_only, close_connection,
                                 &request);
-    } else if (magnus_upstream_enabled
-               && strncmp(request.path, "/proxy", 6) == 0
-               && (request.path[6] == '/' || request.path[6] == '\0')) {
+    } else if (is_proxy_route) {
         if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
-                                        parsed.affinity_key) == 0) {
+                                        parsed->affinity_key) == 0) {
             /* No access-log line here: the request has not completed yet
              * (that happens later, asynchronously, once the upstream
              * responds -- see magnus_proxy_receive_headers/_fail). Just
@@ -1283,6 +1343,148 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
     return 0;
 }
 
+/* Parses the request line/headers already accumulated in connection->input
+ * (exactly request_length bytes, no body) and dispatches it. Only ever
+ * reached for a request that magnus_process_input() has already determined
+ * has no body to buffer -- see magnus_begin_body() for the one that does. */
+static int
+magnus_process_request(int epoll_fd, magnus_connection_t *connection,
+                       size_t request_length)
+{
+    magnus_http_request_t parsed;
+    magnus_http_result_t parse_result;
+
+    parse_result = magnus_http_parse(connection->input, request_length, &parsed);
+    if (parse_result != MAGNUS_HTTP_OK) {
+        magnus_request_t request = {0};
+        unsigned status = parse_result == MAGNUS_HTTP_URI_TOO_LONG ? 414
+            : parse_result == MAGNUS_HTTP_VERSION_UNSUPPORTED ? 505 : 400;
+        const char *reason = status == 414 ? "URI Too Long"
+            : status == 505 ? "HTTP Version Not Supported" : "Bad Request";
+        magnus_trace_handler(&request, NULL);
+        magnus_prepare_response(connection, status, reason, "text/plain",
+                                "bad request\n", false, true, &request);
+        return 0;
+    }
+    return magnus_dispatch_request(epoll_fd, connection, &parsed);
+}
+
+/* Frees connection->body unless magnus_dispatch_request() just handed it
+ * off to an in-flight reverse-proxy attempt (dispatch_result == 1), in
+ * which case magnus_handle_upstream() owns it from here -- either relaying
+ * it and freeing it itself once fully sent, or leaving it for
+ * magnus_close_connection()'s safety net if the connection closes first. */
+static void
+magnus_free_body_if_unowned(magnus_connection_t *connection, int dispatch_result)
+{
+    if (dispatch_result == 1) return;
+    free(connection->body);
+    connection->body = NULL;
+    connection->body_capacity = 0;
+    connection->body_length = 0;
+    connection->body_needed = 0;
+}
+
+/* Called once magnus_process_input() has determined the just-parsed
+ * request (parsed, covering exactly the first request_length bytes of
+ * connection->input) carries a Content-Length body. Buffers whatever body
+ * bytes already arrived in the same read as the headers, separates them
+ * from any pipelined next request sitting after them, and either
+ * dispatches immediately (the whole body was already in hand) or switches
+ * the connection into body-accumulation mode for magnus_continue_body()
+ * to finish across future reads. */
+static int
+magnus_begin_body(int epoll_fd, magnus_connection_t *connection,
+                  size_t request_length, const magnus_http_request_t *parsed)
+{
+    size_t available_after_headers;
+    size_t take;
+    size_t consumed;
+
+    if (parsed->content_length > MAGNUS_MAX_BODY) {
+        magnus_request_t request = {0};
+        magnus_trace_handler(&request, NULL);
+        memcpy(request.method, parsed->method, sizeof(request.method));
+        memcpy(request.path, parsed->target, sizeof(request.path));
+        magnus_prepare_response(connection, 413, "Payload Too Large",
+                                "text/plain", "payload too large\n", false,
+                                true, &request);
+        /* Closing the connection either way (close_connection forced true
+         * above), so there is no next request to preserve framing for --
+         * simplest and safest to just drop whatever is left unread. */
+        connection->input_length = 0;
+        return magnus_update_interest(epoll_fd, connection, EPOLLOUT);
+    }
+
+    connection->body = malloc(parsed->content_length > 0
+                              ? parsed->content_length : 1);
+    if (connection->body == NULL) return -1;
+    connection->body_capacity = parsed->content_length;
+    connection->body_needed = parsed->content_length;
+    connection->pending_parsed = *parsed;
+
+    available_after_headers = connection->input_length - request_length;
+    take = available_after_headers < connection->body_needed
+        ? available_after_headers : connection->body_needed;
+    if (take > 0)
+        memcpy(connection->body, connection->input + request_length, take);
+    connection->body_length = take;
+
+    /* Whatever is left after this request's headers *and* body is the
+     * start of a pipelined next request -- keep only that in `input`. */
+    consumed = request_length + take;
+    memmove(connection->input, connection->input + consumed,
+            connection->input_length - consumed);
+    connection->input_length -= consumed;
+
+    if (connection->body_length < connection->body_needed) {
+        connection->reading_body = true;
+        return 0;
+    }
+
+    {
+        int process_result = magnus_dispatch_request(epoll_fd, connection,
+                                                      &connection->pending_parsed);
+        magnus_free_body_if_unowned(connection, process_result);
+        if (process_result == 1) return 0;
+        return magnus_update_interest(epoll_fd, connection, EPOLLOUT);
+    }
+}
+
+/* Continues filling connection->body from the client socket across
+ * however many more non-blocking reads it takes, then dispatches once it
+ * is complete. Mirrors magnus_handle_read()'s header-accumulation loop,
+ * just against connection->body instead of connection->input. */
+static int
+magnus_continue_body(int epoll_fd, magnus_connection_t *connection)
+{
+    ssize_t received;
+
+    while (connection->body_length < connection->body_needed) {
+        received = magnus_socket_read(connection,
+                        connection->body + connection->body_length,
+                        connection->body_needed - connection->body_length);
+        if (received > 0) {
+            connection->body_length += (size_t) received;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (received == 0) return -1;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+
+    connection->reading_body = false;
+    {
+        int process_result = magnus_dispatch_request(epoll_fd, connection,
+                                                      &connection->pending_parsed);
+        magnus_free_body_if_unowned(connection, process_result);
+        if (process_result == 1) return 0;
+        return magnus_update_interest(epoll_fd, connection, EPOLLOUT);
+    }
+}
+
 static int
 magnus_process_input(int epoll_fd, magnus_connection_t *connection)
 {
@@ -1305,6 +1507,23 @@ magnus_process_input(int epoll_fd, magnus_connection_t *connection)
 
     request_length = (size_t) (end - connection->input);
     connection->request_started_ms = magnus_now_ms();
+
+    {
+        /* A second parse of the same bytes magnus_process_request() (or
+         * magnus_begin_body()) will parse again momentarily -- headers are
+         * small and this runs once per request, so the duplicate work is
+         * cheap next to what it buys: knowing whether a body needs
+         * buffering *before* committing to either path, without threading
+         * a pre-parsed request through both. */
+        magnus_http_request_t peek;
+        if (magnus_http_parse(connection->input, request_length, &peek)
+                == MAGNUS_HTTP_OK
+            && peek.has_content_length && peek.content_length > 0) {
+            return magnus_begin_body(epoll_fd, connection, request_length,
+                                     &peek);
+        }
+    }
+
     int process_result = magnus_process_request(epoll_fd, connection,
                                                 request_length);
     memmove(connection->input, connection->input + request_length,
@@ -1318,6 +1537,7 @@ static int
 magnus_handle_read(int epoll_fd, magnus_connection_t *connection)
 {
     ssize_t received;
+    if (connection->reading_body) return magnus_continue_body(epoll_fd, connection);
     if (connection->input_length == connection->input_capacity
         && connection->input_capacity < MAGNUS_INPUT_LIMIT) {
         size_t capacity = connection->input_capacity * 2;

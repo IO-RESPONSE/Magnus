@@ -19,7 +19,9 @@ independently by IORESPONSE.
 - OpenSSL-based TLS 1.2/1.3 transport (TLS 1.1 rejected)
 - Non-blocking `/proxy/*` reverse proxy: connect/read timeouts, bounded
   retry budget, hop-by-hop header stripping, streaming without blocking
-  the event loop on slow upstreams or large responses
+  the event loop on slow upstreams or large responses; relays any HTTP
+  method with a request body (POST/PUT/PATCH/DELETE/...), buffered up to
+  1 MiB before dispatch -- every other route stays GET/HEAD-only
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP

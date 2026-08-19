@@ -128,6 +128,33 @@ magnus_http_parse(const char *data, size_t length, magnus_http_request_t *reques
                                          request->affinity_key,
                                          sizeof(request->affinity_key));
         }
+        if (magnus_equal_ci(cursor, name_length, "content-length")) {
+            size_t value_length = (size_t) (line_end - value);
+            unsigned long parsed_length = 0;
+            /* A second Content-Length (even if identical) and a value that
+             * does not fit our digit budget are both rejected outright --
+             * duplicate/ambiguous length headers are a request-smuggling
+             * vector, not something to resolve by picking one. */
+            if (request->has_content_length || value_length == 0
+                || value_length > 18)
+                return MAGNUS_HTTP_BAD_REQUEST;
+            for (size_t i = 0; i < value_length; i++) {
+                if (!isdigit((unsigned char) value[i]))
+                    return MAGNUS_HTTP_BAD_REQUEST;
+                parsed_length = parsed_length * 10
+                    + (unsigned long) (value[i] - '0');
+            }
+            request->content_length = parsed_length;
+            request->has_content_length = true;
+        }
+        if (magnus_equal_ci(cursor, name_length, "transfer-encoding")) {
+            /* Chunked request bodies are not implemented yet. Rejecting
+             * any Transfer-Encoding outright (rather than only unknown
+             * codings) also means a request can never carry both it and
+             * Content-Length past this point -- one fewer smuggling
+             * ambiguity to reason about. */
+            return MAGNUS_HTTP_BAD_REQUEST;
+        }
         cursor = line_end + 2;
     }
     if (request->http_11 && !host_seen) return MAGNUS_HTTP_BAD_REQUEST;

@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.0
+
+### Added
+
+- **The reverse proxy now relays any HTTP method with a request body**
+  (POST, PUT, PATCH, DELETE, ...), not just GET/HEAD. Found the gap the
+  same way as the 1.0.1 fix: a live check (`curl -X POST .../proxy/...`)
+  returned 405, and the cause was structural, not a one-line bug -- the
+  method allowlist was global (every route, including `/proxy/*`), and
+  the HTTP parser never read a request body at all (no Content-Length
+  handling, no buffering, nothing to relay). Both had to change:
+  - `magnus_http_parse()` now parses `Content-Length` (rejecting a
+    second one, and any value that doesn't parse as a plain decimal --
+    both request-smuggling-relevant ambiguities). `Transfer-Encoding`
+    (chunked or otherwise) is rejected outright with 400 -- not yet
+    supported, and silently mishandling it would be a framing hazard;
+    it also forecloses the classic Content-Length/Transfer-Encoding
+    smuggling ambiguity for free.
+  - A request with a body is now buffered (bounded at 1 MiB, 413 Payload
+    Too Large beyond that) before dispatch, across as many non-blocking
+    reads as it takes -- mirroring the existing header-accumulation
+    state machine -- so a pipelined next request on the same
+    connection is never mistaken for body bytes or vice versa.
+  - `/proxy/*` is now exempt from the GET/HEAD-only check and forwards
+    the buffered body to the upstream with a `Content-Length` header;
+    every other route (static files, `/healthz`, `/metrics`, `/`) is
+    unchanged and still GET/HEAD-only.
+  - Verified end-to-end against a body-echoing backend: POST/PUT/PATCH/
+    DELETE with small bodies, a 675 KB body split across many reads
+    (byte-for-byte sha256 match), a >1 MiB body correctly 413'd, a
+    chunked request correctly 400'd, a POST to a non-proxy path still
+    405, and four chained requests (mixed body/no-body) over one reused
+    connection each framed correctly. Clean under `make sanitize`
+    (ASan+UBSan). New regression coverage in `tests/test-core.sh`.
+
 ## 1.0.1
 
 ### Fixed

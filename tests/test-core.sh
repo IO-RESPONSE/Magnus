@@ -593,3 +593,105 @@ fi
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
+
+# Request bodies through the proxy: /proxy/* must relay any method (not
+# just GET/HEAD) and forward the client's body to the upstream intact,
+# while every other route stays GET/HEAD-only exactly as before. A plain
+# http.server backend 501s on POST/PUT, which is only useful for proving a
+# method got relayed at all -- a tiny echo backend is needed to also prove
+# the body bytes themselves arrived correctly.
+port_body=$((port + 22))
+upstream_echo=$((port + 23))
+python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _handle(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length) if length else b''
+        payload = ('method=' + self.command + ' path=' + self.path
+                   + ' len=' + str(len(body)) + ' body='
+                   + body.decode('utf-8', 'replace')).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
+    def log_message(self, *a): pass
+
+http.server.HTTPServer(('127.0.0.1', $upstream_echo), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_echo/ping" >/dev/null && break
+  sleep 1
+done
+"$binary" --port "$port_body" --root "$web_root" \
+  --upstream "127.0.0.1:$upstream_echo" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_body/healthz" >/dev/null && break
+  sleep 1
+done
+
+test "$(curl --fail --silent --request POST --data 'hello=world' \
+  "http://127.0.0.1:$port_body/proxy/echo")" \
+  = 'method=POST path=/echo len=11 body=hello=world'
+test "$(curl --fail --silent --request PUT --data '{"a":1}' \
+  "http://127.0.0.1:$port_body/proxy/thing/1")" \
+  = 'method=PUT path=/thing/1 len=7 body={"a":1}'
+test "$(curl --fail --silent --request DELETE \
+  "http://127.0.0.1:$port_body/proxy/thing/1")" \
+  = 'method=DELETE path=/thing/1 len=0 body='
+
+# A body split across many reads (larger than one TCP segment/the header
+# buffer) must still arrive byte-for-byte intact. The echoed response is
+# "<prefix>body=<the body verbatim>" and the body itself is multi-line
+# (base64-wrapped), so extraction has to be byte-offset based (tail -c),
+# not sed/grep, which only ever match within a single line.
+head -c 500000 /dev/urandom | base64 >"$web_root/large_body.txt"
+large_len=$(wc -c <"$web_root/large_body.txt")
+large_sha=$(sha256sum "$web_root/large_body.txt" | cut -d' ' -f1)
+echo_prefix="method=POST path=/big len=$large_len body="
+prefix_len=$(printf '%s' "$echo_prefix" | wc -c)
+relayed_sha=$(curl --fail --silent --request POST \
+  --data-binary "@$web_root/large_body.txt" \
+  "http://127.0.0.1:$port_body/proxy/big" \
+  | tail -c "+$((prefix_len + 1))" | sha256sum | cut -d' ' -f1)
+test "$relayed_sha" = "$large_sha"
+
+# A body over the 1MiB cap is rejected before it is ever forwarded.
+head -c 1500000 /dev/urandom | base64 >"$web_root/huge_body.txt"
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --request POST --data-binary "@$web_root/huge_body.txt" \
+  "http://127.0.0.1:$port_body/proxy/huge")" = 413
+
+# Transfer-Encoding (chunked or otherwise) is rejected outright -- not yet
+# supported, and silently mishandling it would be a framing hazard.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --request POST --header 'Transfer-Encoding: chunked' --data hello \
+  "http://127.0.0.1:$port_body/proxy/chunked")" = 400
+
+# Everything that is not /proxy/* is still GET/HEAD-only.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --request POST --data 'x=1' "http://127.0.0.1:$port_body/hello.txt")" = 405
+
+# Multiple body-bearing requests, plus a bodyless one, chained over one
+# reused connection must each be framed correctly -- no request's body
+# bleeding into the next request's headers.
+chained=$(curl --fail --silent \
+  --request POST --data 'first=1' "http://127.0.0.1:$port_body/proxy/a" \
+  --next \
+  --request POST --data 'second=22' "http://127.0.0.1:$port_body/proxy/b" \
+  --next \
+  "http://127.0.0.1:$port_body/proxy/c" \
+  --next \
+  --request POST --data 'fourth=4444' "http://127.0.0.1:$port_body/proxy/d")
+test "$chained" = 'method=POST path=/a len=7 body=first=1method=POST path=/b len=9 body=second=22method=GET path=/c len=0 body=method=POST path=/d len=11 body=fourth=4444'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
