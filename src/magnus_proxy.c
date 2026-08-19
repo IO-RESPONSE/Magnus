@@ -1,6 +1,8 @@
 #include "magnus_proxy.h"
 #include "magnus_http.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,8 +49,9 @@ magnus_proxy_parse_status_line(char *line, unsigned *status, char *reason,
 int
 magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                        char *out, size_t out_capacity,
-                                       unsigned *out_status,
-                                       const char *affinity_cookie_value)
+                                       const char *affinity_cookie_value,
+                                       bool client_wants_close,
+                                       magnus_proxy_response_info_t *info)
 {
     char *saveptr = NULL;
     char *line;
@@ -56,6 +59,11 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     unsigned status;
     int written;
     size_t total;
+    bool content_length_seen = false;
+    bool content_length_valid = true;
+    bool transfer_encoding_seen = false;
+    bool upstream_wants_close = false;
+    unsigned long content_length = 0;
 
     (void) header_length;
     line = strtok_r(raw, "\r\n", &saveptr);
@@ -73,18 +81,55 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
         char *colon = strchr(line, ':');
         char name[64];
         size_t name_length;
+        char *value;
 
         if (colon == NULL) continue;
         name_length = (size_t) (colon - line);
         if (name_length == 0 || name_length >= sizeof(name)) continue;
         memcpy(name, line, name_length);
         name[name_length] = '\0';
+
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+
+        /* Inspect Connection/Content-Length/Transfer-Encoding for framing
+         * purposes even though (being hop-by-hop) none of them get
+         * forwarded verbatim below -- what the client and the connection
+         * pool actually see is decided from these facts, not by passing
+         * the upstream's own header through. */
+        if (strcasecmp(name, "connection") == 0) {
+            if (strcasestr(value, "close") != NULL) upstream_wants_close = true;
+        } else if (strcasecmp(name, "transfer-encoding") == 0) {
+            transfer_encoding_seen = true;
+        } else if (strcasecmp(name, "content-length") == 0) {
+            char *end;
+            unsigned long parsed;
+            if (content_length_seen) {
+                content_length_valid = false;
+            } else {
+                content_length_seen = true;
+                for (const char *scan = value; *scan != '\0'; scan++)
+                    if (!isdigit((unsigned char) *scan))
+                        content_length_valid = false;
+                if (content_length_valid) {
+                    errno = 0;
+                    parsed = strtoul(value, &end, 10);
+                    if (errno != 0 || end == value || *end != '\0')
+                        content_length_valid = false;
+                    else
+                        content_length = parsed;
+                }
+            }
+        }
+
         if (magnus_proxy_is_hop_by_hop(name)) continue;
 
         written = snprintf(out + total, out_capacity - total, "%s\r\n", line);
         if (written < 0 || (size_t) written >= out_capacity - total) return -1;
         total += (size_t) written;
     }
+
+    if (content_length_seen && !content_length_valid) return -1;
 
     if (affinity_cookie_value != NULL) {
         written = snprintf(out + total, out_capacity - total,
@@ -95,11 +140,17 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
         total += (size_t) written;
     }
 
+    info->status = status;
+    info->has_content_length = content_length_seen && !transfer_encoding_seen;
+    info->content_length = info->has_content_length ? content_length : 0;
+    info->upstream_poolable = info->has_content_length && !upstream_wants_close;
+    info->keep_client_alive = !client_wants_close && info->has_content_length;
+
     written = snprintf(out + total, out_capacity - total,
-                       "Connection: close\r\nX-Magnus-Via: magnus-proxy/0.1\r\n\r\n");
+                       "Connection: %s\r\nX-Magnus-Via: magnus-proxy/0.1\r\n\r\n",
+                       info->keep_client_alive ? "keep-alive" : "close");
     if (written < 0 || (size_t) written >= out_capacity - total) return -1;
     total += (size_t) written;
 
-    *out_status = status;
     return (int) total;
 }

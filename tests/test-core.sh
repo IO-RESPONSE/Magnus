@@ -95,12 +95,16 @@ test "$(curl --fail --silent "http://127.0.0.1:$port/proxy/hello.txt")" \
 curl --fail --silent "http://127.0.0.1:$port/metrics" \
   | grep -Eq '^magnus_connections_active [0-9]+'
 
-# M2: upstream response headers are sanitized -- hop-by-hop headers dropped,
-# framing normalized to a single Connection: close, via marker present.
+# M2: upstream response headers are sanitized -- hop-by-hop headers
+# dropped, exactly one Connection header, marker present. This backend's
+# response carries a Content-Length and the client (curl, default) wants
+# keep-alive, so as of the 1a connection-pool work Connection is
+# "keep-alive" here, not the M2-era hardcoded "close" -- see the
+# keep-alive/no-Content-Length cases further down for both directions.
 proxy_headers=$(curl --fail --silent --dump-header - --output /dev/null \
   "http://127.0.0.1:$port/proxy/hello.txt")
 test "$(printf '%s' "$proxy_headers" | grep -ic '^Connection:')" = 1
-printf '%s' "$proxy_headers" | grep -qi '^Connection: close'
+printf '%s' "$proxy_headers" | grep -qi '^Connection: keep-alive'
 printf '%s' "$proxy_headers" | grep -qi '^X-Magnus-Via: magnus-proxy/0.1'
 
 # M2: large body relayed through the bounded proxy buffer across multiple
@@ -695,3 +699,139 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# Upstream connection pool (1a): a backend that reports which specific
+# TCP connection (by identity, assigned once per accept) each request
+# arrived on, fronted by a Content-Length-only response so both legs
+# qualify for reuse. Deliberately *not* a running "connections accepted so
+# far" counter compared for equality across requests -- magnus's own
+# active health checker (independent of anything under test here) opens
+# its own periodic probe connections to this same backend in the
+# background, which would otherwise intermix with and inflate any such
+# counter. Comparing *which* id a request landed on, rather than counting
+# how many accepts happened in between, is immune to that: a health probe
+# consumes an id that simply never appears in any of these responses.
+port_pool=$((port + 24))
+upstream_pool=$((port + 25))
+python3 -c "
+import http.server, threading
+
+lock = threading.Lock()
+next_id = [0]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def setup(self):
+        super().setup()
+        with lock:
+            next_id[0] += 1
+            self.conn_id = next_id[0]
+    def do_GET(self):
+        payload = ('id=' + str(self.conn_id)).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $upstream_pool), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+sleep 1
+# --config, not plain flags: SIGHUP reload is a documented no-op in plain
+# --port/--root/... mode (nothing to reload from), and the pool-flush
+# check below needs a reload that actually happens.
+pool_config="$web_root/pool.conf"
+printf 'port = %s\nroot = %s\nupstream = 127.0.0.1:%s:1\n' \
+  "$port_pool" "$web_root" "$upstream_pool" > "$pool_config"
+"$binary" --config "$pool_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_pool/healthz" >/dev/null && break
+  sleep 1
+done
+
+# Content-Length known, client wants keep-alive (curl's default) -> both
+# legs get to stay open, matching magnus_proxy_response_info_t's contract.
+# This is also the pool's first real request, establishing the baseline
+# connection id.
+headers=$(curl --fail --silent --dump-header - --output /dev/null \
+  "http://127.0.0.1:$port_pool/proxy/x")
+printf '%s' "$headers" | grep -qi '^Connection: keep-alive'
+baseline=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+
+# 10 requests over one reused *client* connection must all land on that
+# same pooled upstream connection id.
+pooled_ten=$(curl --fail --silent \
+  "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
+  "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
+  "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
+  "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
+  "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x")
+test "$(printf '%s' "$pooled_ten" | grep -o 'id=[0-9]*' | sort -u)" = "$baseline"
+
+# A brand-new *client* connection reusing that same pooled *upstream*
+# connection id is the actual point of a pool scoped to the endpoint
+# rather than to one client connection.
+eleventh=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+test "$eleventh" = "$baseline"
+
+# MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION (100) retires a connection right
+# on schedule. 13 requests have gone through the baseline connection so
+# far (the two that set `headers`/`baseline`, the 10-batch, and the
+# eleventh); 87 more brings it to exactly 100, so the very next one must
+# land on a second, distinct upstream connection id.
+for _ in $(seq 1 87); do
+  curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x" >/dev/null
+done
+rollover=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+test "$rollover" != "$baseline"
+
+# A config reload must flush the pool: reused connections are indexed by
+# endpoint *position*, and a reload does not guarantee position N is still
+# the same backend, even against this identical single-upstream config.
+kill -HUP "$server_pid"
+sleep 0.5
+after_reload=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+test "$after_reload" != "$baseline" && test "$after_reload" != "$rollover"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+
+# A backend that dies while its connection sits idle in the pool: the next
+# request must recover with a clean 502 (dead connection detected at
+# checkout, fresh connect attempted, fails since nothing is listening),
+# not hang or crash magnus itself.
+port_pooldead=$((port + 26))
+upstream_pooldead=$((port + 27))
+python3 -m http.server "$upstream_pooldead" --bind 127.0.0.1 \
+  --directory "$web_root" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_pooldead/hello.txt" >/dev/null \
+    && break
+  sleep 1
+done
+"$binary" --port "$port_pooldead" --root "$web_root" \
+  --upstream "127.0.0.1:$upstream_pooldead" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_pooldead/healthz" >/dev/null && break
+  sleep 1
+done
+test "$(curl --fail --silent "http://127.0.0.1:$port_pooldead/proxy/hello.txt")" \
+  = 'magnus static file'
+kill -KILL "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+sleep 0.5
+test "$(curl --silent --max-time 5 --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_pooldead/proxy/hello.txt")" = 502
+test "$(curl --fail --silent "http://127.0.0.1:$port_pooldead/healthz")" = 'magnus: ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=

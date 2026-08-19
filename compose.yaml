@@ -1,6 +1,6 @@
 services:
   magnus:
-    image: ${MAGNUS_IMAGE:-ioresponse/magnus:1.1.0}
+    image: ${MAGNUS_IMAGE:-ioresponse/magnus:1.2.0}
     container_name: magnus-dev
     ports:
       - "127.0.0.1:8080:8080"

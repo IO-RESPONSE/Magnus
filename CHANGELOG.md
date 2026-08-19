@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+- **Upstream connection pool** (roadmap Phase 1a). The reverse proxy no
+  longer opens a fresh TCP connection to the backend for every request:
+  a per-endpoint pool of idle, still-live connections is checked before
+  connecting, and a connection is returned to the pool (instead of
+  closed) once its response completes cleanly. Bounded at 8 idle
+  connections per endpoint, a 60s idle timeout, and 100 requests per
+  connection before it is retired -- all enforced without registering
+  idle connections with epoll (liveness is checked cheaply, via a
+  non-blocking `MSG_PEEK`, at checkout time instead), which keeps the
+  pool from needing a second "this event belongs to an idle, currently
+  unowned upstream connection" branch in the main dispatch loop. A config
+  reload flushes the whole pool (endpoint *position* in a freshly loaded
+  cluster is not guaranteed to be the same backend it was before the
+  reload).
+- **Client-facing keep-alive for proxied responses.** Previously every
+  proxied response force-closed the client connection regardless of what
+  the client asked for -- found while starting the connection-pool work:
+  pooling the *upstream* leg requires knowing a response's exact length
+  up front (Content-Length) rather than relying on the upstream closing
+  its end to signal completion, and once that's known there is no reason
+  not to extend the same length-based framing to the *client* leg too.
+  `magnus_proxy_sanitize_response_headers()` now reports whether the
+  upstream response has a single well-formed Content-Length (and no
+  Transfer-Encoding, which is not decoded), and the client-facing
+  `Connection` header is `keep-alive` whenever the client's own request
+  wanted it and the response is unambiguously framed -- `close`
+  otherwise, exactly as before. The upstream leg's poolability and the
+  client leg's keep-alive are decided independently: an upstream that
+  sends `Connection: close` doesn't force the client connection closed,
+  and a client that wants `close` doesn't prevent the upstream connection
+  from being pooled for someone else's next request.
+- A duplicate or malformed upstream `Content-Length` is rejected (502),
+  matching the request-side parser's existing duplicate-header handling.
+
+Verified: a body-echoing/connection-identifying backend confirmed actual
+TCP reuse (many requests over one pooled connection, including from
+*different* client connections reusing the same pooled upstream
+connection), the 100-requests-per-connection retirement landing exactly
+on schedule, a config reload flushing the pool, and a backend dying while
+its connection sits idle in the pool recovering cleanly (502, not a hang
+or crash) rather than corrupting a later request. `make clean && make
+test` and `make sanitize` both green, including this behavior exercised
+end-to-end through `tests/test-core.sh` under ASan+UBSan. Image rebuilt
+and `./scripts/test-image.sh` passes.
+
 ## 1.1.0
 
 ### Added

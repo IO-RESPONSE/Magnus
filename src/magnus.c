@@ -26,7 +26,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.1.0"
+#define MAGNUS_VERSION "1.2.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -46,6 +46,9 @@
 #define MAGNUS_CLUSTER_FAILURE_THRESHOLD 3
 #define MAGNUS_CLUSTER_COOLDOWN_MS 5000
 #define MAGNUS_RATE_TABLE_SIZE 512
+#define MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT 8
+#define MAGNUS_POOL_IDLE_TIMEOUT_SECONDS 60
+#define MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION 100
 
 typedef struct {
     int fd;
@@ -75,6 +78,29 @@ typedef struct {
     /* How much of `body` has been relayed to the upstream so far, once
      * the proxy request's headers have gone out. */
     size_t proxy_body_sent;
+    /* Whether the *client's* original request wanted the connection kept
+     * alive, captured before dispatch starts (close_after_write gets
+     * overwritten the moment a proxy attempt begins, since the real
+     * decision -- whether the upstream response is even unambiguously
+     * framed -- isn't known until magnus_proxy_receive_headers() parses
+     * it). */
+    bool proxy_client_wants_close;
+    /* Response-body framing/pool-eligibility, filled in by
+     * magnus_proxy_receive_headers() from magnus_proxy_response_info_t.
+     * has_response_length false means "relay until the upstream closes,
+     * exactly like before this connection pool existed" -- the safe
+     * fallback for any response this pool cannot reason precisely about
+     * (no Content-Length, or Transfer-Encoding present). */
+    bool proxy_upstream_poolable;
+    bool proxy_has_response_length;
+    unsigned long proxy_response_length;
+    unsigned long proxy_response_received;
+    /* Carried over from a pooled connection at checkout (0 for a freshly
+     * connected one) so magnus_proxy_flush() can decide, once this
+     * response completes, whether the connection has already done its
+     * MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION share and should be closed
+     * rather than pooled again. */
+    unsigned proxy_upstream_requests_served;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -140,6 +166,132 @@ static SSL_CTX *magnus_tls_context;
 static magnus_cluster_t magnus_cluster;
 static bool magnus_upstream_enabled;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
+
+/* Idle upstream connections kept open for reuse, per cluster endpoint.
+ * Deliberately *not* registered with epoll while idle -- simpler and
+ * safer than adding a whole second "this fd's event belongs to a pooled,
+ * currently-unowned connection" branch to the main dispatch loop for a
+ * case (the backend closing or sending unexpected bytes to an idle
+ * connection) that is both rare and, worst case, just means a checkout
+ * finds a dead connection a little later than it otherwise could have.
+ * Liveness is instead checked cheaply (MSG_PEEK, non-blocking) at
+ * checkout time, and MAGNUS_POOL_IDLE_TIMEOUT_SECONDS bounds how long a
+ * connection nothing ever checks out again sits here regardless. */
+typedef struct {
+    int fd;
+    time_t idle_since;
+    unsigned requests_served;
+} magnus_pool_slot_t;
+
+typedef struct {
+    magnus_pool_slot_t slots[MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT];
+    size_t count;
+} magnus_pool_t;
+
+static magnus_pool_t magnus_upstream_pool[MAGNUS_MAX_UPSTREAMS];
+
+/* Returns a still-live, reusable fd for `endpoint_index` if the pool has
+ * one, discarding any dead (peer-closed) or exhausted
+ * (MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION already reached) connections it
+ * finds along the way rather than handing them out. Checks the
+ * most-recently-idled slot first (LIFO -- the warmest connection, most
+ * likely to still be alive on a backend with its own idle timeout).
+ * Returns -1 if none is available; the caller falls back to opening a
+ * fresh connection exactly as it did before pooling existed. */
+static int
+magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served)
+{
+    magnus_pool_t *pool;
+    if (endpoint_index >= MAGNUS_MAX_UPSTREAMS) return -1;
+    pool = &magnus_upstream_pool[endpoint_index];
+    while (pool->count > 0) {
+        magnus_pool_slot_t slot = pool->slots[pool->count - 1];
+        char probe;
+        ssize_t peeked;
+        pool->count--;
+        if (slot.requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+            close(slot.fd);
+            continue;
+        }
+        peeked = recv(slot.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (peeked == 0
+            || (peeked < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            /* peer closed it, or it is otherwise unusable */
+            close(slot.fd);
+            continue;
+        }
+        if (peeked > 0) {
+            /* Backend sent bytes with no request pending -- not something
+             * a well-behaved HTTP/1.1 server does while idle. Whatever it
+             * is, this connection's framing can no longer be trusted. */
+            close(slot.fd);
+            continue;
+        }
+        *out_requests_served = slot.requests_served;
+        return slot.fd;
+    }
+    return -1;
+}
+
+/* Returns fd to the idle pool for `endpoint_index` if there is room and it
+ * has not yet hit its request budget; otherwise just closes it. Ownership
+ * of fd (its magnus_upstream_owner[] entry, its epoll registration -- none
+ * held while idle, per the type comment above) is entirely the caller's
+ * responsibility to have already cleared before calling this. */
+static void
+magnus_pool_checkin(size_t endpoint_index, int fd, unsigned requests_served)
+{
+    magnus_pool_t *pool;
+    if (endpoint_index >= MAGNUS_MAX_UPSTREAMS) {
+        close(fd);
+        return;
+    }
+    pool = &magnus_upstream_pool[endpoint_index];
+    if (pool->count == MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT
+        || requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+        close(fd);
+        return;
+    }
+    pool->slots[pool->count] = (magnus_pool_slot_t) {
+        .fd = fd, .idle_since = time(NULL), .requests_served = requests_served
+    };
+    pool->count++;
+}
+
+/* Closes any pooled connection that has sat idle past
+ * MAGNUS_POOL_IDLE_TIMEOUT_SECONDS. Called once per second from the same
+ * sweep as magnus_expire_idle()/magnus_expire_proxies(). */
+static void
+magnus_pool_expire_idle(time_t now)
+{
+    for (size_t endpoint = 0; endpoint < MAGNUS_MAX_UPSTREAMS; endpoint++) {
+        magnus_pool_t *pool = &magnus_upstream_pool[endpoint];
+        size_t write_index = 0;
+        for (size_t read_index = 0; read_index < pool->count; read_index++) {
+            magnus_pool_slot_t slot = pool->slots[read_index];
+            if (now - slot.idle_since > MAGNUS_POOL_IDLE_TIMEOUT_SECONDS) {
+                close(slot.fd);
+                continue;
+            }
+            pool->slots[write_index++] = slot;
+        }
+        pool->count = write_index;
+    }
+}
+
+/* Closes every pooled idle connection on every endpoint. Called once at
+ * shutdown -- these fds are not attached to any magnus_connection_t, so
+ * nothing else closes them. */
+static void
+magnus_pool_close_all(void)
+{
+    for (size_t endpoint = 0; endpoint < MAGNUS_MAX_UPSTREAMS; endpoint++) {
+        magnus_pool_t *pool = &magnus_upstream_pool[endpoint];
+        for (size_t index = 0; index < pool->count; index++)
+            close(pool->slots[index].fd);
+        pool->count = 0;
+    }
+}
 /* Health-probe fds share the same epoll_fd as client/upstream connections.
  * Index i+1 (0 means "not a probe fd") names the cluster endpoint a given
  * fd is probing, so the main dispatch loop can route its events here
@@ -230,11 +382,13 @@ static void magnus_prepare_response(magnus_connection_t *connection,
                                     bool head_only, bool close_connection,
                                     magnus_request_t *request);
 static char *magnus_find_header_end(char *buffer, size_t length);
+static int magnus_process_input(int epoll_fd, magnus_connection_t *connection);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
                                        const magnus_request_t *request,
-                                       const char *client_affinity_key);
+                                       const char *client_affinity_key,
+                                       bool client_wants_close);
 
 static void
 magnus_signal_handler(int signal_number)
@@ -438,33 +592,31 @@ magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
  * been torn down via magnus_proxy_teardown_upstream(). Returns 0 once the
  * attempt is in flight, -1 on immediate failure (the caller records the
  * failure and decides whether to retry or give up). */
+/* Common state setup once a socket (freshly connected or handed out of
+ * magnus_upstream_pool) is ready to be this connection's active upstream:
+ * resets every per-attempt proxy_* field and registers it with epoll.
+ * `connected` is true immediately for a pooled fd (already established by
+ * definition) or for a fresh connect() that happened to complete
+ * synchronously; otherwise EPOLLOUT will report completion later.
+ * Returns 0 once the attempt is in flight, -1 on immediate failure (fd is
+ * already closed by the time this returns -1). */
 static int
-magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
-                              size_t endpoint_index)
+magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
+                             size_t endpoint_index, int fd, bool connected,
+                             unsigned requests_served)
 {
-    struct sockaddr_in address;
     struct epoll_event event;
-    int result;
-    int fd;
 
-    if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
     if (connection->proxy_buffer == NULL) {
         connection->proxy_buffer = malloc(MAGNUS_PROXY_BUFFER);
-        if (connection->proxy_buffer == NULL) return -1;
-    }
-    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
-        if (fd >= 0) close(fd);
-        return -1;
-    }
-    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
-    if (result < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
+        if (connection->proxy_buffer == NULL) {
+            close(fd);
+            return -1;
+        }
     }
     connection->upstream_fd = fd;
     connection->proxy_active = true;
-    connection->proxy_connected = result == 0;
+    connection->proxy_connected = connected;
     connection->proxy_request_sent = 0;
     connection->proxy_body_sent = 0;
     connection->proxy_headers_sent = false;
@@ -472,9 +624,17 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
     connection->proxy_header_accum = 0;
     connection->proxy_eof = false;
     connection->proxy_response_started = false;
+    connection->proxy_upstream_poolable = false;
+    connection->proxy_has_response_length = false;
+    connection->proxy_response_length = 0;
+    connection->proxy_response_received = 0;
+    connection->proxy_upstream_requests_served = requests_served;
     connection->proxy_endpoint_index = endpoint_index;
     connection->proxy_connect_started = time(NULL);
     connection->proxy_last_activity = connection->proxy_connect_started;
+    /* Provisional; magnus_proxy_receive_headers() corrects this once the
+     * response's actual framing (and the client's own original
+     * preference, in proxy_client_wants_close) is known. */
     connection->close_after_write = true;
     magnus_upstream_owner[fd] = connection;
     event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
@@ -487,6 +647,47 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
         return -1;
     }
     return 0;
+}
+
+/* A pooled idle connection for this endpoint is tried first -- skipping
+ * the TCP handshake (and, for a TLS upstream in a future phase, its
+ * handshake too) entirely -- before falling back to opening a fresh one,
+ * exactly as before this pool existed. Every caller of this function
+ * (including retries against a different endpoint after a connect
+ * failure) benefits automatically; none of them needed to change. */
+static int
+magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
+                              size_t endpoint_index)
+{
+    struct sockaddr_in address;
+    int result;
+    int fd;
+    unsigned pooled_requests_served;
+    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served);
+
+    if (pooled_fd >= 0) {
+        if (magnus_proxy_attach_upstream(epoll_fd, connection, endpoint_index,
+                                         pooled_fd, true,
+                                         pooled_requests_served) == 0)
+            return 0;
+        /* attach itself failed (buffer allocation, or epoll_ctl) -- the fd
+         * is already closed; fall through to a fresh connection rather
+         * than giving up the whole attempt over what the pool offered. */
+    }
+
+    if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return magnus_proxy_attach_upstream(epoll_fd, connection, endpoint_index,
+                                        fd, result == 0, 0);
 }
 
 /* The MAGNUS_AFFINITY cookie value this gateway issues encodes the target
@@ -540,7 +741,8 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                             const magnus_request_t *request,
-                            const char *client_affinity_cookie)
+                            const char *client_affinity_cookie,
+                            bool client_wants_close)
 {
     int written;
     size_t preferred_index;
@@ -549,21 +751,31 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
     /* connection->body/body_length carry whatever request body was
      * buffered before dispatch reached here (empty for GET/HEAD and any
      * other request that had none). Relaying it is magnus_handle_upstream's
-     * job, once these headers have gone out. */
+     * job, once these headers have gone out.
+     *
+     * Always *offers* the upstream keep-alive (regardless of what the
+     * client itself wanted) -- whether the connection actually gets
+     * reused afterward depends on whether the response turns out to have
+     * an unambiguous length (see magnus_proxy_receive_headers()), not on
+     * this request. Worst case the upstream ignores it and closes anyway,
+     * exactly like before this pool existed: MAGNUS_PROXY_READ_TIMEOUT_SECONDS
+     * still bounds how long a response with neither Content-Length nor a
+     * closed connection can stay unresolved. */
     written = connection->body_length > 0
         ? snprintf(connection->proxy_request, sizeof(connection->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: close\r\nContent-Length: %zu\r\n"
+                   "Connection: keep-alive\r\nContent-Length: %zu\r\n"
                    "X-Magnus-Request-Id: %s\r\n\r\n",
                    request->method, request->path + 6,
                    connection->body_length, request->request_id)
         : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: close\r\nX-Magnus-Request-Id: %s\r\n\r\n",
+                   "Connection: keep-alive\r\nX-Magnus-Request-Id: %s\r\n\r\n",
                    request->method, request->path + 6, request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
         return -1;
     connection->proxy_request_length = (size_t) written;
+    connection->proxy_client_wants_close = client_wants_close;
     memcpy(connection->proxy_request_id, request->request_id,
           sizeof(connection->proxy_request_id));
     connection->proxy_attempt = 0;
@@ -744,13 +956,50 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
     }
     connection->proxy_buffer_length = 0;
     connection->proxy_buffer_sent = 0;
-    if (connection->proxy_eof) return magnus_proxy_abort(epoll_fd, connection);
-    if (connection->upstream_fd >= 0) {
-        struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
-                                     .data.fd = connection->upstream_fd };
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->upstream_fd, &event);
+
+    {
+        bool complete_by_length = connection->proxy_has_response_length
+            && connection->proxy_response_received
+               >= connection->proxy_response_length;
+        if (!connection->proxy_eof && !complete_by_length) {
+            /* Still mid-body; keep watching the upstream for more. */
+            if (connection->upstream_fd >= 0) {
+                struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                             .data.fd = connection->upstream_fd };
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->upstream_fd,
+                         &event);
+            }
+            return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
+        }
+
+        /* Response complete. The upstream leg either goes back into the
+         * pool (cleanly length-framed, and not asked to close -- see
+         * magnus_proxy_receive_headers()) or gets torn down exactly as
+         * before this pool existed; independently, the client leg either
+         * stays open for its next request or closes, per whatever
+         * close_after_write was already set to there. */
+        if (complete_by_length && connection->proxy_upstream_poolable
+            && connection->upstream_fd >= 0) {
+            int fd = connection->upstream_fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            magnus_upstream_owner[fd] = NULL;
+            connection->upstream_fd = -1;
+            magnus_pool_checkin(connection->proxy_endpoint_index, fd,
+                connection->proxy_upstream_requests_served + 1);
+        } else {
+            magnus_proxy_teardown_upstream(epoll_fd, connection);
+        }
+        connection->proxy_active = false;
+
+        if (connection->close_after_write) return -1;
+        if (connection->input_length > 0
+            && magnus_find_header_end(connection->input,
+                                      connection->input_length) != NULL) {
+            return magnus_process_input(epoll_fd, connection);
+        }
+        return magnus_update_interest(epoll_fd, connection,
+                                      EPOLLIN | EPOLLRDHUP);
     }
-    return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
 }
 
 /* Accumulates the upstream response's status line + header block (which
@@ -768,7 +1017,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     size_t leftover;
     char header_copy[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
-    unsigned upstream_status;
+    magnus_proxy_response_info_t info;
     int sanitized_length;
 
     while (connection->proxy_header_accum < MAGNUS_PROXY_BUFFER) {
@@ -825,9 +1074,10 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     memcpy(header_copy, connection->proxy_buffer, header_length);
     header_copy[header_length] = '\0';
     sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
-        header_length, sanitized, sizeof(sanitized), &upstream_status,
+        header_length, sanitized, sizeof(sanitized),
         connection->proxy_issue_affinity_cookie
-            ? connection->proxy_affinity_key : NULL);
+            ? connection->proxy_affinity_key : NULL,
+        connection->proxy_client_wants_close, &info);
     if (sanitized_length < 0)
         return magnus_proxy_connect_failed(epoll_fd, connection, 502,
                                            "Bad Gateway");
@@ -839,22 +1089,42 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     memcpy(connection->proxy_header_out, sanitized, (size_t) sanitized_length);
     connection->proxy_header_out_length = (size_t) sanitized_length;
     connection->proxy_header_out_sent = 0;
+    /* `leftover` is body bytes that arrived in the same recv() as the
+     * headers -- already fully received from upstream even though
+     * magnus_proxy_flush() hasn't written them to the client yet, so it
+     * counts toward proxy_response_received now, not just once flushed:
+     * what decides whether more needs to be read from *upstream* (and
+     * therefore whether the upstream connection can be freed for reuse)
+     * is what has been received, independent of client-write progress.
+     * If a length was declared and the backend sent more than that in one
+     * burst (a misbehaving backend, or a pipelined next response arriving
+     * early on a connection this pool just started reusing), the excess
+     * must not be forwarded as part of *this* response's body -- doing so
+     * would desync the client's own parser -- so it is dropped, not
+     * buffered, here. */
+    if (info.has_content_length && leftover > info.content_length)
+        leftover = info.content_length;
     memmove(connection->proxy_buffer, body_start, leftover);
     connection->proxy_buffer_length = leftover;
     connection->proxy_buffer_sent = 0;
     connection->proxy_headers_received = true;
+    connection->close_after_write = !info.keep_client_alive;
+    connection->proxy_upstream_poolable = info.upstream_poolable;
+    connection->proxy_has_response_length = info.has_content_length;
+    connection->proxy_response_length = info.content_length;
+    connection->proxy_response_received = leftover;
     magnus_cluster_result(&magnus_cluster, connection->proxy_endpoint_index,
                           true, magnus_now_ms());
     magnus_requests_total++;
-    if (upstream_status >= 500) magnus_responses_5xx++;
-    else if (upstream_status >= 400) magnus_responses_4xx++;
+    if (info.status >= 500) magnus_responses_5xx++;
+    else if (info.status >= 400) magnus_responses_4xx++;
     {
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
         magnus_record_latency(latency_ms);
         magnus_access_log(connection->proxy_request_id,
                           connection->proxy_log_method,
-                          connection->proxy_log_target, upstream_status,
+                          connection->proxy_log_target, info.status,
                           latency_ms);
     }
     return magnus_proxy_flush(epoll_fd, connection);
@@ -935,18 +1205,38 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
     }
     if (connection->proxy_buffer_length != 0) return 0;
     if ((flags & EPOLLIN) != 0 || (flags & EPOLLRDHUP) != 0) {
-        ssize_t received = recv(connection->upstream_fd, connection->proxy_buffer,
-                                MAGNUS_PROXY_BUFFER, 0);
+        /* Never read past a declared Content-Length: leftover bytes in the
+         * kernel buffer past this response's end would otherwise belong to
+         * whatever comes next on this connection (a pipelined response, if
+         * this pool ever hands the connection to a concurrent user again --
+         * it does not today, but the boundary must hold regardless) rather
+         * than to this one. */
+        size_t want = MAGNUS_PROXY_BUFFER;
+        if (connection->proxy_has_response_length) {
+            size_t remaining = connection->proxy_response_length
+                - connection->proxy_response_received;
+            if (remaining < want) want = remaining;
+        }
+        ssize_t received = want > 0
+            ? recv(connection->upstream_fd, connection->proxy_buffer, want, 0)
+            : 0;
         if (received > 0) {
             connection->proxy_buffer_length = (size_t) received;
+            connection->proxy_response_received += (size_t) received;
             connection->last_active = time(NULL);
             connection->proxy_last_activity = connection->last_active;
+        } else if (want == 0) {
+            /* Already have every declared body byte -- nothing left to
+             * read, and treating a want-0 recv()'s return as EOF would be
+             * exactly the same misread magnus_proxy_receive_headers()
+             * already avoids for the same reason. */
         } else if (received == 0) {
             connection->proxy_eof = true;
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             return magnus_proxy_abort(epoll_fd, connection);
         }
-        if (connection->proxy_buffer_length != 0 || connection->proxy_eof)
+        if (connection->proxy_buffer_length != 0 || connection->proxy_eof
+            || want == 0)
             return magnus_proxy_flush(epoll_fd, connection);
     }
     event = (struct epoll_event) { .events = EPOLLIN | EPOLLRDHUP,
@@ -1299,7 +1589,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 &request);
     } else if (is_proxy_route) {
         if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
-                                        parsed->affinity_key) == 0) {
+                                        parsed->affinity_key,
+                                        close_connection) == 0) {
             /* No access-log line here: the request has not completed yet
              * (that happens later, asynchronously, once the upstream
              * responds -- see magnus_proxy_receive_headers/_fail). Just
@@ -2049,6 +2340,15 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_root_fd = new_root_fd;
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
     magnus_tls_context = new_tls_context;
+    /* Pooled connections are indexed purely by endpoint *position*
+     * (0..count-1), not by address -- after a reload, position N in the
+     * new cluster is not necessarily the same backend it was in the old
+     * one (an upstream line added, removed, or reordered shifts every
+     * index after it). Handing one out under the new cluster without
+     * this flush could send a request meant for the new endpoint N to
+     * whatever pooled connection happened to be sitting at slot N from
+     * before the reload. */
+    magnus_pool_close_all();
     magnus_cluster = new_cluster;
     magnus_upstream_enabled = new_cluster.count > 0;
     magnus_rate_limit_enabled = config->has_rate_limit;
@@ -2442,6 +2742,7 @@ main(int argc, char **argv)
         if (now != last_sweep) {
             magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
+            magnus_pool_expire_idle(now);
             magnus_health_tick(epoll_fd, now);
             magnus_access_log_flush();
             last_sweep = now;
@@ -2453,6 +2754,7 @@ main(int argc, char **argv)
             magnus_close_connection(epoll_fd, magnus_connections[fd]);
         }
     }
+    magnus_pool_close_all();
     close(epoll_fd);
     close(listener);
     if (magnus_admin_listener >= 0) {

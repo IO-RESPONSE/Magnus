@@ -22,6 +22,10 @@ independently by IORESPONSE.
   the event loop on slow upstreams or large responses; relays any HTTP
   method with a request body (POST/PUT/PATCH/DELETE/...), buffered up to
   1 MiB before dispatch -- every other route stays GET/HEAD-only
+- Per-endpoint pool of idle upstream connections (avoids a fresh TCP
+  handshake per proxied request); a response with a known length also
+  keeps the *client* connection alive, independent of whether the
+  upstream leg is pooled
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP

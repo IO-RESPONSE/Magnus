@@ -93,17 +93,31 @@ make sanitize` + new-tests-pass + short report cycle already used for every
 milestone so far in this project. Nothing here starts without that
 checkpoint from the prior sub-phase being green.
 
-1. **1a — Upstream connection pool.** Extends the existing single-shot
-   proxy connection with idle/active/connecting/draining/failed state per
-   endpoint, keepalive reuse, an idle timeout, and a max-requests-per-
-   connection bound. Highest value-to-risk ratio: it changes proxy
-   *performance* (removes a TCP+TLS handshake from every proxied request)
-   without touching wire protocol parsing at all. Module impact: `magnus_proxy.c`/`.h`
-   gain a pool structure; `magnus.c`'s upstream-fd handling in
-   `magnus_handle_upstream` changes from "one fd per request" to "borrow
-   from pool, return or discard on completion." No config schema change
-   needed for a first cut (sane fixed defaults), pool size becomes
-   configurable in a follow-up.
+1. **1a — Upstream connection pool. Shipped in 1.2.0.** A per-endpoint
+   pool of idle connections (checked before opening a fresh one; returned
+   to the pool, not closed, once a response completes cleanly), bounded
+   at 8 idle/endpoint, a 60s idle timeout, and 100 requests/connection.
+   Liveness is checked at checkout time (non-blocking `MSG_PEEK`) rather
+   than by keeping idle connections registered with epoll -- simpler, and
+   avoids a second "this event belongs to an idle, unowned upstream
+   connection" branch in the main dispatch loop, at the cost of not
+   detecting a backend-initiated close until the next checkout rather
+   than immediately; the idle timeout bounds how long that can matter. A
+   config reload flushes the whole pool (endpoint position is not
+   guaranteed stable across a reload). Turned out to require -- and this
+   ended up being the more consequential half of the sub-phase -- knowing
+   a response's exact length up front (Content-Length) rather than
+   relying on the upstream closing to signal completion, which is also
+   what unlocked a real, independently-shipped fix: proxied responses
+   had been force-closing the *client* connection unconditionally since
+   M2, regardless of what the client asked for; both legs are now decided
+   independently (see CHANGELOG.md 1.2.0). No config schema change yet;
+   pool size/timeout/request-budget stay fixed constants for now,
+   revisited if real usage shows the defaults wrong. Not yet done:
+   TLS-upstream connection reuse (no TLS upstream support exists at all
+   yet -- out of this sub-phase's scope) and connection draining as a
+   distinct state (a connection mid-response when its budget is hit is
+   simply not pooled afterward, not actively drained early).
 2. **1b — Advanced routing.** `host`/`path prefix`/`method`/`header`/
    `cookie`/`query parameter`/`source IP` match conditions, combinable with
    AND, evaluated before the existing static/proxy dispatch. New
