@@ -2,6 +2,7 @@
 #include "magnus_config.h"
 #include "magnus_http.h"
 #include "magnus_policy.h"
+#include "magnus_dns.h"
 #include "magnus_proxy.h"
 #include "magnus_route.h"
 
@@ -27,7 +28,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.3.0"
+#define MAGNUS_VERSION "1.4.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -50,6 +51,10 @@
 #define MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT 8
 #define MAGNUS_POOL_IDLE_TIMEOUT_SECONDS 60
 #define MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION 100
+/* How often a hostname upstream is re-resolved. Fixed, not the record's
+ * actual TTL -- see magnus_dns.h's design note on why this module cannot
+ * see a real TTL at all without hand-rolling DNS wire-format parsing. */
+#define MAGNUS_DNS_REFRESH_SECONDS 30
 
 typedef struct {
     int fd;
@@ -300,6 +305,112 @@ magnus_pool_close_all(void)
         pool->count = 0;
     }
 }
+
+/* Hostname-upstream tracking (1c). Parallel to magnus_cluster.endpoints[]
+ * by index -- magnus_dns_apply_result() overwrites an endpoint's address
+ * in place on a successful resolution, so magnus_endpoint_sockaddr() and
+ * everything downstream of it (connect, health checks, the connection
+ * pool) needs no DNS-awareness of its own at all. The eventfd
+ * magnus_dns_start() returns is registered with epoll once, at startup;
+ * the worker thread itself is started once and outlives any number of
+ * config reloads (only what it's asked to resolve changes). */
+static int magnus_dns_eventfd = -1;
+static bool magnus_dns_hostname_endpoint[MAGNUS_MAX_UPSTREAMS];
+static char magnus_dns_endpoint_hostname[MAGNUS_MAX_UPSTREAMS][64];
+static time_t magnus_dns_next_resolution[MAGNUS_MAX_UPSTREAMS];
+static bool magnus_dns_resolution_pending[MAGNUS_MAX_UPSTREAMS];
+
+/* Registers endpoint `index` as needing async resolution of `hostname`
+ * and kicks off an immediate first attempt (if the resolver started
+ * successfully -- if not, the endpoint's address stays whatever the
+ * config/CLI flag literally said, which is not a valid IP for a hostname
+ * entry, so it simply fails connect attempts cleanly via the existing
+ * magnus_endpoint_sockaddr() -> inet_pton() failure path, same as any
+ * other bad address would). */
+static void
+magnus_dns_track(size_t index, const char *hostname)
+{
+    if (index >= MAGNUS_MAX_UPSTREAMS
+        || strlen(hostname) >= sizeof(magnus_dns_endpoint_hostname[0]))
+        return;
+    magnus_dns_hostname_endpoint[index] = true;
+    strcpy(magnus_dns_endpoint_hostname[index], hostname);
+    magnus_dns_next_resolution[index] = time(NULL) + MAGNUS_DNS_REFRESH_SECONDS;
+    if (magnus_dns_eventfd < 0) return;
+    magnus_dns_resolution_pending[index] = true;
+    magnus_dns_resolve(hostname, index);
+}
+
+/* Rebuilds hostname tracking from scratch for a freshly applied config
+ * (initial load or reload): every previous index's tracking is cleared
+ * first since after a reload, position N in the new cluster is not
+ * necessarily the same upstream it was before (same reasoning as the
+ * connection pool's reload flush in magnus_apply_config()). */
+static void
+magnus_dns_apply_upstreams(const magnus_config_upstream_t *upstreams, size_t count)
+{
+    for (size_t i = 0; i < MAGNUS_MAX_UPSTREAMS; i++) {
+        magnus_dns_hostname_endpoint[i] = false;
+        magnus_dns_resolution_pending[i] = false;
+    }
+    for (size_t i = 0; i < count && i < MAGNUS_MAX_UPSTREAMS; i++) {
+        if (upstreams[i].is_hostname) magnus_dns_track(i, upstreams[i].address);
+    }
+}
+
+/* Called once per second from the main sweep: kicks off re-resolution for
+ * any hostname endpoint whose refresh interval has elapsed and that does
+ * not already have a resolution in flight. A resolution failure does not
+ * touch next_resolution or the endpoint's current address here -- see
+ * magnus_dns_apply_result() -- so a transient DNS hiccup just means this
+ * retries again next interval, exactly as if nothing had gone wrong. */
+static void
+magnus_dns_tick(time_t now)
+{
+    for (size_t i = 0; i < MAGNUS_MAX_UPSTREAMS; i++) {
+        if (!magnus_dns_hostname_endpoint[i] || magnus_dns_resolution_pending[i]
+            || now < magnus_dns_next_resolution[i])
+            continue;
+        magnus_dns_resolution_pending[i] = true;
+        magnus_dns_next_resolution[i] = now + MAGNUS_DNS_REFRESH_SECONDS;
+        magnus_dns_resolve(magnus_dns_endpoint_hostname[i], i);
+    }
+}
+
+/* magnus_dns_drain_results() callback: applies a completed resolution to
+ * the live cluster. A stale result for an index the cluster has since
+ * shrunk past (a reload removed upstream entries) or that is no longer
+ * tracked as a hostname at all (an in-flight resolution from before a
+ * reload, completing after magnus_dns_apply_upstreams() already reset
+ * tracking for the new config) is simply ignored -- the token space is
+ * only ever endpoint indices, so there is nothing else it could mean.
+ *
+ * On failure, the endpoint's current address is left exactly as it was:
+ * a still-good address from a previous successful resolution should not
+ * be thrown away over one failed refresh (this is the "keep last-known-
+ * good" policy noted as a design decision in docs/development-roadmap.md's
+ * 1c entry), and a first-ever resolution that fails simply leaves the
+ * address as whatever it started as (the hostname itself, not a valid IP
+ * literal -- see magnus_dns_track()'s comment), which already fails
+ * connect attempts cleanly rather than needing special-case handling
+ * here. */
+static void
+magnus_dns_apply_result(const magnus_dns_result_t *result, void *data)
+{
+    size_t index = result->token;
+    (void) data;
+    if (index >= MAGNUS_MAX_UPSTREAMS || index >= magnus_cluster.count
+        || !magnus_dns_hostname_endpoint[index])
+        return;
+    magnus_dns_resolution_pending[index] = false;
+    if (!result->ok) {
+        fprintf(stderr, "magnus: dns: '%s' did not resolve, keeping last "
+                        "known address\n", magnus_dns_endpoint_hostname[index]);
+        return;
+    }
+    strcpy(magnus_cluster.endpoints[index].address, result->address);
+}
+
 /* Health-probe fds share the same epoll_fd as client/upstream connections.
  * Index i+1 (0 means "not a probe fd") names the cluster endpoint a given
  * fd is probing, so the main dispatch loop can route its events here
@@ -2404,6 +2515,7 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_pool_close_all();
     magnus_cluster = new_cluster;
     magnus_upstream_enabled = new_cluster.count > 0;
+    magnus_dns_apply_upstreams(config->upstreams, config->upstream_count);
     memcpy(magnus_routes, config->routes, sizeof(magnus_routes));
     magnus_route_count = config->route_count;
     magnus_rate_limit_enabled = config->has_rate_limit;
@@ -2528,13 +2640,16 @@ magnus_parse_options(int argc, char **argv)
             unsigned long upstream_port;
             unsigned long weight = 1;
             struct in_addr probe;
+            bool is_hostname;
             if (strlen(argv[index + 1]) >= sizeof(spec)) break;
             strcpy(spec, argv[index + 1]);
             address = strtok_r(spec, ":", &saveptr);
             port_text = strtok_r(NULL, ":", &saveptr);
             weight_text = strtok_r(NULL, ":", &saveptr);
-            if (address == NULL || port_text == NULL
-                || inet_pton(AF_INET, address, &probe) != 1) break;
+            if (address == NULL || port_text == NULL) break;
+            is_hostname = inet_pton(AF_INET, address, &probe) != 1;
+            if (is_hostname && !magnus_config_looks_like_hostname(address))
+                break;
             errno = 0;
             upstream_port = strtoul(port_text, &end, 10);
             if (errno != 0 || *end != '\0' || upstream_port == 0
@@ -2549,6 +2664,8 @@ magnus_parse_options(int argc, char **argv)
                                    (unsigned) upstream_port,
                                    (unsigned) weight) != 0) break;
             magnus_upstream_enabled = true;
+            if (is_hostname)
+                magnus_dns_track(magnus_cluster.count - 1, address);
         } else if (strcmp(argv[index], "--rate-limit") == 0) {
             /* requests-per-second, or requests-per-second:burst */
             char spec[32];
@@ -2681,6 +2798,18 @@ main(int argc, char **argv)
     unsigned port;
     int listener;
     magnus_ensure_standard_fds();
+    /* Started before option parsing: a --config or --upstream hostname
+     * entry kicks off its first resolution as soon as it is parsed (see
+     * magnus_dns_track()/magnus_dns_apply_upstreams()), which needs the
+     * worker thread already running. A failure here is not fatal -- IP-
+     * literal upstreams are entirely unaffected, and a hostname one just
+     * never resolves (fails connect attempts cleanly, same as any other
+     * bad address) until process restart. */
+    magnus_dns_eventfd = magnus_dns_start();
+    if (magnus_dns_eventfd < 0) {
+        fprintf(stderr, "magnus: dns: resolver unavailable (%s); hostname "
+                        "upstreams will not resolve\n", strerror(errno));
+    }
     port = magnus_parse_options(argc, argv);
     magnus_listen_port = port;
     listener = magnus_create_listener(port);
@@ -2706,6 +2835,16 @@ main(int argc, char **argv)
         close(epoll_fd);
         close(listener);
         return 1;
+    }
+    if (magnus_dns_eventfd >= 0) {
+        struct epoll_event dns_event = { .events = EPOLLIN,
+                                         .data.fd = magnus_dns_eventfd };
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, magnus_dns_eventfd,
+                      &dns_event) < 0) {
+            perror("magnus: dns: epoll_ctl");
+            magnus_dns_stop();
+            magnus_dns_eventfd = -1;
+        }
     }
     if (magnus_admin_enabled) {
         struct epoll_event admin_event;
@@ -2775,6 +2914,10 @@ main(int argc, char **argv)
                                                  true);
                 continue;
             }
+            if (magnus_dns_eventfd >= 0 && fd == magnus_dns_eventfd) {
+                magnus_dns_drain_results(magnus_dns_apply_result, NULL);
+                continue;
+            }
             if (fd >= 0 && fd < MAGNUS_MAX_FDS
                 && magnus_upstream_owner[fd] != NULL) {
                 connection = magnus_upstream_owner[fd];
@@ -2817,6 +2960,7 @@ main(int argc, char **argv)
             magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             magnus_pool_expire_idle(now);
+            magnus_dns_tick(now);
             magnus_health_tick(epoll_fd, now);
             magnus_access_log_flush();
             last_sweep = now;
@@ -2829,6 +2973,7 @@ main(int argc, char **argv)
         }
     }
     magnus_pool_close_all();
+    magnus_dns_stop();
     close(epoll_fd);
     close(listener);
     if (magnus_admin_listener >= 0) {

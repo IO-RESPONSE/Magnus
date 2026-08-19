@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+
+- **DNS-resolved upstreams** (roadmap Phase 1c). An `upstream` entry
+  (config key or `--upstream` CLI flag) can now be a hostname instead of
+  a literal IPv4 address -- resolved asynchronously so the event loop
+  never blocks on a lookup, kept up to date on a fixed refresh interval
+  (`MAGNUS_DNS_REFRESH_SECONDS`, 30s), and "keep last-known-good" on a
+  failed refresh rather than tearing down a perfectly good address over
+  one DNS hiccup. A hostname that has never resolved yet fails proxy
+  attempts cleanly (502) exactly like any other unreachable endpoint --
+  no special-case handling needed for that state, since the endpoint's
+  address simply is not a valid IP literal until the first successful
+  resolution overwrites it.
+- New module `magnus_dns.c`/`.h`: one dedicated background thread runs
+  the system's own (blocking) `getaddrinfo()`, with completion delivered
+  to the main thread via an eventfd registered in the normal epoll loop
+  -- **the first thread this codebase has ever had**. Deliberately built
+  on `getaddrinfo()` rather than a hand-rolled DNS wire-format parser:
+  it hands correctness (search domains, `/etc/hosts`, NSS modules) to
+  the C library instead of adding a new parser of untrusted bytes: the
+  trade-off is that the standard API exposes no TTL, so refresh is a
+  fixed interval, not the record's actual TTL (a real limitation,
+  documented rather than glossed over).
+- The DNS worker thread never touches anything outside `magnus_dns.c`'s
+  own mutex-protected request/result queues; only the main thread's
+  drain callback reaches into the rest of `magnus.c` (overwriting a
+  cluster endpoint's address in place), so the only place a data race
+  could exist is inside that one module. Verified with a dedicated
+  `make tsan` target (ThreadSanitizer) on top of the usual
+  `make clean && make test`/`make sanitize`, all green -- this codebase's
+  first use of a sanitizer built specifically for concurrency, for its
+  first genuinely concurrent code.
+- Verified end-to-end, not just via the module's own unit test
+  (`tests/test-dns.c`, real worker thread + real eventfd + real
+  `getaddrinfo()` against `localhost`, no mocking): a `--config`
+  hostname upstream and a CLI `--upstream` hostname both resolve and
+  proxy correctly against a real backend, a config reload re-resolves
+  and keeps working, and a hostname that cannot resolve at all fails
+  proxy attempts cleanly without affecting magnus's own health. New
+  coverage in `tests/test-core.sh`.
+
 ## 1.3.0
 
 ### Added

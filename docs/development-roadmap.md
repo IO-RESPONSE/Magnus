@@ -144,15 +144,29 @@ checkpoint from the prior sub-phase being green.
    codebase has always had; per-route upstream selection is a natural
    follow-up, likely worth bundling with the eventual canary/traffic-split
    work in Section 26's routing list rather than doing it twice.
-3. **1c — DNS resolver.** A/AAAA resolution for `upstream` entries that are
-   hostnames instead of literal IPv4 addresses, with a TTL-respecting
-   cache, background refresh, and defined behavior when resolution fails
-   (keep last-known-good vs. mark unhealthy — decided in the design step).
-   Self-contained; the main event-loop-safety risk is that DNS resolution
-   must never become a blocking call inside epoll (either `getaddrinfo_a`,
-   a small resolver thread pool feeding results back over an eventfd, or a
-   vendored minimal async resolver — evaluated in Section 5's dependency
-   framework before writing any of it).
+3. **1c — DNS resolver. Shipped in 1.4.0.** An `upstream` entry may be a
+   hostname; resolved on a dedicated background thread (this codebase's
+   first thread) running the system's own `getaddrinfo()`, completion
+   delivered to the main thread over an eventfd registered in the normal
+   epoll loop -- chosen over `getaddrinfo_a()` (real-world reliability
+   history) and over a hand-rolled DNS wire-format parser (new untrusted-
+   byte parsing surface this project has otherwise avoided; also gets
+   search domains/`/etc/hosts`/NSS for free). The trade-off that comes
+   with `getaddrinfo()`: its standard API exposes no TTL, so this is a
+   fixed-interval refresh (`MAGNUS_DNS_REFRESH_SECONDS`, 30s), not a
+   TTL-respecting cache as originally scoped here -- true TTL-awareness
+   would require the wire-format-parsing approach this deliberately
+   avoided, or a library like c-ares; revisit only if the fixed interval
+   proves wrong in practice. Resolution failure keeps the last-known-good
+   address (decided: an endpoint that has resolved successfully at least
+   once should not be torn down over one transient DNS hiccup); an
+   endpoint that has never resolved simply fails connect attempts
+   cleanly via the existing bad-address handling, no special pending
+   state needed. New module `magnus_dns.c`/`.h`, and this codebase's
+   first use of ThreadSanitizer (`make tsan`), justified by being its
+   first genuinely concurrent code -- the worker thread never touches
+   anything outside its own module, so that is also the only place a
+   race could exist, and TSan confirms none does.
 4. **1d — WebSocket.** HTTP Upgrade handshake, RFC 6455 frame parsing
    (text/binary/ping/pong/close/fragmentation, client-frame unmasking,
    large-frame handling), and proxying the upgraded connection as a raw

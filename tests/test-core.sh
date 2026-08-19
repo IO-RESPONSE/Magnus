@@ -913,3 +913,111 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# DNS-resolved upstream (1c): "localhost" instead of a literal IP, in
+# both --config mode and plain --upstream CLI-flag mode, actually
+# resolves asynchronously and proxies successfully -- not just accepted
+# by config parsing. A config reload re-resolves and keeps working. An
+# upstream hostname that cannot resolve at all fails proxy attempts
+# cleanly (502), not a hang or crash, and does not stop magnus itself
+# from staying healthy.
+port_dns=$((port + 30))
+upstream_dns=$((port + 31))
+printf '%s\n' 'dns-resolved backend' >"$web_root/dns-backend.txt"
+python3 -m http.server "$upstream_dns" --bind 127.0.0.1 \
+  --directory "$web_root" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_dns/dns-backend.txt" \
+    >/dev/null && break
+  sleep 1
+done
+dns_config="$web_root/dns.conf"
+cat > "$dns_config" <<EOF
+port = $port_dns
+root = $web_root
+upstream = localhost:$upstream_dns:1
+EOF
+"$binary" --config "$dns_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_dns/healthz" >/dev/null && break
+  sleep 1
+done
+resolved=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  test "$(curl --silent "http://127.0.0.1:$port_dns/proxy/dns-backend.txt")" \
+    = 'dns-resolved backend' && resolved=1 && break
+  sleep 1
+done
+test "$resolved" = 1
+curl --fail --silent "http://127.0.0.1:$port_dns/metrics" \
+  | grep -Eq '^magnus_upstream_healthy\{endpoint="127\.0\.0\.1:'"$upstream_dns"'"\} 1$'
+
+# Reload re-resolves (a fresh cluster after reload starts unresolved
+# again -- see magnus_dns_apply_upstreams()) and keeps working.
+kill -HUP "$server_pid"
+sleep 1
+test "$(curl --fail --silent "http://127.0.0.1:$port_dns/proxy/dns-backend.txt")" \
+  = 'dns-resolved backend'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+
+# A hostname that cannot resolve at all: proxy attempts fail cleanly, and
+# magnus itself is unaffected.
+port_dnsbad=$((port + 32))
+bad_config="$web_root/dns-bad.conf"
+cat > "$bad_config" <<EOF
+port = $port_dnsbad
+root = $web_root
+upstream = this-name-should-not-resolve.invalid:1:1
+EOF
+"$binary" --config "$bad_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_dnsbad/healthz" >/dev/null && break
+  sleep 1
+done
+sleep 1
+test "$(curl --silent --max-time 5 --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_dnsbad/proxy/dns-backend.txt")" = 502
+test "$(curl --fail --silent "http://127.0.0.1:$port_dnsbad/healthz")" = 'magnus: ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# CLI --upstream also accepts and resolves a hostname, not just --config.
+port_dnscli=$((port + 33))
+upstream_dnscli=$((port + 34))
+python3 -m http.server "$upstream_dnscli" --bind 127.0.0.1 \
+  --directory "$web_root" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_dnscli/dns-backend.txt" \
+    >/dev/null && break
+  sleep 1
+done
+"$binary" --port "$port_dnscli" --root "$web_root" \
+  --upstream "localhost:$upstream_dnscli:1" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_dnscli/healthz" >/dev/null && break
+  sleep 1
+done
+resolved=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  test "$(curl --silent "http://127.0.0.1:$port_dnscli/proxy/dns-backend.txt")" \
+    = 'dns-resolved backend' && resolved=1 && break
+  sleep 1
+done
+test "$resolved" = 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=

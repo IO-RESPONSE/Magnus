@@ -86,6 +86,7 @@ main(void)
     assert(strcmp(config.tls_key, key_path) == 0);
     assert(config.upstream_count == 2);
     assert(strcmp(config.upstreams[0].address, "10.0.0.1") == 0);
+    assert(!config.upstreams[0].is_hostname);
     assert(config.upstreams[0].port == 8001);
     assert(config.upstreams[0].weight == 2);
     assert(config.upstreams[1].weight == 1);
@@ -130,6 +131,26 @@ main(void)
 
     /* malformed upstream */
     write_file(config_path, "port = 8080\nupstream = not-an-endpoint\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+
+    /* upstream hostname (1c): accepted, flagged as such, resolved
+     * asynchronously at runtime -- see magnus_dns.h -- not here. */
+    write_file(config_path, "port = 8080\nupstream = backend.internal:8001\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.upstream_count == 1);
+    assert(strcmp(config.upstreams[0].address, "backend.internal") == 0);
+    assert(config.upstreams[0].is_hostname);
+    assert(config.upstreams[0].port == 8001);
+
+    /* obviously-invalid hostname syntax is still rejected up front --
+     * "does this actually resolve" is deferred to runtime, but "is this
+     * even hostname-shaped" is not. */
+    write_file(config_path, "port = 8080\nupstream = -bad..host:8001\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nupstream = has space:8001\n");
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
 

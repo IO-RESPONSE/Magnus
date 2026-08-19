@@ -12,7 +12,13 @@
 #define MAGNUS_CONFIG_MAX_ROUTES 32
 
 typedef struct {
+    /* Either a literal IPv4 address, or (is_hostname true) a hostname to
+     * be resolved asynchronously at runtime -- see magnus_dns.h. Either
+     * way this is the value as written in the config; a hostname entry's
+     * *current* resolved address lives on the runtime cluster endpoint
+     * (magnus_policy.h), not here. */
     char address[64];
+    bool is_hostname;
     unsigned port;
     unsigned weight;
 } magnus_config_upstream_t;
@@ -74,5 +80,14 @@ magnus_config_result_t magnus_config_load(const char *path,
  * the same field values hash the same regardless of comment/whitespace
  * differences in the source file. */
 uint64_t magnus_config_hash(const magnus_config_t *config);
+
+/* True if `text` is at least hostname-*shaped* (labels of alphanumeric/
+ * hyphen, dot-separated, no leading/trailing hyphen or dot, length
+ * bounds) -- not a claim that it resolves, which can only be checked
+ * asynchronously at runtime (see magnus_dns.h). Exposed so magnus.c's
+ * plain --upstream CLI flag can apply the identical check
+ * magnus_config_load()'s `upstream` key does, rather than duplicating or
+ * drifting from it. */
+bool magnus_config_looks_like_hostname(const char *text);
 
 #endif

@@ -29,6 +29,10 @@ independently by IORESPONSE.
 - Advanced routing: repeatable `route` rules (host/path-prefix/method/
   header/cookie/query/source-CIDR, combinable with AND, first match
   wins) ahead of the built-in dispatch, actioned as proxy/deny/static
+- DNS-resolved upstreams: an `upstream` entry may be a hostname,
+  resolved asynchronously on a dedicated background thread (this
+  codebase's first thread) so the event loop never blocks; fixed-interval
+  refresh, keeps the last-known-good address on a failed refresh
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP

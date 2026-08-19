@@ -75,6 +75,36 @@ magnus_config_file_exists(const char *path)
     return stat(path, &metadata) == 0 && S_ISREG(metadata.st_mode);
 }
 
+/* Lenient on purpose: rejects what is clearly not hostname syntax at all
+ * (empty, too long, an empty label, a stray character outside
+ * alphanumeric/hyphen/dot, a leading/trailing hyphen or dot) but does not
+ * attempt full RFC 1123 compliance -- unlike an IP literal, "does this
+ * name actually resolve" cannot be verified at config-parse time anyway
+ * (see magnus_dns.h), so this only exists to catch obvious typos, not to
+ * be the authority on validity. */
+bool
+magnus_config_looks_like_hostname(const char *text)
+{
+    size_t length = strlen(text);
+    size_t label_length = 0;
+    if (length == 0 || length > 253) return false;
+    if (text[0] == '.' || text[0] == '-'
+        || text[length - 1] == '.' || text[length - 1] == '-')
+        return false;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char) text[i];
+        if (c == '.') {
+            if (label_length == 0) return false;
+            label_length = 0;
+            continue;
+        }
+        if (!isalnum(c) && c != '-') return false;
+        label_length++;
+        if (label_length > 63) return false;
+    }
+    return true;
+}
+
 static bool
 magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
 {
@@ -86,6 +116,7 @@ magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
     unsigned long port;
     unsigned long weight = 1;
     struct in_addr probe;
+    bool is_hostname;
 
     if (strlen(value) >= sizeof(spec)) return false;
     strcpy(spec, value);
@@ -93,13 +124,15 @@ magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
     port_text = strtok_r(NULL, ":", &saveptr);
     weight_text = strtok_r(NULL, ":", &saveptr);
     if (address == NULL || port_text == NULL) return false;
-    if (inet_pton(AF_INET, address, &probe) != 1) return false;
+    is_hostname = inet_pton(AF_INET, address, &probe) != 1;
+    if (is_hostname && !magnus_config_looks_like_hostname(address)) return false;
     if (!magnus_config_parse_uint(port_text, 1, 65535, &port)) return false;
     if (weight_text != NULL
         && !magnus_config_parse_uint(weight_text, 1, 1000, &weight))
         return false;
     if (strlen(address) >= sizeof(out->address)) return false;
     strcpy(out->address, address);
+    out->is_hostname = is_hostname;
     out->port = (unsigned) port;
     out->weight = (unsigned) weight;
     return true;
