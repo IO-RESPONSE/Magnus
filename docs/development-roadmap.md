@@ -118,14 +118,32 @@ checkpoint from the prior sub-phase being green.
    yet -- out of this sub-phase's scope) and connection draining as a
    distinct state (a connection mid-response when its budget is hit is
    simply not pooled afterward, not actively drained early).
-2. **1b — Advanced routing.** `host`/`path prefix`/`method`/`header`/
-   `cookie`/`query parameter`/`source IP` match conditions, combinable with
-   AND, evaluated before the existing static/proxy dispatch. New
-   `magnus_route.c`/`.h` (or extend `magnus_policy.c` — decided during
-   1b's design step, Section 24 step 2) plus new config schema (`route`
-   blocks). No protocol work; the risk is entirely in the config
-   schema/validation and the matcher correctness (fuzz the matcher, not
-   just the HTTP parser).
+2. **1b — Advanced routing. Shipped in 1.3.0.** `host`/`path_prefix`/
+   `method`/`header:<name>`/`cookie:<name>`/`query:<name>`/`source_cidr`
+   match conditions, combinable with AND (up to 8 per route), evaluated
+   in file order (first match wins) ahead of the built-in dispatch. New
+   `magnus_route.c`/`.h`, independently unit-tested and fuzzed (the
+   matcher against real request data, not the DSL parser, which only
+   ever sees admin-controlled config — same reasoning `magnus_config.c`
+   itself is unfuzzed). New repeatable `route = ...` config key (compact
+   single-line DSL, not a multi-line block — kept the flat-file schema
+   from needing a section/grouping concept it doesn't have yet) plus a
+   mirrored `--route` CLI flag. Three actions: `proxy` (forwards the
+   *full* path — a route isn't anchored to the literal `/proxy/*`
+   prefix, so nothing gets stripped, unlike that dispatch path), `deny`
+   (403, short-circuits ahead of everything else), and `static` (lets a
+   route's conditions gate an otherwise-ordinary static request; no
+   per-route root override yet — see below). Required extending
+   `magnus_http_parse()` to retain the Host value and every header
+   field for lookup, which `header:<name>` conditions need.
+   Not yet done: `action=static` root override (deferred — no `root=`
+   key on a route spec yet, not silently unsupported), regex matching
+   (path_prefix is a literal anchored prefix only), OR-combined
+   conditions (only AND), and multiple upstream clusters — every
+   `action=proxy` route still targets the one cluster this whole
+   codebase has always had; per-route upstream selection is a natural
+   follow-up, likely worth bundling with the eventual canary/traffic-split
+   work in Section 26's routing list rather than doing it twice.
 3. **1c — DNS resolver.** A/AAAA resolution for `upstream` entries that are
    hostnames instead of literal IPv4 addresses, with a TTL-respecting
    cache, background refresh, and defined behavior when resolution fails

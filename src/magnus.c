@@ -3,6 +3,7 @@
 #include "magnus_http.h"
 #include "magnus_policy.h"
 #include "magnus_proxy.h"
+#include "magnus_route.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -26,7 +27,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.2.0"
+#define MAGNUS_VERSION "1.3.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -165,6 +166,13 @@ static int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
 static magnus_cluster_t magnus_cluster;
 static bool magnus_upstream_enabled;
+/* Evaluated in order, first match wins, ahead of the built-in
+ * healthz/metrics/proxy-prefix/static dispatch -- see
+ * magnus_dispatch_request(). Empty (route_count == 0, the default) means
+ * every request falls straight through to that built-in dispatch exactly
+ * as it did before routes existed. */
+static magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
+static size_t magnus_route_count;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
 
 /* Idle upstream connections kept open for reuse, per cluster endpoint.
@@ -387,6 +395,7 @@ static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
                                        const magnus_request_t *request,
+                                       const char *forward_path,
                                        const char *client_affinity_key,
                                        bool client_wants_close);
 
@@ -726,6 +735,14 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
  * interest already updated to watch for abort), -1 if no healthy endpoint
  * was available or the retry budget was exhausted.
  *
+ * `forward_path` is what actually goes out on the wire as the upstream
+ * request's target: request->path with the literal "/proxy" prefix
+ * stripped for a request that reached here via that hardcoded prefix, or
+ * request->path unchanged for one that reached here via a matched
+ * action=proxy route instead (see magnus_dispatch_request()) -- a route
+ * is not anchored to any particular prefix, so there is nothing route
+ * matching implies should be stripped before relaying.
+ *
  * Selection uses session affinity: if the client's request carried a valid
  * MAGNUS_AFFINITY cookie, its encoded endpoint is preferred for this first
  * attempt only (magnus_cluster_select_sticky() itself already falls back
@@ -741,6 +758,7 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                             const magnus_request_t *request,
+                            const char *forward_path,
                             const char *client_affinity_cookie,
                             bool client_wants_close)
 {
@@ -766,12 +784,12 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
                    "Connection: keep-alive\r\nContent-Length: %zu\r\n"
                    "X-Magnus-Request-Id: %s\r\n\r\n",
-                   request->method, request->path + 6,
+                   request->method, forward_path,
                    connection->body_length, request->request_id)
         : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
                    "Connection: keep-alive\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-                   request->method, request->path + 6, request->request_id);
+                   request->method, forward_path, request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
         return -1;
     connection->proxy_request_length = (size_t) written;
@@ -1464,13 +1482,43 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     bool close_connection = parsed->close_connection;
     bool head_only = parsed->head_only;
     bool is_proxy_route;
+    bool literal_proxy_prefix;
+    bool route_denied = false;
+    const char *proxy_forward_path;
 
     memcpy(request.method, parsed->method, sizeof(request.method));
     memcpy(request.path, parsed->target, sizeof(request.path));
 
-    is_proxy_route = magnus_upstream_enabled && !connection->admin_only
+    literal_proxy_prefix = magnus_upstream_enabled && !connection->admin_only
         && strncmp(request.path, "/proxy", 6) == 0
         && (request.path[6] == '/' || request.path[6] == '\0');
+    is_proxy_route = literal_proxy_prefix;
+    proxy_forward_path = literal_proxy_prefix ? request.path + 6 : request.path;
+
+    /* Routes (advanced host/path/method/header/cookie/query/source-IP
+     * matching -- see magnus_route.h) are evaluated in file order, first
+     * match wins, ahead of everything else below except the phase hooks.
+     * The admin channel is exempt outright, same as it already is from
+     * the literal "/proxy" prefix above -- its own routing is that
+     * socket's filesystem permissions, not this. An action=static match
+     * needs no special handling here: matching and being neither deny nor
+     * proxy already falls through to the same static-file dispatch a
+     * request with no matching route at all gets, which is the point --
+     * it lets a route's *conditions* gate access to it. */
+    if (!connection->admin_only) {
+        for (size_t r = 0; r < magnus_route_count; r++) {
+            if (!magnus_route_matches(&magnus_routes[r], parsed,
+                                      connection->client_address))
+                continue;
+            if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
+                is_proxy_route = true;
+                proxy_forward_path = request.path;
+            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
+                route_denied = true;
+            }
+            break;
+        }
+    }
 
     if (magnus_phase_run(&magnus_phases, MAGNUS_PHASE_INGRESS, &request) != 0
         || magnus_phase_run(&magnus_phases, MAGNUS_PHASE_ROUTE, &request) != 0) {
@@ -1496,7 +1544,11 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         return 0;
     }
 
-    if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route) {
+    if (route_denied) {
+        magnus_prepare_response(connection, 403, "Forbidden", "text/plain",
+                                "forbidden\n", head_only, close_connection,
+                                &request);
+    } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
          * the reverse proxy is the one route that has always been meant
          * to relay whatever method (and body) the client sent -- see the
@@ -1589,6 +1641,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 &request);
     } else if (is_proxy_route) {
         if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
+                                        proxy_forward_path,
                                         parsed->affinity_key,
                                         close_connection) == 0) {
             /* No access-log line here: the request has not completed yet
@@ -2351,6 +2404,8 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_pool_close_all();
     magnus_cluster = new_cluster;
     magnus_upstream_enabled = new_cluster.count > 0;
+    memcpy(magnus_routes, config->routes, sizeof(magnus_routes));
+    magnus_route_count = config->route_count;
     magnus_rate_limit_enabled = config->has_rate_limit;
     if (config->has_rate_limit) {
         magnus_rate_limit_rps = config->rate_limit_rps;
@@ -2541,8 +2596,26 @@ magnus_parse_options(int argc, char **argv)
             if (errno != 0 || *end != '\0' || sample == 0
                 || sample > 1000000) break;
             magnus_access_log_sample = (unsigned) sample;
+        } else if (strcmp(argv[index], "--route") == 0) {
+            char route_error[128];
+            if (magnus_route_count == MAGNUS_CONFIG_MAX_ROUTES) break;
+            if (!magnus_route_parse(argv[index + 1],
+                                    &magnus_routes[magnus_route_count],
+                                    route_error, sizeof(route_error))) {
+                fprintf(stderr, "magnus: --route: %s\n", route_error);
+                exit(2);
+            }
+            magnus_route_count++;
         } else {
             break;
+        }
+    }
+    for (size_t r = 0; r < magnus_route_count; r++) {
+        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY
+            && !magnus_upstream_enabled) {
+            fprintf(stderr, "magnus: --route: a route with action=proxy "
+                            "needs at least one --upstream\n");
+            exit(2);
         }
     }
     if (index == argc && port != 0
@@ -2571,6 +2644,7 @@ magnus_parse_options(int argc, char **argv)
                     "[--rate-limit <rps[:burst]>] "
                     "[--admin-socket <path>] "
                     "[--access-log on|off] [--access-log-sample <n>] "
+                    "[--route <spec> ...] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
     exit(2);

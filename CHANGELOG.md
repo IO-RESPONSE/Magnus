@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+
+- **Advanced routing** (roadmap Phase 1b). A repeatable `route = ...`
+  config key (and `--route` CLI flag) evaluated in file order -- first
+  match wins -- ahead of the existing built-in dispatch, gated out for
+  the admin channel exactly like the literal `/proxy/*` prefix already
+  is. Each route combines up to 8 conditions with AND: `host`,
+  `path_prefix` (must start with `/`), `method`, `header:<name>`,
+  `cookie:<name>`, `query:<name>`, and `source_cidr` (`a.b.c.d/prefix`),
+  plus exactly one action -- `proxy` (relay to the existing upstream
+  cluster; forwards the request's full path, unlike the literal
+  `/proxy/*` dispatch, which strips that prefix -- a route isn't anchored
+  to any particular prefix, so there's nothing to strip), `deny` (403,
+  short-circuits ahead of everything else including the method check),
+  or `static` (no config-schema-visible effect yet beyond letting a
+  route's conditions gate an otherwise-ordinary static-file request --
+  see "Not yet done" below). A route with zero conditions is a valid
+  catch-all. `magnus_config_load()` rejects a `proxy`-action route
+  outright if no `upstream` is configured, same validate-up-front
+  philosophy as every other cross-field constraint.
+- `magnus_http_parse()` now retains the Host header's value (not just
+  its presence) and every header field (name and value, up to 32) for
+  `magnus_http_header_find()` to look up -- what `header:<name>`
+  route conditions (and any future consumer) match against.
+- New module `magnus_route.c`/`.h`: the compact single-line route DSL
+  parser and the request matcher, independently unit-tested
+  (`tests/test-route.c`) and fuzzed (`tests/fuzz-route.c`, mutating the
+  Host/Cookie/query-string bytes a route condition actually evaluates
+  against real request data -- not the DSL parser itself, which only
+  ever sees admin-controlled config content, the same reasoning that
+  keeps `magnus_config.c` unfuzzed).
+
+### Not yet done (see docs/development-roadmap.md)
+
+- `action=static` does not yet support a per-route root override (routes
+  can gate *whether* a request reaches static serving, not redirect it
+  to a different directory) -- deferred, not silently unsupported: the
+  config schema has no `root=` key on a route spec at all yet.
+- `query`/`cookie` condition values are compared case-sensitively (opaque
+  data, not a protocol token); `host`/`method`/`header` are
+  case-insensitive (HTTP convention). No regex matching -- `path_prefix`
+  is a literal, anchored prefix only.
+
+Verified end-to-end against a real backend and real loopback client IPs
+(not just the module's own unit tests): host+path_prefix routed to proxy
+with the full path forwarded correctly, a non-matching Host falling
+straight through to ordinary dispatch, a header-gated deny returning 403
+only when the header is present, a source_cidr match against real
+127.0.0.1 traffic denying only within its `path_prefix`, and the
+pre-existing literal `/proxy/*` dispatch completely unaffected. New
+coverage in `tests/test-core.sh`. `make clean && make test` and
+`make sanitize` both green; image rebuilt,
+`./scripts/test-image.sh` passes.
+
 ## 1.2.0
 
 ### Added

@@ -9,6 +9,19 @@
  * the first time a client arrives without one. */
 #define MAGNUS_AFFINITY_COOKIE_NAME "MAGNUS_AFFINITY"
 
+/* Bounds how many header fields magnus_http_parse() remembers individually
+ * (for magnus_http_header_find(), used by route matching -- see
+ * magnus_route.h). A header beyond this count is still fully validated as
+ * part of parsing but is not retained; MAGNUS_INPUT_LIMIT's 8KiB request
+ * cap already bounds how many headers a request can realistically carry,
+ * so this is a defensive limit, not an expected-to-bite one. */
+#define MAGNUS_HTTP_MAX_HEADERS 32
+
+typedef struct {
+    char name[64];
+    char value[192];
+} magnus_http_header_t;
+
 typedef struct {
     char method[8];
     char target[256];
@@ -22,7 +35,21 @@ typedef struct {
      * header without honoring it would be a framing hazard. */
     bool has_content_length;
     unsigned long content_length;
+    /* Host header's value verbatim (already required/validated non-empty
+     * for HTTP/1.1 -- see host_seen in magnus_http_parse()). */
+    char host[256];
+    /* Every header field, name and value verbatim, up to
+     * MAGNUS_HTTP_MAX_HEADERS -- see magnus_http_header_find(). */
+    magnus_http_header_t headers[MAGNUS_HTTP_MAX_HEADERS];
+    size_t header_count;
 } magnus_http_request_t;
+
+/* Case-insensitive lookup of a header's value among the (up to
+ * MAGNUS_HTTP_MAX_HEADERS) ones magnus_http_parse() retained. Returns NULL
+ * if not present (including if the request had more headers than were
+ * retained and this one happened to be past the cutoff). */
+const char *magnus_http_header_find(const magnus_http_request_t *request,
+                                    const char *name);
 
 typedef enum {
     MAGNUS_HTTP_OK = 0,

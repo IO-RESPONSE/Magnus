@@ -1,12 +1,15 @@
 #ifndef MAGNUS_CONFIG_H
 #define MAGNUS_CONFIG_H
 
+#include "magnus_route.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define MAGNUS_CONFIG_MAX_UPSTREAMS 16
 #define MAGNUS_CONFIG_PATH_MAX 256
+#define MAGNUS_CONFIG_MAX_ROUTES 32
 
 typedef struct {
     char address[64];
@@ -34,6 +37,13 @@ typedef struct {
     unsigned access_log_sample;
     bool has_admin_socket;
     char admin_socket[MAGNUS_CONFIG_PATH_MAX];
+    /* Parsed eagerly here (not left as raw strings) so a malformed route
+     * is caught by config validation itself, same as every other field --
+     * see magnus_route_parse(). Evaluated in file order; the first
+     * matching route wins. Optional: a config with none behaves exactly
+     * as it did before routes existed. */
+    size_t route_count;
+    magnus_route_t routes[MAGNUS_CONFIG_MAX_ROUTES];
 } magnus_config_t;
 
 typedef enum {
@@ -46,7 +56,8 @@ typedef enum {
  *   - every value is range/format checked (port, ipv4:port[:weight],
  *     file existence for root/tls_cert/tls_key, tls_cert and tls_key must
  *     be given together, rate_limit_burst requires rate_limit_rps,
- *     access_log is 'on'/'off', access_log_sample is a positive integer)
+ *     access_log is 'on'/'off', access_log_sample is a positive integer,
+ *     route is a valid magnus_route_parse() spec -- see magnus_route.h)
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted
  *

@@ -26,6 +26,9 @@ independently by IORESPONSE.
   handshake per proxied request); a response with a known length also
   keeps the *client* connection alive, independent of whether the
   upstream leg is pooled
+- Advanced routing: repeatable `route` rules (host/path-prefix/method/
+  header/cookie/query/source-CIDR, combinable with AND, first match
+  wins) ahead of the built-in dispatch, actioned as proxy/deny/static
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP

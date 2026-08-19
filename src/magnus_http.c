@@ -109,9 +109,29 @@ magnus_http_parse(const char *data, size_t length, magnus_http_request_t *reques
         for (const char *scan = value; scan < line_end; scan++)
             if (((unsigned char) *scan < 0x20 && *scan != '\t') || *scan == 0x7f)
                 return MAGNUS_HTTP_BAD_REQUEST;
+        if (request->header_count < MAGNUS_HTTP_MAX_HEADERS) {
+            magnus_http_header_t *stored
+                = &request->headers[request->header_count];
+            size_t value_length = (size_t) (line_end - value);
+            size_t stored_name_length = name_length < sizeof(stored->name) - 1
+                ? name_length : sizeof(stored->name) - 1;
+            size_t stored_value_length
+                = value_length < sizeof(stored->value) - 1
+                ? value_length : sizeof(stored->value) - 1;
+            memcpy(stored->name, cursor, stored_name_length);
+            stored->name[stored_name_length] = '\0';
+            memcpy(stored->value, value, stored_value_length);
+            stored->value[stored_value_length] = '\0';
+            request->header_count++;
+        }
         if (magnus_equal_ci(cursor, name_length, "host")) {
+            size_t value_length = (size_t) (line_end - value);
             if (host_seen || value == line_end) return MAGNUS_HTTP_BAD_REQUEST;
             host_seen = true;
+            if (value_length < sizeof(request->host)) {
+                memcpy(request->host, value, value_length);
+                request->host[value_length] = '\0';
+            }
         }
         if (magnus_equal_ci(cursor, name_length, "connection")) {
             size_t value_length = (size_t) (line_end - value);
@@ -160,4 +180,13 @@ magnus_http_parse(const char *data, size_t length, magnus_http_request_t *reques
     if (request->http_11 && !host_seen) return MAGNUS_HTTP_BAD_REQUEST;
     request->head_only = strcmp(request->method, "HEAD") == 0;
     return MAGNUS_HTTP_OK;
+}
+
+const char *
+magnus_http_header_find(const magnus_http_request_t *request, const char *name)
+{
+    for (size_t i = 0; i < request->header_count; i++)
+        if (strcasecmp(request->headers[i].name, name) == 0)
+            return request->headers[i].value;
+    return NULL;
 }

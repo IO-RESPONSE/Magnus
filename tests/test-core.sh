@@ -835,3 +835,81 @@ test "$(curl --fail --silent "http://127.0.0.1:$port_pooldead/healthz")" = 'magn
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
+
+# Advanced routing (1b): host/path_prefix/header/source_cidr conditions,
+# each combined with an action. A route with action=proxy forwards the
+# request's *full* path (not the literal-"/proxy"-prefix-stripped one the
+# hardcoded /proxy/* dispatch uses -- routes are not anchored to that
+# prefix, so there is nothing to strip), a deny match short-circuits to
+# 403 ahead of everything else, and neither disturbs a request that
+# matches no route at all, including the pre-existing literal /proxy/*
+# dispatch.
+port_route=$((port + 28))
+upstream_route=$((port + 29))
+python3 -c "
+import http.server
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        payload = ('backend saw path=' + self.path).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', $upstream_route), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+sleep 1
+route_config="$web_root/route.conf"
+cat > "$route_config" <<EOF
+port = $port_route
+root = $web_root
+upstream = 127.0.0.1:$upstream_route:1
+route = host=api.internal; path_prefix=/v1; action=proxy
+route = header:X-Blocked=1; action=deny
+route = source_cidr=127.0.0.0/8; path_prefix=/blocked-by-cidr; action=deny
+EOF
+"$binary" --config "$route_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_route/healthz" >/dev/null && break
+  sleep 1
+done
+
+# host+path_prefix match -> proxy, full path forwarded unchanged.
+test "$(curl --fail --silent --header 'Host: api.internal' \
+  "http://127.0.0.1:$port_route/v1/widgets")" \
+  = 'backend saw path=/v1/widgets'
+
+# Same path, non-matching Host -> no route matches, falls through to the
+# ordinary (here, 404 -- ordinary static dispatch, no such file) path.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --header 'Host: other.internal' "http://127.0.0.1:$port_route/v1/widgets")" \
+  = 404
+
+# header: condition -> deny short-circuits to 403.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --header 'X-Blocked: 1' "http://127.0.0.1:$port_route/hello.txt")" = 403
+# Without the header, the very same request is unaffected.
+test "$(curl --fail --silent "http://127.0.0.1:$port_route/hello.txt")" \
+  = 'magnus static file'
+
+# source_cidr matches real loopback traffic (127.0.0.1/8) on the
+# path_prefix-gated path -> denied; the same CIDR condition does not fire
+# outside that path_prefix, so unrelated requests are unaffected.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_route/blocked-by-cidr/x")" = 403
+test "$(curl --fail --silent "http://127.0.0.1:$port_route/hello.txt")" \
+  = 'magnus static file'
+
+# The pre-existing literal /proxy/* dispatch is completely unaffected by
+# any of the above: still strips the "/proxy" prefix before forwarding.
+test "$(curl --fail --silent "http://127.0.0.1:$port_route/proxy/x")" \
+  = 'backend saw path=/x'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=

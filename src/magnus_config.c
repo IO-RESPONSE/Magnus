@@ -270,6 +270,24 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
             }
             strcpy(config->admin_socket, value);
             config->has_admin_socket = true;
+        } else if (strcmp(key, "route") == 0) {
+            char route_error[128];
+            if (config->route_count == MAGNUS_CONFIG_MAX_ROUTES) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'route' entries (max %d)",
+                                        MAGNUS_CONFIG_MAX_ROUTES);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_route_parse(value,
+                                    &config->routes[config->route_count],
+                                    route_error, sizeof(route_error))) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'route': %s", route_error);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->route_count++;
         } else {
             magnus_config_set_error(error, error_capacity, line_number,
                                     "unknown key '%s'", key);
@@ -299,6 +317,16 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     }
     if (config->has_rate_limit && config->rate_limit_burst == 0.0) {
         config->rate_limit_burst = config->rate_limit_rps;
+    }
+    if (config->upstream_count == 0) {
+        for (size_t index = 0; index < config->route_count; index++) {
+            if (config->routes[index].action == MAGNUS_ROUTE_ACTION_PROXY) {
+                magnus_config_set_error(error, error_capacity, 0,
+                                        "a 'route' with action=proxy needs "
+                                        "at least one 'upstream'");
+                return MAGNUS_CONFIG_ERROR;
+            }
+        }
     }
     return MAGNUS_CONFIG_OK;
 }

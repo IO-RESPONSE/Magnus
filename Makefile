@@ -5,7 +5,7 @@ LDFLAGS ?= -Wl,-z,relro,-z,now
 LDLIBS ?= -lssl -lcrypto
 
 SOURCES := src/magnus.c src/magnus_config.c src/magnus_http.c src/magnus_phase.c \
-           src/magnus_policy.c src/magnus_proxy.c
+           src/magnus_policy.c src/magnus_proxy.c src/magnus_route.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize
@@ -32,24 +32,26 @@ build/%.o: src/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 build/magnusd: src/magnusd.c src/magnus_config.c src/magnus_config.h \
-		src/magnusd_protocol.h
+		src/magnus_route.c src/magnus_http.c src/magnusd_protocol.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc src/magnusd.c src/magnus_config.c \
-		$(LDFLAGS) -o $@
+		src/magnus_route.c src/magnus_http.c $(LDFLAGS) -o $@
 
 build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
-		src/magnusd_protocol.h
+		src/magnus_route.c src/magnus_http.c src/magnusd_protocol.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc src/magnusctl.c src/magnus_config.c \
-		$(LDFLAGS) -o $@
+		src/magnus_route.c src/magnus_http.c $(LDFLAGS) -o $@
 
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
-		build/fuzz-http
+		build/test-route build/fuzz-http build/fuzz-route
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
 	./build/test-config
+	./build/test-route
 	./build/fuzz-http
+	./build/fuzz-route
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -65,13 +67,27 @@ build/test-proxy: tests/test-proxy.c src/magnus_proxy.c src/magnus_proxy.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-proxy.c src/magnus_proxy.c -o $@
 
-build/test-config: tests/test-config.c src/magnus_config.c src/magnus_config.h
+build/test-config: tests/test-config.c src/magnus_config.c src/magnus_config.h \
+		src/magnus_route.c src/magnus_http.c
 	mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-config.c src/magnus_config.c -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-config.c src/magnus_config.c \
+		src/magnus_route.c src/magnus_http.c -o $@
+
+build/test-route: tests/test-route.c src/magnus_route.c src/magnus_route.h \
+		src/magnus_http.c src/magnus_http.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-route.c src/magnus_route.c \
+		src/magnus_http.c -o $@
 
 build/fuzz-http: tests/fuzz-http.c src/magnus_http.c src/magnus_http.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-http.c src/magnus_http.c -o $@
+
+build/fuzz-route: tests/fuzz-route.c src/magnus_route.c src/magnus_route.h \
+		src/magnus_http.c src/magnus_http.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-route.c src/magnus_route.c \
+		src/magnus_http.c -o $@
 
 clean:
 	rm -rf build
