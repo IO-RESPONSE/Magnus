@@ -1,0 +1,282 @@
+# Magnus Development Roadmap: v1.1.0 → NGINX-class Gateway
+
+Baseline for this roadmap is **v1.1.0** (the master prompt that requested this
+document named v1.0.1; v1.1.0 shipped the reverse proxy's request-body/any-method
+support in the time between that prompt being drafted and this analysis, so the
+gap analysis below is against the actual current state, not v1.0.1).
+
+This document is the mandatory first deliverable before any Phase 1 code is
+written, per the operating principle for this effort: analyze before building,
+one bounded phase at a time, each phase gated on `make && make test &&
+make sanitize` plus its own new tests before the next one starts.
+
+## 1. Current state (v1.1.0)
+
+Four C source files outside `magnus.c` are small and single-purpose
+(`magnus_http.c` 163 lines, `magnus_policy.c` 126, `magnus_proxy.c` 105,
+`magnus_phase.c` 60); the control plane (`magnusd.c` 561, `magnusctl.c` 246,
+`magnus_config.c` 317) is already separate from the data plane. `magnus.c`
+itself is 2,467 lines and is the one file this roadmap's module-split
+(Section 6) is actually about — everything else is already reasonably
+decomposed.
+
+### 1.1 Implemented
+
+- **Core**: single-threaded, non-blocking epoll reactor; HTTP/1.0 and
+  HTTP/1.1 parsing (strict, 8 KiB header cap); keep-alive; graceful
+  shutdown on SIGTERM/SIGINT; per-request 128-bit trace ID.
+- **Static content**: safe document-root resolution, MIME typing, HEAD,
+  zero-copy `sendfile`. No Range, no conditional requests (ETag/
+  If-Modified-Since), no compression.
+- **TLS**: OpenSSL, min version pinned to TLS 1.2 (so 1.2 and 1.3 both
+  negotiate), no explicit cipher list (platform default), `SSL_OP_NO_COMPRESSION`.
+  No SNI-based multi-cert selection, no ALPN, no mTLS, no session
+  ticket/OCSP handling beyond OpenSSL's own defaults.
+- **Reverse proxy** (`/proxy/*` only, one static config-file route): connect/
+  read timeouts, bounded retry budget (`MAGNUS_PROXY_MAX_ATTEMPTS`), hop-by-hop
+  header stripping, streaming response relay without blocking the event loop,
+  and — as of v1.1.0 — any HTTP method with a Content-Length-delineated
+  request body (capped at 1 MiB; chunked request bodies are rejected, not
+  yet decoded). One upstream TCP connection per proxied request, opened
+  fresh and closed after (`Connection: close` to the upstream) — no
+  connection pooling/reuse.
+- **Cluster / load balancing**: static `upstream ip:port[:weight]` list
+  from config, weighted round-robin only. Active (periodic TCP connect)
+  and passive (live-traffic) health checks share one circuit-breaker
+  state per endpoint (failure threshold + cooldown). Cookie-based sticky
+  session affinity (index-encoded, not hash-based).
+- **Traffic policy**: per-client-IP token-bucket rate limiting (single
+  global rate/burst, bounded eviction table). No ACL, no connection-count
+  limit, no per-route policy.
+- **Control plane**: `magnusd` supervises one `magnus` child, validates
+  config before applying, SIGHUP hot reload (old generation drains,
+  new connections see the new one), health-checked automatic rollback
+  on a failed reload or crash, audit log. `magnusctl check/reload/status/
+  shutdown` over a Unix domain socket.
+- **Observability**: buffered/sampleable/disable-able access log (fixed
+  field set: request_id, method, target, status, latency_ms — not the
+  full field list in Section 15 of the master prompt, no JSON mode).
+  Prometheus-style `/metrics`: request counters, per-endpoint health
+  gauges, one latency histogram. No per-route/per-upstream breakdown,
+  no TLS/HTTP2/cache/circuit-breaker series.
+- **Admin channel isolation**: `--admin-socket` moves `/metrics` to an
+  owner-only Unix socket; `/healthz` stays public.
+- **Security posture**: slowloris guard (absolute header-phase deadline),
+  RELRO+NOW, `_FORTIFY_SOURCE=2`, non-root/read-only container rootfs,
+  clean under ASan+UBSan, HTTP parser mutation-fuzzed (200k iterations in
+  `make test`, 4M+ verified separately).
+- **Config**: flat `key = value` file, strict unknown-key rejection,
+  per-field validation. No `include`, no sections (global/upstream/server/
+  location/route/tls/cache/stream), no duplicate-key detection beyond
+  what already exists for a few fields (Host header, Content-Length).
+
+### 1.2 Not implemented (gap vs. the target list in Section 26)
+
+Everything else in the master prompt's target feature tree: HTTP/2, HTTP/3/
+QUIC, WebSocket, gRPC, FastCGI/SCGI/uWSGI, reverse-proxy cache, compression
+(gzip/Brotli/zstd), upstream connection pooling, DNS-based upstream
+resolution, advanced routing (host/header/cookie/query/regex/canary), least-
+connections/hash/consistent-hash load balancing, L4 TCP/UDP proxying, TLS
+passthrough, PROXY protocol, mTLS, ACL, Real-IP (X-Forwarded-For/Forwarded)
+trust handling, zero-downtime binary upgrade, and the full logging/metrics
+field sets in Sections 15–16.
+
+## 2. Phase 1, broken into checkpointed sub-phases
+
+The master prompt bundles HTTP/2, WebSocket, connection pooling, DNS, and
+advanced routing into one "Phase 1." Given each of those is independently
+substantial — and Section 24's own development method (analyze → design →
+implement → unit → integration → security → sanitizer → benchmark → docs →
+regression, *per change*) — Phase 1 runs as five gated sub-phases, ordered
+by risk and dependency, each ending in the same `make && make test &&
+make sanitize` + new-tests-pass + short report cycle already used for every
+milestone so far in this project. Nothing here starts without that
+checkpoint from the prior sub-phase being green.
+
+1. **1a — Upstream connection pool.** Extends the existing single-shot
+   proxy connection with idle/active/connecting/draining/failed state per
+   endpoint, keepalive reuse, an idle timeout, and a max-requests-per-
+   connection bound. Highest value-to-risk ratio: it changes proxy
+   *performance* (removes a TCP+TLS handshake from every proxied request)
+   without touching wire protocol parsing at all. Module impact: `magnus_proxy.c`/`.h`
+   gain a pool structure; `magnus.c`'s upstream-fd handling in
+   `magnus_handle_upstream` changes from "one fd per request" to "borrow
+   from pool, return or discard on completion." No config schema change
+   needed for a first cut (sane fixed defaults), pool size becomes
+   configurable in a follow-up.
+2. **1b — Advanced routing.** `host`/`path prefix`/`method`/`header`/
+   `cookie`/`query parameter`/`source IP` match conditions, combinable with
+   AND, evaluated before the existing static/proxy dispatch. New
+   `magnus_route.c`/`.h` (or extend `magnus_policy.c` — decided during
+   1b's design step, Section 24 step 2) plus new config schema (`route`
+   blocks). No protocol work; the risk is entirely in the config
+   schema/validation and the matcher correctness (fuzz the matcher, not
+   just the HTTP parser).
+3. **1c — DNS resolver.** A/AAAA resolution for `upstream` entries that are
+   hostnames instead of literal IPv4 addresses, with a TTL-respecting
+   cache, background refresh, and defined behavior when resolution fails
+   (keep last-known-good vs. mark unhealthy — decided in the design step).
+   Self-contained; the main event-loop-safety risk is that DNS resolution
+   must never become a blocking call inside epoll (either `getaddrinfo_a`,
+   a small resolver thread pool feeding results back over an eventfd, or a
+   vendored minimal async resolver — evaluated in Section 5's dependency
+   framework before writing any of it).
+4. **1d — WebSocket.** HTTP Upgrade handshake, RFC 6455 frame parsing
+   (text/binary/ping/pong/close/fragmentation, client-frame unmasking,
+   large-frame handling), and proxying the upgraded connection as a raw
+   bidirectional byte pipe once the handshake completes. Bounded scope
+   compared to HTTP/2 — no multiplexing, no compression extension in v1 —
+   but a new binary parser is new attack surface, so it gets the same
+   fuzz-harness treatment `tests/fuzz-http.c` already gives the HTTP/1
+   parser before this sub-phase is called done.
+5. **1e — HTTP/2.** Deliberately last and expected to be the largest single
+   piece of work in Phase 1: ALPN negotiation, h2c upgrade, HPACK
+   (header compression — see Section 5, hand-rolling this is where CVEs
+   in other servers have historically come from), stream multiplexing,
+   flow control, and the GOAWAY/RST_STREAM/PING/SETTINGS frame set. The
+   design step for 1e must produce the "common internal request model"
+   the master prompt asks for (Section 3.1) — i.e. confirm HTTP/1.1 and
+   HTTP/2 requests both resolve to the same `magnus_request_t`-shaped
+   object before routing/proxy code needs to care which protocol version
+   is in play — *before* any frame-parsing code is written, since
+   retrofitting that abstraction after the fact is how monolithic,
+   protocol-specific forks of the dispatch path happen (the thing Section
+   23 forbids).
+
+Each sub-phase's own checkpoint report will name its new tests, confirm
+`make`/`make test`/`make sanitize` are green, and give the size/behavior
+delta — matching the format every milestone in this project has used so
+far. Phase 1 as a whole is not reported "done" until all five are.
+
+## 3. Phases 2–6 (unchanged in intent from the master prompt, summarized)
+
+Detailed sub-phase breakdowns for these will be written the same way Phase
+1's was — right before that phase starts, not speculatively now, since the
+concrete design depends on what Phase 1 actually settles on (especially the
+connection-pool and common-request-model decisions).
+
+- **Phase 2 — gRPC, reverse-proxy cache, compression, advanced LB, health
+  check expansion, Real IP.** gRPC rides on the Phase 1e HTTP/2 stack
+  (streaming, trailers, deadline propagation) — cannot start before 1e is
+  done. Cache and compression are independent of each other and of gRPC,
+  so may run as parallel sub-phases. Real IP (X-Forwarded-For/Forwarded/
+  PROXY protocol trust) is small and self-contained; doing it early despite
+  being listed in Phase 2 is worth reconsidering since ACL/rate-limit
+  correctness downstream depends on it.
+- **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
+  distinct from the L7 phases: a new listener type that doesn't go through
+  `magnus_http_parse` at all. UDP session tracking's memory bound (Section
+  12) needs its design nailed down before implementation, not discovered
+  during it.
+- **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
+  (Section 4), not hand-rolled — evaluated against vetted libraries
+  (e.g. an nginx-QUIC-style OpenSSL-integrated stack vs. quiche vs. msquic)
+  in Section 5's dependency framework before any code.
+- **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
+  binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
+  old-process drain) touches `magnusd`'s supervision model directly and
+  should be designed together with a review of the existing SIGHUP-reload
+  atomicity guarantees, not bolted on separately.
+- **Phase 6 — Production hardening.** Not a feature phase — the security
+  attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
+  the connection-scale benchmark ladder in Section 10 apply continuously
+  to whatever protocol surface exists *at the time*, so in practice this
+  work is threaded through every phase above (each new parser gets fuzzed
+  as it's written, per Section 1d/1e above) rather than deferred entirely
+  to the end. What's left genuinely for a dedicated Phase 6 is the
+  cross-cutting audit once all protocol surfaces exist.
+
+## 4. Module structure
+
+`magnus.c` at 2,467 lines is still one file handling the reactor, HTTP/1
+request dispatch, static file serving, TLS handshake glue, proxy state
+machine, cluster/rate-limit wiring, access logging, and signal handling.
+Per Section 20's own caveat ("디렉터리 분리를 목적 자체로 삼지 않는다" —
+don't split for its own sake), the split happens incrementally, driven by
+what each Phase 1 sub-phase actually needs to not make `magnus.c` worse:
+
+- 1a (connection pool) is the natural point to extract proxy/upstream
+  logic that's already partly separate (`magnus_proxy.c`) into a real
+  `upstream` module owning connection lifecycle.
+- 1b (routing) becomes its own module because it is one (a matcher +
+  config schema), not because of a size target.
+- 1d/1e (WebSocket, HTTP/2) each get their own module by necessity — a
+  frame parser does not belong inlined into the HTTP/1 request loop.
+- The reactor/accept/signal-handling core in `magnus.c` stays where it is
+  until something concrete (e.g. Phase 3's L4 listeners needing a second
+  accept path) forces a `core`/`http1` split, rather than moving it
+  preemptively into an empty `src/core/` per Section 20's target tree.
+
+## 5. Dependencies (Section 22 framework applied)
+
+| Need | Candidate | License | Notes |
+|---|---|---|---|
+| HTTP/2 (1e) | nghttp2 (C, widely deployed, HPACK included) | MIT | Hand-rolling HPACK is explicitly the kind of thing this roadmap avoids (Section 4's own CVE-history warning); evaluate binary size / static-link footprint against the current ~9 MiB image budget before committing |
+| HTTP/3 (Phase 4) | ngtcp2+nghttp3, or quiche (Rust, violates Section 2.2's "don't bring in another language's runtime" unless it's a leaf dependency with a C ABI, evaluate accordingly), or defer entirely if the size/complexity trade-off fails Section 2.4's memory-safety bar | varies | Explicitly deferred to Phase 4's own dependency review; not decided here |
+| Compression (Phase 2) | zlib (gzip, already a near-universal system dependency), brotli, zstd | zlib/MIT/BSD | Start with gzip only per Section 4.2's "최소" wording; add brotli/zstd only once the gzip path's CPU-exhaustion guard (Section 4.3) is proven |
+| DNS (1c) | `getaddrinfo_a` (glibc, no new dependency) vs. a minimal vendored async resolver | n/a / varies | Prefer no new dependency unless `getaddrinfo_a`'s behavior (thread-pool based, not epoll-native) proves unworkable under load in 1c's own benchmark step |
+
+Every dependency actually adopted gets its license, maintenance status, and
+size/runtime-overhead impact recorded in `THIRD_PARTY_NOTICES.md` at the
+point it's added — not before, and not skipped.
+
+## 6. API / ABI
+
+The Magnus Module ABI is pre-1.0 (Section 21). Phases 1–3 are the reviewed
+window for its design before it needs to hold still: the common HTTP/1↔HTTP/2
+request-model decision in 1e in particular has direct ABI implications (a
+module hook written against "the request" needs to keep meaning the same
+thing across protocol versions). Any breaking change made during this
+window is recorded in `CHANGELOG.md` at the version it lands in, per the
+versioning policy already adopted (MAJOR = engine change, MINOR = feature,
+PATCH = security/bug fix) — an ABI break is an engine-level change and
+bumps MAJOR.
+
+## 7. Test plan
+
+Matches Section 17's tree, mapped onto what this repo already has:
+
+- `tests/*.c` unit tests and `tests/fuzz-http.c`-style fuzz harnesses: one
+  new fuzz target per new binary parser (routing matcher in 1b, WebSocket
+  frames in 1d, HPACK/frame parsing in 1e), each run for 200k iterations
+  in `make test` and 4M+ separately before a sub-phase is called done —
+  the same bar `tests/fuzz-http.c` already meets.
+- `tests/test-core.sh` / `tests/test-control-plane.sh`-style integration
+  tests: every sub-phase adds its own block to `tests/test-core.sh`
+  (matching the pattern already used for M2–M6 and the 1.1.0 body-proxy
+  tests) rather than a separate parallel test tree, until the test file's
+  size itself argues for a split.
+- Security-specific cases (Section 8.1's attack list) get added
+  incrementally as each relevant protocol surface exists — e.g. HTTP/2
+  Rapid Reset and stream exhaustion are meaningless before 1e ships, so
+  they belong to 1e's own checkpoint, not a deferred blanket "security
+  phase."
+- Performance: the concurrency ladder in Section 10 and the Magnus/NGINX/
+  HAProxy comparison in Section 11 apply once there is a stable feature
+  surface worth comparing — a repeat of the external, git-repo-excluded
+  benchmark methodology already used for the 1.0.0 NGINX/Apache comparison
+  (`/home/nytr/magnus-bench-ext/`, kept outside this repository), extended
+  with HAProxy and the new scenarios (HTTP/2, WebSocket, TCP proxy, cache)
+  as each becomes available to test.
+
+## 8. Performance and security goals
+
+- No optimization (Section 2.3's Linux API list — `splice`, `SO_REUSEPORT`,
+  `TCP_FASTOPEN`, etc.) lands without a before/after benchmark showing it
+  actually helped, per Section 23's explicit prohibition on unverified
+  performance claims — the TCP_NODELAY fix in v1.0.1 is the template: found
+  by reproduction, fixed, measured (390 → 17,485 req/s), not asserted.
+- Every new resource (connection pool slots, DNS cache entries, WebSocket
+  frame buffers, HTTP/2 stream count, cache size) gets an explicit upper
+  bound at the point it's introduced, per Section 12 — not retrofitted
+  after an exhaustion bug is found the hard way.
+- Every new parser is fuzzed before its sub-phase is called done, not
+  after (see Section 7 above).
+
+## 9. What this roadmap deliberately does not do yet
+
+Per Section 27, this document does not commit to a Phase 2–6 line-by-line
+plan (Section 3 above stays a summary), does not pre-select the HTTP/3
+dependency, and does not begin any Phase 1 implementation. The next step is
+1a (upstream connection pool) — starting only once this roadmap itself has
+been reviewed.
