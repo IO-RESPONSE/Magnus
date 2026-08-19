@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,7 +26,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.0.0"
+#define MAGNUS_VERSION "1.0.1"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -1462,6 +1463,21 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
         if (client >= MAGNUS_MAX_FDS) {
             close(client);
             continue;
+        }
+        if (!admin) {
+            /* The admin listener is a Unix domain socket -- TCP_NODELAY
+             * does not apply there. On the public listener, without this
+             * a keep-alive connection's small response segments sit in
+             * Nagle's algorithm waiting for the peer's ACK, which the
+             * peer's own delayed-ACK timer can hold off for up to ~40ms;
+             * the two stalls compound into a fixed ~40ms floor on every
+             * request regardless of load. Connection: close traffic never
+             * showed this (a single write immediately followed by close
+             * has nothing left to wait for), which is what made it easy
+             * to miss until a keep-alive benchmark surfaced it. */
+            int one = 1;
+            (void) setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one,
+                              sizeof(one));
         }
         connection = calloc(1, sizeof(*connection));
         if (connection == NULL) {

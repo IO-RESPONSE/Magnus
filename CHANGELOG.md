@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.1
+
+### Fixed
+
+- **Missing `TCP_NODELAY` on accepted client sockets.** Every response
+  written on a reused keep-alive connection sat in Nagle's algorithm
+  waiting for the peer's ACK, and a peer using standard delayed-ACK
+  (the Linux default) could hold that ACK back for up to ~40ms -- the
+  two stalls compounded into a fixed ~40ms floor on *every* request
+  over a keep-alive connection, independent of load. `Connection: close`
+  traffic never showed it (a single write immediately followed by a
+  close has nothing left to wait for), which is what let it ship in
+  1.0.0 unnoticed. Reproduced directly: with the fix, the same
+  static-file/keep-alive/concurrency-16 scenario went from 390 req/s at
+  a 41ms average to 17,485 req/s at a 0.9ms average. Fix: set
+  `TCP_NODELAY` on every accepted public-listener socket (the admin
+  Unix domain socket is unaffected -- TCP_NODELAY does not apply there).
+  Regression test added to `tests/test-core.sh`: 20 sequential requests
+  over one reused connection must finish in well under the ~800ms a
+  40ms-per-request floor would produce.
+
 ## 1.0.0
 
 First stable release. Independent C17/epoll HTTP(S) gateway with a

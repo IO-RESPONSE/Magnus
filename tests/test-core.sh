@@ -63,6 +63,22 @@ second=$(curl --fail --silent --dump-header - --output /dev/null \
 test "${#first}" -eq 32
 test "${#second}" -eq 32
 test "$first" != "$second"
+
+# Regression test for a missing-TCP_NODELAY bug: without it, each response
+# on a reused keep-alive connection sat in Nagle's algorithm waiting on the
+# peer's delayed ACK, adding a fixed ~40ms to every request regardless of
+# load (Connection: close traffic never showed it, which is what let it
+# hide). 20 sequential requests over one reused connection must finish
+# nowhere near 20 * 40ms; give a generous 400ms ceiling so this stays
+# reliable on a loaded host while still catching the regression, which
+# would blow past a full second.
+keepalive_urls=()
+for _ in $(seq 1 20); do keepalive_urls+=("http://127.0.0.1:$port/hello.txt"); done
+keepalive_start=$(date +%s%3N)
+curl --fail --silent "${keepalive_urls[@]}" >/dev/null
+keepalive_elapsed=$(( $(date +%s%3N) - keepalive_start ))
+test "$keepalive_elapsed" -lt 400
+
 test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
   "http://127.0.0.1:$port/missing")" = 404
 test "$(curl --silent --request POST --output /dev/null --write-out '%{http_code}' \
