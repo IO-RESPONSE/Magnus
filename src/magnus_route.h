@@ -69,6 +69,13 @@ typedef struct {
 bool magnus_route_parse(const char *value, magnus_route_t *out, char *error,
                         size_t error_capacity);
 
+/* Parses an IPv4 CIDR string (e.g. "192.168.1.0/24") into `network` and
+ * `prefix_length`. Returns true on success, false on malformed input (non-IPv4,
+ * prefix > 32, missing slash, etc.). Exposed so config loading and trusted-proxy
+ * parsing can reuse the same validator. */
+bool magnus_route_parse_cidr(const char *text, struct in_addr *network,
+                             unsigned *prefix_length);
+
 /* True if every one of `route`'s conditions matches `request` (vacuously
  * true if it has none). `client_ip` is the connection's peer address, used
  * for MAGNUS_ROUTE_MATCH_SOURCE_CIDR. HOST/METHOD/HEADER/COOKIE values are

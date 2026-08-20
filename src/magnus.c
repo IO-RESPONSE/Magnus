@@ -7,6 +7,7 @@
 #include "magnus_dns.h"
 #include "magnus_h2.h"
 #include "magnus_proxy.h"
+#include "magnus_realip.h"
 #include "magnus_route.h"
 #include "magnus_ws.h"
 
@@ -288,6 +289,9 @@ typedef struct {
     char proxy_log_method[8];
     char proxy_log_target[256];
     struct in_addr client_address;
+    struct in_addr raw_peer_address;
+    bool proxy_proto_done;
+    bool realip_from_proxy_proto;
     /* set when this connection was accepted on the admin-only Unix
      * socket listener (see magnus_admin_listener): restricted to
      * /healthz and /metrics, and exempt from rate limiting since access
@@ -336,6 +340,8 @@ static bool magnus_upstream_enabled;
  * as it did before routes existed. */
 static magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
 static size_t magnus_route_count;
+static magnus_cidr_t magnus_trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
+static size_t magnus_trusted_proxy_count;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
 /* Parallel to magnus_upstream_owner[] above, for an upstream fd opened on
  * behalf of one HTTP/2 stream's proxy dispatch (1e-2) rather than a whole
@@ -815,8 +821,9 @@ magnus_access_log_flush(void)
 }
 
 static void
-magnus_access_log(const char *request_id, const char *method,
-                  const char *target, unsigned status, double latency_ms)
+magnus_access_log(const char *request_id, const char *client_ip,
+                  const char *method, const char *target, unsigned status,
+                  double latency_ms)
 {
     int written;
     if (!magnus_access_log_enabled) return;
@@ -826,7 +833,8 @@ magnus_access_log(const char *request_id, const char *method,
     written = snprintf(magnus_access_log_buffer + magnus_access_log_length,
         sizeof(magnus_access_log_buffer) - magnus_access_log_length,
         "access request_id=%s method=%s target=%s status=%u "
-        "latency_ms=%.2f\n", request_id, method, target, status, latency_ms);
+        "latency_ms=%.2f client_ip=%s\n", request_id, method, target, status,
+        latency_ms, client_ip);
     if (written < 0) return;
     if ((size_t) written >= sizeof(magnus_access_log_buffer)
                             - magnus_access_log_length) {
@@ -834,8 +842,8 @@ magnus_access_log(const char *request_id, const char *method,
         written = snprintf(magnus_access_log_buffer,
             sizeof(magnus_access_log_buffer),
             "access request_id=%s method=%s target=%s status=%u "
-            "latency_ms=%.2f\n", request_id, method, target, status,
-            latency_ms);
+            "latency_ms=%.2f client_ip=%s\n", request_id, method, target,
+            status, latency_ms, client_ip);
         if (written > 0 && (size_t) written < sizeof(magnus_access_log_buffer))
             magnus_access_log_length = (size_t) written;
         return;
@@ -1254,10 +1262,12 @@ magnus_proxy_fail(int epoll_fd, magnus_connection_t *connection,
                                           : "bad gateway\n",
                             false, true, &request);
     {
+        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
+        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(request.request_id, connection->proxy_log_method,
+        magnus_access_log(request.request_id, client_ip, connection->proxy_log_method,
                           connection->proxy_log_target, status, latency_ms);
     }
     return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
@@ -1541,10 +1551,12 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
                               true, magnus_now_ms());
         magnus_requests_total++;
         {
+            char client_ip[INET_ADDRSTRLEN];
             double latency_ms = (double) (magnus_now_ms()
                                           - connection->request_started_ms);
+            inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
             magnus_record_latency(latency_ms);
-            magnus_access_log(connection->proxy_request_id,
+            magnus_access_log(connection->proxy_request_id, client_ip,
                               connection->proxy_log_method,
                               connection->proxy_log_target, 101, latency_ms);
         }
@@ -1588,10 +1600,12 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     if (info.status >= 500) magnus_responses_5xx++;
     else if (info.status >= 400) magnus_responses_4xx++;
     {
+        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
+        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(connection->proxy_request_id,
+        magnus_access_log(connection->proxy_request_id, client_ip,
                           connection->proxy_log_method,
                           connection->proxy_log_target, info.status,
                           latency_ms);
@@ -2927,9 +2941,13 @@ magnus_h2_proxy_fail(magnus_connection_t *connection,
     magnus_requests_total++;
     if (status_code >= 500) magnus_responses_5xx++;
     else if (status_code >= 400) magnus_responses_4xx++;
-    magnus_record_latency(latency_ms);
-    magnus_access_log(stream->request_id, stream->log_method, stream->log_target,
-                      status_code, latency_ms);
+    {
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
+        magnus_record_latency(latency_ms);
+        magnus_access_log(stream->request_id, client_ip, stream->log_method,
+                          stream->log_target, status_code, latency_ms);
+    }
 }
 
 /* Ends a proxy-dispatched stream after response headers were already
@@ -3425,9 +3443,11 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
     if (info.status >= 500) magnus_responses_5xx++;
     else if (info.status >= 400) magnus_responses_4xx++;
     {
+        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(stream->request_id, stream->log_method,
+        magnus_access_log(stream->request_id, client_ip, stream->log_method,
                           stream->log_target, info.status, latency_ms);
     }
     magnus_h2_proxy_maybe_complete(stream);
@@ -3851,10 +3871,12 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     }
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_LOG, &request);
     {
+        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
+        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(request.request_id, request.method, request.path,
+        magnus_access_log(request.request_id, client_ip, request.method, request.path,
                           request.status, latency_ms);
     }
     return 0;

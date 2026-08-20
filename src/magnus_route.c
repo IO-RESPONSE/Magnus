@@ -47,7 +47,7 @@ magnus_route_find_pair(const char *text, size_t text_length, char separator,
     return false;
 }
 
-static bool
+bool
 magnus_route_parse_cidr(const char *text, struct in_addr *network,
                         unsigned *prefix_length)
 {

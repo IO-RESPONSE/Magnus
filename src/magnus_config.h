@@ -10,6 +10,12 @@
 #define MAGNUS_CONFIG_MAX_UPSTREAMS 16
 #define MAGNUS_CONFIG_PATH_MAX 256
 #define MAGNUS_CONFIG_MAX_ROUTES 32
+#define MAGNUS_CONFIG_MAX_TRUSTED_PROXIES 16
+
+typedef struct {
+    struct in_addr network;
+    unsigned prefix_length;
+} magnus_cidr_t;
 
 typedef struct {
     /* Either a literal IPv4 address, or (is_hostname true) a hostname to
@@ -50,6 +56,8 @@ typedef struct {
      * as it did before routes existed. */
     size_t route_count;
     magnus_route_t routes[MAGNUS_CONFIG_MAX_ROUTES];
+    size_t trusted_proxy_count;
+    magnus_cidr_t trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
 } magnus_config_t;
 
 typedef enum {

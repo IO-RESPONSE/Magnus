@@ -321,6 +321,42 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             config->route_count++;
+        } else if (strcmp(key, "trusted_proxies") == 0) {
+            char spec[512];
+            char *saveptr = NULL;
+            char *token;
+            if (strlen(value) >= sizeof(spec)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'trusted_proxies' list too long");
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(spec, value);
+            for (token = strtok_r(spec, ",", &saveptr); token != NULL;
+                 token = strtok_r(NULL, ",", &saveptr)) {
+                char *cidr_text = magnus_config_trim(token);
+                struct in_addr network;
+                unsigned prefix_length;
+                if (*cidr_text == '\0') continue;
+                if (config->trusted_proxy_count == MAGNUS_CONFIG_MAX_TRUSTED_PROXIES) {
+                    magnus_config_set_error(error, error_capacity, line_number,
+                                            "too many 'trusted_proxies' entries "
+                                            "(max %d)",
+                                            MAGNUS_CONFIG_MAX_TRUSTED_PROXIES);
+                    fclose(file);
+                    return MAGNUS_CONFIG_ERROR;
+                }
+                if (!magnus_route_parse_cidr(cidr_text, &network, &prefix_length)) {
+                    magnus_config_set_error(error, error_capacity, line_number,
+                                            "'trusted_proxies': invalid CIDR '%s'",
+                                            cidr_text);
+                    fclose(file);
+                    return MAGNUS_CONFIG_ERROR;
+                }
+                config->trusted_proxies[config->trusted_proxy_count].network = network;
+                config->trusted_proxies[config->trusted_proxy_count].prefix_length = prefix_length;
+                config->trusted_proxy_count++;
+            }
         } else {
             magnus_config_set_error(error, error_capacity, line_number,
                                     "unknown key '%s'", key);
