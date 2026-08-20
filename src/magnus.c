@@ -36,7 +36,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.13.0"
+#define MAGNUS_VERSION "1.14.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -706,6 +706,13 @@ static int magnus_h2_handle_upstream(struct magnus_h2_stream *stream,
                                      uint32_t flags);
 static int magnus_h2_grpc_handle_upstream(struct magnus_h2_stream *stream,
                                           uint32_t flags);
+static int magnus_h2_grpc_push(struct magnus_h2_stream *stream);
+static int magnus_h2_grpc_relay_request_chunk(struct magnus_h2_stream *stream,
+                                              const uint8_t *data, size_t len);
+static void magnus_h2_grpc_fail_or_abort(magnus_connection_t *connection,
+                                         struct magnus_h2_stream *stream,
+                                         const char *grpc_status_code,
+                                         const char *message);
 static void magnus_h2_submit_text(magnus_connection_t *connection,
                                   struct magnus_h2_stream *stream,
                                   const char *status, const char *content_type,
@@ -2141,10 +2148,24 @@ struct magnus_h2_stream {
      * (see magnus_h2_stream_new()) and overwritten only if this stream's
      * own headers resolve a trusted, more specific value. */
     struct in_addr effective_client_address;
-    /* Set the moment magnus_h2_dispatch() runs, so a second END_STREAM-
-     * bearing frame on the same stream (defensively -- HTTP/2 framing
-     * should never actually produce one) cannot dispatch it twice. */
+    /* Set the moment magnus_h2_dispatch() runs its committing pass (see
+     * that function's own comment on why it can now run twice per stream
+     * -- an early, headers-only call for a gRPC route, deferred calls for
+     * everything else -- but must only ever *commit* once), so a second
+     * END_STREAM-bearing frame on the same stream (defensively -- HTTP/2
+     * framing should never actually produce one) cannot dispatch it
+     * twice. */
     bool dispatched;
+    /* True from the moment ANY frame (HEADERS or DATA) carrying
+     * NGHTTP2_FLAG_END_STREAM has been observed for this stream's
+     * *request* -- i.e. "the whole request body, if any, is now fully
+     * known" -- independent of whether dispatch() has actually committed
+     * yet. Sets apart "headers are complete" (magnus_h2_dispatch() is
+     * always callable once that's true) from "the whole request is
+     * complete" (which is what every non-streaming dispatch still needs
+     * before it may safely act -- see magnus_h2_dispatch()'s own
+     * comment). */
+    bool request_end_stream_seen;
 
     /* -- static-file dispatch (1e-1) -- */
     int file_fd;
@@ -2235,13 +2256,15 @@ struct magnus_h2_stream {
     unsigned long response_received;
     bool upstream_poolable;
 
-    /* -- gRPC dispatch (roadmap 2c-1): client h2 stream -> upstream h2
-     * (gRPC) server -- see the block comment above magnus_h2_grpc_start()
-     * for the full design. Reuses body/body_length/body_sent above (the
-     * client's request, already fully buffered before dispatch) as the
-     * outbound gRPC request's DATA source, and io_buffer/io_length/io_sent
-     * above for the upstream's response body -- both already exist for
-     * exactly this "hold one buffer this stream owns" purpose; only what
+    /* -- gRPC dispatch (roadmap 2c-1, streaming since 2c-2): client h2
+     * stream -> upstream h2 (gRPC) server -- see the block comment above
+     * magnus_h2_grpc_start() for the full design. Reuses body/
+     * body_length/body_sent above as a *sliding* request-body relay
+     * queue (bytes the client has sent but magnus has not yet forwarded
+     * to the upstream -- compacted as they drain, not "the whole request,
+     * known upfront" the way the h1-proxy path's own body_* fields are),
+     * and io_buffer/io_length/io_sent above the same way for the
+     * upstream's response body in the other direction; only what
      * genuinely differs (a second, magnus-owned nghttp2 CLIENT session
      * driving the upstream leg, since a real gRPC server requires actual
      * h2 trailers HTTP/1.1 cannot carry) gets new fields below. */
@@ -2251,13 +2274,26 @@ struct magnus_h2_stream {
     unsigned char *grpc_output;
     size_t grpc_output_length;
     size_t grpc_output_sent;
+    /* True if magnus_h2_grpc_read_request_body() last returned
+     * NGHTTP2_ERR_DEFERRED because it caught up with everything the
+     * client has sent so far and request_end_stream_seen was not yet
+     * true -- the request-body-direction analogue of the existing
+     * `deferred` field above, which is the response direction's own.
+     * Whoever next adds bytes (magnus_h2_on_data_chunk_recv(), for a
+     * dispatched gRPC stream) or observes request_end_stream_seen
+     * becoming true must call nghttp2_session_resume_data() on
+     * grpc_session to make it eligible again. */
+    bool grpc_request_deferred;
     /* Set (only) by magnus_h2_grpc_client_on_stream_close() -- the
      * upstream nghttp2 session's callback context, where it is unsafe to
      * do anything more than record the fact (see this section's own
      * comment on why nghttp2_session_del() must never be called from
      * inside one of that same session's own callbacks). The real
-     * response-submission/teardown work happens back in
-     * magnus_h2_grpc_handle_upstream(), checked right after each
+     * finalization (marking response_complete so the client-facing data
+     * provider knows it is safe to emit the trailer once io_buffer
+     * drains, or -- if the upstream never even got as far as sending
+     * response headers -- a synthesized UNAVAILABLE failure) happens back
+     * in magnus_h2_grpc_handle_upstream(), checked right after each
      * nghttp2_session_mem_recv2() round. */
     bool grpc_stream_closed;
     /* Captured from the upstream response's leading HEADERS frame
@@ -2533,12 +2569,13 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     bool head_only;
     const char *forward_path;
 
-    stream->dispatched = true;
     if (stream->method_overflow) {
+        stream->dispatched = true;
         magnus_h2_submit_status(session, stream->stream_id, "405");
         return;
     }
     if (stream->path_overflow) {
+        stream->dispatched = true;
         magnus_h2_submit_status(session, stream->stream_id, "414");
         return;
     }
@@ -2582,6 +2619,25 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         }
         break;
     }
+
+    /* Streaming (roadmap 2c-2): magnus_h2_on_frame_recv() now calls this
+     * function as soon as the request HEADERS frame completes, not only
+     * once the whole request body (if any) has arrived -- a gRPC route
+     * needs that head start to begin relaying to the upstream before the
+     * body is fully known (client-streaming/bidi). Every other route
+     * still needs the whole body buffered first (rate limiting in
+     * particular must only ever be consumed once per request), so if
+     * this call is the early, headers-only one and the route is not
+     * gRPC, defer: return without touching stream->dispatched, so
+     * whichever later call actually observes end-of-body (routed back
+     * here by that same function once the DATA-frame-carrying
+     * END_STREAM arrives) is the one that commits. Re-running route
+     * matching/Real IP resolution on that later call is harmless,
+     * side-effect-free duplicate work -- rate limiting below is what
+     * must not run twice, and it never does, since only the committing
+     * call ever reaches it. */
+    if (!is_grpc_route && !stream->request_end_stream_seen) return;
+    stream->dispatched = true;
 
     /* /healthz and /metrics stay exempt from rate limiting for the same
      * reason as HTTP/1.1: they are exactly what an operator or
@@ -2760,7 +2816,15 @@ magnus_h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
  * looks at stream->body for an is_proxy_route match anyway. Once the cap
  * is hit, no further bytes are retained (body_overflow latches) --
  * magnus_h2_dispatch() answers 413 once END_STREAM arrives rather than
- * failing the stream mid-flight. */
+ * failing the stream mid-flight.
+ *
+ * A gRPC stream that has already been dispatched (2c-2: happens as soon
+ * as its request HEADERS complete, well before END_STREAM for a
+ * streaming RPC) takes a completely different path instead --
+ * magnus_h2_grpc_relay_request_chunk() -- relaying each chunk to the
+ * upstream as it arrives rather than accumulating a "whole request"
+ * MAGNUS_MAX_BODY never actually has to hold at once for a long-lived
+ * streaming call. */
 static int
 magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
                              int32_t stream_id, const uint8_t *data,
@@ -2772,6 +2836,17 @@ magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
     (void) flags;
     (void) user_data;
     if (stream == NULL || stream->body_overflow || len == 0) return 0;
+
+    if (stream->is_grpc && stream->dispatched) {
+        if (magnus_h2_grpc_relay_request_chunk(stream, data, len) != 0) {
+            stream->body_overflow = true;
+            magnus_h2_grpc_fail_or_abort(stream->connection, stream, "8",
+                                         "request body exceeded buffering "
+                                         "limit");
+        }
+        return 0;
+    }
+
     if (stream->body_length + len > MAGNUS_MAX_BODY) {
         stream->body_overflow = true;
         return 0;
@@ -2806,7 +2881,18 @@ magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
  * protocol-level consequences (adjusting flow-control windows, refusing
  * new streams past a received GOAWAY's declared last-stream-id, acking
  * PINGs, ...) before this callback ever runs, and none of them need any
- * further reaction from magnus itself at this stage of the roadmap. */
+ * further reaction from magnus itself at this stage of the roadmap.
+ *
+ * Streaming (2c-2): unlike before, a request HEADERS frame is inspected
+ * here regardless of whether it also carries END_STREAM -- magnus_h2_
+ * dispatch() is called the moment headers complete, not only once the
+ * whole request is known, so a gRPC route can start relaying to the
+ * upstream immediately (client-streaming/bidi) rather than waiting for a
+ * body that might not finish for a long time, if ever, on its own. Every
+ * other route still only *commits* inside dispatch() once
+ * request_end_stream_seen is true (see that function's own comment) --
+ * this callback's job is only to track that flag and re-invoke dispatch()
+ * once it flips, not to decide what any given route does with it. */
 static int
 magnus_h2_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
                         void *user_data)
@@ -2829,15 +2915,31 @@ magnus_h2_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
         return 0;
     }
 
-    if ((frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA)
-        || (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0)
+    if (frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA)
         return 0;
     if (frame->hd.type == NGHTTP2_HEADERS
         && frame->headers.cat != NGHTTP2_HCAT_REQUEST)
         return 0;
     stream = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
-    if (stream == NULL || stream->dispatched) return 0;
-    magnus_h2_dispatch(connection, stream);
+    if (stream == NULL) return 0;
+
+    if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+        stream->request_end_stream_seen = true;
+        if (stream->is_grpc && stream->grpc_session != NULL
+            && stream->grpc_request_deferred) {
+            stream->grpc_request_deferred = false;
+            (void) nghttp2_session_resume_data(stream->grpc_session,
+                                               stream->grpc_stream_id);
+            if (stream->upstream_connected)
+                (void) magnus_h2_grpc_push(stream);
+        }
+    }
+
+    if (!stream->dispatched
+        && (frame->hd.type == NGHTTP2_HEADERS
+            || stream->request_end_stream_seen)) {
+        magnus_h2_dispatch(connection, stream);
+    }
     return 0;
 }
 
@@ -3755,15 +3857,23 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
  *
  * Scoped to unary RPCs only for this increment (see
  * docs/development-roadmap.md's 2c-1 entry): the whole client request is
- * already fully buffered before dispatch runs (same as the h1-proxy path
- * above, reusing its body/body_length fields), and this dispatch
- * likewise buffers the *entire* upstream response -- headers, body, and
- * trailer -- into stream->io_buffer before ever submitting anything to
- * the real client, rather than streaming it through as it arrives. That
- * collapses away most of the deferred/backpressure machinery the
- * h1-proxy path needs, at the cost of true client-streaming/
- * server-streaming/bidi support, which is exactly what a later increment
- * (2c-2) is scoped to add.
+ * dispatched immediately once its request HEADERS complete -- see
+ * magnus_h2_dispatch()'s own comment -- rather than waiting for the whole
+ * request body first the way every other route still does. Both
+ * directions stream through incrementally: request DATA the client sends
+ * is relayed to the upstream as it arrives (magnus_h2_on_data_chunk_recv()'s
+ * gRPC branch -> magnus_h2_grpc_relay_request_chunk()), and response
+ * HEADERS from the upstream are forwarded to the real client the moment
+ * they are known (magnus_h2_grpc_submit_headers()), with response DATA
+ * draining through stream->io_buffer/io_length/io_sent the same
+ * deferred/resume pattern the h1-proxy path's own magnus_h2_read_io_buffer()
+ * already established for exactly this shape of problem -- see
+ * magnus_h2_grpc_read_response()'s own comment. This is what makes
+ * client-streaming, server-streaming, and bidi RPCs all work: neither leg
+ * is ever fully buffered before being relayed, only however far one side
+ * has gotten ahead of the other (bounded by MAGNUS_MAX_BODY on the
+ * request side, matching the client-request-body cap every other route
+ * already enforces).
  *
  * Also unlike the h1-proxy path: no upstream connection pooling/reuse (a
  * fresh TCP + h2 handshake is opened per unary RPC and closed after --
@@ -3834,13 +3944,21 @@ magnus_h2_grpc_fail(magnus_connection_t *connection,
 /* nghttp2 data-provider read callback for a gRPC-dispatched stream's
  * response to the real client -- pulls from stream->io_buffer/io_length/
  * io_sent exactly like magnus_h2_read_io_buffer() does for every other h2
- * response, but cannot simply reuse that callback: at EOF it must also
- * submit this stream's trailer (grpc-status/grpc-message), which no other
- * caller of magnus_h2_read_io_buffer() ever needs to do. By the time this
- * is ever called, the whole upstream response is already fully buffered
- * (see this block's own top comment) -- response_complete is implicitly
- * always true here, so this never returns NGHTTP2_ERR_DEFERRED the way
- * the h1-proxy path's callback sometimes does. */
+ * response, but cannot simply reuse that callback: at true EOF it must
+ * also submit this stream's trailer (grpc-status/grpc-message), which no
+ * other caller of magnus_h2_read_io_buffer() ever needs to do. Streaming
+ * (2c-2): unlike the buffer-it-all-first shape 2c-1 shipped,
+ * response_complete is NOT implicitly true just because io_buffer is
+ * empty right now -- magnus_h2_grpc_client_on_data_chunk_recv() can still
+ * be about to append more (server-streaming/bidi), so "no bytes
+ * available" defers (NGHTTP2_ERR_DEFERRED, exactly like
+ * magnus_h2_read_io_buffer() already does for the h1-proxy path) unless
+ * response_complete is *also* true (set only once
+ * stream->grpc_stream_closed is observed -- see that field's own
+ * comment), which is the one condition that actually means "no more DATA
+ * is ever coming." Compacts io_buffer back to empty once fully drained,
+ * so a long-lived streaming response's buffer never grows by more than
+ * however far behind the client connection currently is. */
 static nghttp2_ssize
 magnus_h2_grpc_read_response(nghttp2_session *session, int32_t stream_id,
                              uint8_t *buf, size_t length, uint32_t *data_flags,
@@ -3853,6 +3971,10 @@ magnus_h2_grpc_read_response(nghttp2_session *session, int32_t stream_id,
     if (available == 0) {
         nghttp2_nv trailer[2 + 8];
         size_t trailer_count = 0;
+        if (!stream->response_complete) {
+            stream->deferred = true;
+            return NGHTTP2_ERR_DEFERRED;
+        }
         *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
         trailer[trailer_count++] = magnus_h2_nv("grpc-status",
             stream->grpc_status[0] != '\0' ? stream->grpc_status : "0");
@@ -3873,25 +3995,30 @@ magnus_h2_grpc_read_response(nghttp2_session *session, int32_t stream_id,
     if (length > available) length = available;
     memcpy(buf, stream->io_buffer + stream->io_sent, length);
     stream->io_sent += length;
+    if (stream->io_sent == stream->io_length) {
+        stream->io_length = 0;
+        stream->io_sent = 0;
+    }
     return (nghttp2_ssize) length;
 }
 
-/* Called once stream->grpc_stream_closed is observed (from
- * magnus_h2_grpc_handle_upstream(), never from inside a grpc_session
- * callback -- see that field's own comment) with stream->grpc_status
- * non-empty, meaning the upstream produced a genuine, complete
- * gRPC-shaped response: everything needed is already sitting in
- * stream->grpc_response_status/grpc_response_headers/io_buffer/
- * grpc_status/grpc_message, so this only ever submits, never blocks or
- * defers. */
+/* Submits this stream's response HEADERS (and attaches
+ * magnus_h2_grpc_read_response() as its DATA source) to the real client
+ * as soon as the upstream's own response HEADERS frame is fully known --
+ * called from magnus_h2_grpc_client_on_frame_recv() the moment that
+ * happens, streaming (2c-2): unlike 2c-1, this no longer waits for the
+ * whole response body (or even the trailer) to be known first. Must only
+ * be called once, while stream->response_headers_submitted is still
+ * false. Logging/counters are deliberately NOT done here -- latency and
+ * final status are only meaningful once the whole exchange is known
+ * complete, which for a streaming response can be long after headers go
+ * out; see the finalization in magnus_h2_grpc_handle_upstream() instead. */
 static void
-magnus_h2_grpc_submit_response(magnus_connection_t *connection,
-                               struct magnus_h2_stream *stream)
+magnus_h2_grpc_submit_headers(magnus_connection_t *connection,
+                              struct magnus_h2_stream *stream)
 {
     nghttp2_nv headers[2 + 16];
     size_t count = 0;
-    unsigned status_for_log;
-    double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
     const char *status_text = stream->grpc_response_status[0] != '\0'
         ? stream->grpc_response_status : "200";
 
@@ -3903,9 +4030,7 @@ magnus_h2_grpc_submit_response(magnus_connection_t *connection,
                                         stream->grpc_response_headers[i].value);
     }
 
-    stream->response_complete = true; /* whole body is already buffered */
     stream->response_headers_submitted = true;
-    status_for_log = (unsigned) strtoul(status_text, NULL, 10);
     {
         nghttp2_data_provider2 data_provider = {
             .source = { .ptr = stream },
@@ -3915,21 +4040,20 @@ magnus_h2_grpc_submit_response(magnus_connection_t *connection,
                                         stream->stream_id, headers, count,
                                         &data_provider);
     }
-    magnus_requests_total++;
-    magnus_record_latency(latency_ms);
-    magnus_access_log(stream->request_id, stream->effective_client_address,
-                      stream->log_method, stream->log_target, status_for_log,
-                      latency_ms);
 }
 
 /* nghttp2 data-provider read callback for this stream's outbound gRPC
  * request body, sent to the upstream -- pulls from stream->body/
- * body_length/body_sent, already fully buffered by
- * magnus_h2_on_data_chunk_recv() before dispatch ever ran (same buffer
- * the h1-proxy path's own raw send() loop drains -- reused here, not
- * duplicated, since the two dispatch modes are mutually exclusive per
- * stream). The whole body is already known up front, so -- unlike the
- * response side -- this never needs to defer either. */
+ * body_length/body_sent, the same buffer the h1-proxy path's own raw
+ * send() loop drains (reused, not duplicated, since the two dispatch
+ * modes are mutually exclusive per stream). Streaming (2c-2): unlike
+ * 2c-1, the whole body is not necessarily known up front any more --
+ * magnus_h2_grpc_relay_request_chunk() can still be about to append more
+ * as the client keeps sending (client-streaming/bidi) -- so catching up
+ * with everything sent *so far* only means EOF if request_end_stream_seen
+ * is also true; otherwise this defers (NGHTTP2_ERR_DEFERRED), exactly
+ * mirroring magnus_h2_grpc_read_response()'s own response-direction
+ * shape via grpc_request_deferred, its request-direction counterpart. */
 static nghttp2_ssize
 magnus_h2_grpc_read_request_body(nghttp2_session *session, int32_t stream_id,
                                  uint8_t *buf, size_t length,
@@ -3942,6 +4066,10 @@ magnus_h2_grpc_read_request_body(nghttp2_session *session, int32_t stream_id,
     (void) stream_id;
     (void) user_data;
     if (available == 0) {
+        if (!stream->request_end_stream_seen) {
+            stream->grpc_request_deferred = true;
+            return NGHTTP2_ERR_DEFERRED;
+        }
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
         return 0;
     }
@@ -4045,7 +4173,15 @@ magnus_h2_grpc_client_on_header(nghttp2_session *session,
  * doubling) as needed up to MAGNUS_MAX_BODY, the same cap the client
  * request-body side already enforces (magnus_h2_on_data_chunk_recv()).
  * Unlike the h1-proxy path's fixed MAGNUS_PROXY_BUFFER window, io_buffer
- * genuinely grows here -- see io_capacity's own comment on the struct. */
+ * genuinely grows here -- see io_capacity's own comment on the struct.
+ * Streaming (2c-2): compacts away whatever magnus_h2_grpc_read_response()
+ * has already drained (io_sent) before appending, so the cap bounds how
+ * far behind the *client* connection has fallen, not the response's total
+ * size -- and, if that data provider was stalled waiting for exactly this
+ * (stream->deferred), wakes it and pushes onto the client fd immediately,
+ * since nothing else guarantees that fd has a pending epoll event right
+ * now to otherwise trigger it (mirrors the h1-proxy path's own
+ * magnus_h2_handle_upstream() tail for the identical reason). */
 static int
 magnus_h2_grpc_client_on_data_chunk_recv(nghttp2_session *session,
                                          uint8_t flags, int32_t stream_id,
@@ -4056,6 +4192,12 @@ magnus_h2_grpc_client_on_data_chunk_recv(nghttp2_session *session,
     (void) session;
     (void) flags;
     if (stream_id != stream->grpc_stream_id || len == 0) return 0;
+    if (stream->io_sent > 0) {
+        memmove(stream->io_buffer, stream->io_buffer + stream->io_sent,
+               stream->io_length - stream->io_sent);
+        stream->io_length -= stream->io_sent;
+        stream->io_sent = 0;
+    }
     if (stream->io_length + len > MAGNUS_MAX_BODY) return NGHTTP2_ERR_CALLBACK_FAILURE;
     if (stream->io_length + len > stream->io_capacity) {
         size_t new_capacity = stream->io_capacity == 0
@@ -4069,15 +4211,51 @@ magnus_h2_grpc_client_on_data_chunk_recv(nghttp2_session *session,
     }
     memcpy(stream->io_buffer + stream->io_length, data, len);
     stream->io_length += len;
+
+    if (stream->deferred) {
+        stream->deferred = false;
+        (void) nghttp2_session_resume_data(stream->connection->h2_session,
+                                           stream->stream_id);
+        (void) magnus_h2_push(magnus_global_epoll_fd, stream->connection);
+    }
+    return 0;
+}
+
+/* on_frame_recv callback for stream->grpc_session -- the one piece of
+ * streaming (2c-2) that could not simply be handled from on_header() or
+ * on_data_chunk_recv() alone: the moment the upstream's response HEADERS
+ * frame (the very first one, NGHTTP2_HCAT_RESPONSE) is fully known,
+ * submit it to the real client immediately via
+ * magnus_h2_grpc_submit_headers() rather than waiting for the whole
+ * exchange to finish -- that immediate hand-off is what lets a
+ * server-streaming or bidi response's DATA start reaching the real client
+ * as it arrives, instead of only once grpc_stream_closed. Fires at most
+ * once per stream (guarded by response_headers_submitted); the later
+ * trailer HEADERS frame, if any, has already had grpc-status/grpc-message
+ * captured by on_header() and needs no reaction here. */
+static int
+magnus_h2_grpc_client_on_frame_recv(nghttp2_session *session,
+                                    const nghttp2_frame *frame,
+                                    void *user_data)
+{
+    struct magnus_h2_stream *stream = user_data;
+    (void) session;
+    if (frame->hd.type != NGHTTP2_HEADERS
+        || frame->hd.stream_id != stream->grpc_stream_id
+        || frame->headers.cat != NGHTTP2_HCAT_RESPONSE
+        || stream->response_headers_submitted)
+        return 0;
+    magnus_h2_grpc_submit_headers(stream->connection, stream);
+    (void) magnus_h2_push(magnus_global_epoll_fd, stream->connection);
     return 0;
 }
 
 /* on_stream_close callback for stream->grpc_session -- deliberately does
  * nothing but record the fact (see grpc_stream_closed's own comment on
  * why: nghttp2_session_del() must never be called from inside one of
- * that same session's own callbacks, and submitting the real client's
+ * that same session's own callbacks, and finalizing the real client's
  * response from here would be reachable from exactly such a context).
- * The actual response-submission/teardown work happens back in
+ * The actual finalization/teardown work happens back in
  * magnus_h2_grpc_handle_upstream(), once nghttp2_session_mem_recv2()
  * (which is what invokes this) has returned. */
 static int
@@ -4120,6 +4298,7 @@ magnus_h2_grpc_build_session(struct magnus_h2_stream *stream)
     int32_t submitted_stream_id;
 
     stream->grpc_stream_closed = false;
+    stream->grpc_request_deferred = false;
     stream->grpc_status[0] = '\0';
     stream->grpc_message[0] = '\0';
     stream->grpc_response_status[0] = '\0';
@@ -4168,6 +4347,8 @@ magnus_h2_grpc_build_session(struct magnus_h2_stream *stream)
         magnus_h2_grpc_client_on_header);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks,
         magnus_h2_grpc_client_on_data_chunk_recv);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks,
+        magnus_h2_grpc_client_on_frame_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
         magnus_h2_grpc_client_on_stream_close);
 
@@ -4192,9 +4373,21 @@ magnus_h2_grpc_build_session(struct magnus_h2_stream *stream)
             .source = { .ptr = stream },
             .read_callback = magnus_h2_grpc_read_request_body,
         };
+        /* Streaming (2c-2): dispatch happens as soon as request HEADERS
+         * complete, well before END_STREAM for anything but a bodyless
+         * call -- so body_length being 0 *right now* does not mean there
+         * is no body, only that none of it has arrived yet. The data
+         * provider must be attached whenever more could still be coming
+         * (!request_end_stream_seen), not just when something has
+         * already arrived; omitting it here for a soon-to-stream call
+         * would wrongly submit HEADERS with END_STREAM set (data_prd ==
+         * NULL means "no body, ever" -- see nghttp2_submit_request2()'s
+         * own contract), foreclosing the request body track entirely. */
+        bool has_body_or_more_coming = stream->body_length > 0
+            || !stream->request_end_stream_seen;
         submitted_stream_id = nghttp2_submit_request2(stream->grpc_session,
             NULL, headers, count,
-            stream->body_length > 0 ? &data_provider : NULL, NULL);
+            has_body_or_more_coming ? &data_provider : NULL, NULL);
     }
     if (submitted_stream_id < 0) {
         nghttp2_session_del(stream->grpc_session);
@@ -4234,20 +4427,69 @@ magnus_h2_grpc_connect_endpoint(magnus_connection_t *connection,
                                            fd, result == 0, 0);
 }
 
+/* The gRPC analogue of magnus_h2_proxy_abort(): ends a stream whose
+ * response headers were already submitted to the real client -- a fresh
+ * status/trailer is no longer possible (h2 does not allow a second
+ * HEADERS frame after the response has started any more than it allows a
+ * second status line), so the stream itself is reset instead. Only ever
+ * reachable once streaming (2c-2) is genuinely mid-flight; 2c-1's own
+ * whole-response-buffered-first shape could never reach this state
+ * (nothing was ever submitted to the client before the outcome was fully
+ * known). */
+static void
+magnus_h2_grpc_abort(struct magnus_h2_stream *stream)
+{
+    magnus_connection_t *connection = stream->connection;
+    magnus_h2_stream_teardown_upstream(stream);
+    (void) nghttp2_submit_rst_stream(connection->h2_session, NGHTTP2_FLAG_NONE,
+                                     stream->stream_id, NGHTTP2_INTERNAL_ERROR);
+}
+
+/* Picks the one correct reaction to a gRPC stream failure depending on
+ * whether the real client has already started receiving a response for
+ * it: magnus_h2_grpc_fail() (a clean "Trailers-Only" gRPC error) if not,
+ * since the client has not committed to anything yet; magnus_h2_grpc_abort()
+ * if so, since retrying to a different endpoint transparently no longer
+ * makes sense once the client is mid-conversation with *this* specific
+ * attempt. Used by every gRPC failure path below (connect failure at any
+ * stage, a client body that overflows mid-stream, an upstream that never
+ * produced a valid response) so this branch is decided in exactly one
+ * place. */
+static void
+magnus_h2_grpc_fail_or_abort(magnus_connection_t *connection,
+                             struct magnus_h2_stream *stream,
+                             const char *grpc_status_code,
+                             const char *message)
+{
+    if (stream->response_headers_submitted) {
+        magnus_h2_grpc_abort(stream);
+        return;
+    }
+    magnus_h2_grpc_fail(connection, stream, grpc_status_code, message);
+    magnus_h2_stream_teardown_upstream(stream);
+}
+
 /* The gRPC analogue of magnus_h2_proxy_connect_failed(): records a
  * failure for the endpoint currently in flight and either retries against
  * a different healthy endpoint (a fresh session + fresh connect, per this
  * block's own top comment) -- bounded by MAGNUS_PROXY_MAX_ATTEMPTS total
  * attempts, same as the h1-proxy path -- or gives up with a clean
- * UNAVAILABLE gRPC error. Reused for both a literal connect() failure and
- * any later mid-exchange transport failure, exactly like
- * magnus_h2_proxy_connect_failed() already is for the h1-proxy path. */
+ * UNAVAILABLE gRPC error (magnus_h2_grpc_fail_or_abort() -- an abort, not
+ * a retry, if the client already has a response in flight for this
+ * stream; see that function's own comment). Reused for both a literal
+ * connect() failure and any later mid-exchange transport failure, exactly
+ * like magnus_h2_proxy_connect_failed() already is for the h1-proxy
+ * path. */
 static void
 magnus_h2_grpc_connect_failed(magnus_connection_t *connection,
                               struct magnus_h2_stream *stream)
 {
     magnus_cluster_result(&magnus_grpc_cluster, stream->endpoint_index, false,
                           magnus_now_ms());
+    if (stream->response_headers_submitted) {
+        magnus_h2_grpc_abort(stream);
+        return;
+    }
     magnus_h2_stream_teardown_upstream(stream);
     if (stream->attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
         int endpoint = magnus_cluster_select(&magnus_grpc_cluster,
@@ -4408,6 +4650,71 @@ magnus_h2_grpc_update_interest(int epoll_fd, struct magnus_h2_stream *stream)
     return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, stream->upstream_fd, &event);
 }
 
+/* Pulls as much serialized output as stream->grpc_session currently has
+ * queued and writes it to stream->upstream_fd, then re-arms epoll
+ * interest -- the gRPC analogue of magnus_h2_push(), callable from
+ * outside magnus_h2_grpc_handle_upstream()'s own driving loop (namely:
+ * magnus_h2_grpc_relay_request_chunk(), when new request-body bytes just
+ * arrived from the client and need pushing toward the upstream
+ * immediately rather than waiting for whatever epoll event happens to
+ * fire next). A no-op, safely, if the upstream connection has not
+ * finished connecting yet -- magnus_h2_grpc_handle_upstream() itself
+ * picks up anything already queued once it has. */
+static int
+magnus_h2_grpc_push(struct magnus_h2_stream *stream)
+{
+    if (magnus_h2_grpc_flush_output(stream) < 0) return -1;
+    if (stream->grpc_output == NULL && magnus_h2_grpc_drain_send(stream) < 0)
+        return -1;
+    return magnus_h2_grpc_update_interest(magnus_global_epoll_fd, stream);
+}
+
+/* Relays one chunk of the client's request body to the upstream as it
+ * arrives -- magnus_h2_on_data_chunk_recv()'s gRPC-streaming branch
+ * (2c-2). Compacts away whatever magnus_h2_grpc_read_request_body() has
+ * already drained (body_sent) before appending, so MAGNUS_MAX_BODY bounds
+ * how far behind the *upstream* has fallen, not the request's total size
+ * -- the request-direction mirror of magnus_h2_grpc_client_on_data_chunk_recv()'s
+ * own compaction on the response side. If the data provider was stalled
+ * waiting for exactly this (grpc_request_deferred), wakes it and pushes
+ * toward the upstream immediately, once it is actually connected (before
+ * that, magnus_h2_grpc_handle_upstream() will pick up everything queued
+ * so far the moment it is). Returns 0 on success, -1 on overflow/OOM --
+ * the caller decides how to react to that (see
+ * magnus_h2_grpc_fail_or_abort()). */
+static int
+magnus_h2_grpc_relay_request_chunk(struct magnus_h2_stream *stream,
+                                   const uint8_t *data, size_t len)
+{
+    if (stream->body_sent > 0) {
+        memmove(stream->body, stream->body + stream->body_sent,
+               stream->body_length - stream->body_sent);
+        stream->body_length -= stream->body_sent;
+        stream->body_sent = 0;
+    }
+    if (stream->body_length + len > MAGNUS_MAX_BODY) return -1;
+    if (stream->body_length + len > stream->body_capacity) {
+        size_t new_capacity = stream->body_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : stream->body_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->body_length + len) new_capacity *= 2;
+        grown = realloc(stream->body, new_capacity);
+        if (grown == NULL) return -1;
+        stream->body = grown;
+        stream->body_capacity = new_capacity;
+    }
+    memcpy(stream->body + stream->body_length, data, len);
+    stream->body_length += len;
+
+    if (stream->grpc_session != NULL && stream->grpc_request_deferred) {
+        stream->grpc_request_deferred = false;
+        (void) nghttp2_session_resume_data(stream->grpc_session,
+                                           stream->grpc_stream_id);
+        if (stream->upstream_connected) (void) magnus_h2_grpc_push(stream);
+    }
+    return 0;
+}
+
 /* Entry point for any epoll event on a gRPC-dispatched stream's upstream
  * fd -- the gRPC analogue of magnus_h2_handle_upstream(), driving
  * stream->grpc_session's send/recv instead of the h1-proxy path's raw
@@ -4475,12 +4782,56 @@ magnus_h2_grpc_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
     }
 
     if (stream->grpc_stream_closed) {
-        if (stream->grpc_status[0] == '\0') {
+        if (!stream->response_headers_submitted) {
+            /* Never got far enough to send anything to the real client at
+             * all -- the same gateway-level-failure contract 2c-1
+             * established: a clean UNAVAILABLE, not a raw transport
+             * error the client library cannot interpret as gRPC. */
             magnus_h2_grpc_fail(connection, stream, "14",
                                 "upstream did not return a valid gRPC "
                                 "response");
         } else {
-            magnus_h2_grpc_submit_response(connection, stream);
+            /* Streaming (2c-2): headers (and zero or more DATA chunks)
+             * were already relayed to the real client as they arrived --
+             * nothing left to submit but the fact that this is now
+             * finished. A stream that closed without ever naming a real
+             * grpc-status (the upstream's h2 stream simply ended -- a
+             * mid-exchange transport failure, not an RPC-level outcome)
+             * must not silently read as success to the real client, so
+             * this is where an absent grpc-status gets a real value
+             * (UNKNOWN) rather than leaving magnus_h2_grpc_read_response()'s
+             * own defensive "0" fallback -- meant only as a last resort,
+             * never as a substitute for deciding the real outcome here --
+             * paper over a failure as if it were one. */
+            if (stream->grpc_status[0] == '\0') {
+                stream->grpc_status[0] = '2';
+                stream->grpc_status[1] = '\0';
+            }
+            stream->response_complete = true;
+            if (stream->deferred) {
+                stream->deferred = false;
+                (void) nghttp2_session_resume_data(connection->h2_session,
+                                                   stream->stream_id);
+            }
+            /* Logging/counters happen here, not at
+             * magnus_h2_grpc_submit_headers() time: latency and the final
+             * outcome are only meaningful once the whole exchange is
+             * known complete, which for a streaming response can be long
+             * after headers first went out. */
+            {
+                unsigned status_for_log = (unsigned) strtoul(
+                    stream->grpc_response_status[0] != '\0'
+                        ? stream->grpc_response_status : "200",
+                    NULL, 10);
+                double latency_ms = (double) (magnus_now_ms()
+                                              - stream->started_ms);
+                magnus_requests_total++;
+                magnus_record_latency(latency_ms);
+                magnus_access_log(stream->request_id,
+                                  stream->effective_client_address,
+                                  stream->log_method, stream->log_target,
+                                  status_for_log, latency_ms);
+            }
         }
         magnus_h2_stream_teardown_upstream(stream);
         return magnus_h2_push(epoll_fd, connection);
@@ -4935,6 +5286,16 @@ magnus_h2c_activate(int epoll_fd, magnus_connection_t *connection)
         return -1;
     }
     stream->parsed = connection->pending_parsed;
+    /* This synthetic stream never goes through magnus_h2_on_frame_recv()'s
+     * real HEADERS-frame handling at all (see this function's own
+     * comment: it is dispatched immediately, exactly as if END_STREAM
+     * had just been observed) -- so magnus_h2_dispatch()'s own streaming
+     * (2c-2) defer-until-request_end_stream_seen check needs telling
+     * directly that this request's body (an Upgrade: h2c request is
+     * scoped to carry none at all -- see h2c_pending's own comment) is
+     * already fully known, or a non-gRPC route here would wait forever
+     * for a END_STREAM event that can never arrive on this stream. */
+    stream->request_end_stream_seen = true;
     magnus_h2_dispatch(connection, stream);
 
     if (connection->input_length > 0) {

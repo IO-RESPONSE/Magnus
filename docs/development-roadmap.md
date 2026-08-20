@@ -458,12 +458,20 @@ connection-pool and common-request-model decisions).
       connection pooling/session affinity, IPv4-literal upstreams only.
       Verified against a real `grpcio` client and server. See
       `CHANGELOG.md` 1.13.0 for the full detail.
-    - **2c-2 — true client-/server-streaming and bidi support.** Removes
-      2c-1's "buffer the whole request/response before dispatch" shape on
-      both legs -- DATA frames need to flow through as they arrive in
-      each direction independently, via nghttp2's DEFERRED/resume
-      mechanism on both the client-facing and upstream-facing sessions at
-      once. The largest, riskiest remaining piece of gRPC support.
+    - **2c-2 — true client-/server-streaming and bidi support. Shipped
+      in 1.14.0.** Removed 2c-1's "buffer the whole request/response
+      before dispatch" shape on both legs: dispatch now happens as soon
+      as request HEADERS complete (a new `request_end_stream_seen` flag
+      decouples that from "the whole request is known," which every
+      non-gRPC route still requires before it may act), and DATA flows
+      through as it arrives in each direction independently, via the
+      same deferred/resume data-provider pattern the h1-proxy path
+      (1e-2) already established for its own response leg. Verified
+      against a real `grpcio` client and server across every RPC shape,
+      including a timing-verified server-streaming case proving genuine
+      incremental delivery. See `CHANGELOG.md` 1.14.0 for the full
+      detail, including a real h2c (1e-5) regression this increment's
+      own dispatch-timing change caused and fixed along the way.
     - **2c-3 — `grpc-timeout` deadline propagation.** Parses the request
       header into an absolute deadline and applies it as this stream's
       own connect/read timeout budget, extending the existing proxy

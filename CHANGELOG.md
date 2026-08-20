@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.14.0
+
+### Added
+
+- **True client-streaming, server-streaming, and bidi gRPC support
+  (roadmap 2c-2).** Removes 2c-1's "buffer the whole request/response
+  before ever touching the upstream or the client" shape on both legs:
+  an `action=grpc` stream now dispatches -- and opens its upstream
+  connection -- the moment its request HEADERS complete, not once the
+  whole request body (if any) has arrived, and the upstream's response
+  HEADERS are forwarded to the real client the instant they are known,
+  with DATA relayed in each direction as it arrives rather than
+  accumulated first. A response chunk sent by a real server-streaming
+  RPC now reaches the client within milliseconds of being written,
+  independently verified with a timing check against a real `grpcio`
+  server (measured ~50ms inter-arrival gaps matching the server's own
+  per-chunk delay, not a single post-buffered burst).
+- `magnus_h2_dispatch()` is now called as soon as a request's HEADERS
+  frame completes, for every route -- not only a gRPC one -- but only a
+  gRPC route ever *acts* on that early call; every other route (static,
+  `action=proxy`) still only commits once the whole body has arrived
+  (tracked by a new `request_end_stream_seen` flag, decoupled from
+  "dispatch has run"), exactly matching their existing 1e-1/1e-2
+  behavior -- this is a change to *when* the function can be called, not
+  to what any non-gRPC route does once it runs.
+- Both directions use the same deferred/resume data-provider pattern the
+  h1-proxy path (1e-2) already established for its own response leg
+  (`stream->deferred` -- now with a `grpc_request_deferred` counterpart
+  for the request leg), with the request/response buffers
+  (`body`/`io_buffer`) now compacting as they drain instead of growing
+  by the exchange's total size, so `MAGNUS_MAX_BODY` bounds how far
+  behind either side has fallen, not how long a streaming RPC may run.
+- A mid-stream failure after the client has already started receiving a
+  response is now a clean stream reset (`magnus_h2_grpc_abort()`, the
+  gRPC analogue of the h1-proxy path's own `magnus_h2_proxy_abort()`)
+  rather than the impossible-post-headers "Trailers-Only" response 2c-1's
+  logic would otherwise have attempted; a connect/transport failure
+  before anything was sent to the client still gets 2c-1's own clean
+  UNAVAILABLE retry-then-fail behavior. A stream that closes without
+  ever naming a real `grpc-status` (a raw mid-exchange transport failure,
+  not an RPC-level outcome) is now reported as `grpc-status: 2`
+  (UNKNOWN) rather than silently defaulting to success.
+
+Verified against a real, independent gRPC implementation (`grpcio`,
+Python) covering every RPC shape: client-streaming (multiple request
+messages sent with real inter-message delays, aggregated correctly by
+the upstream), server-streaming (5 response chunks with real delays
+between them, individually observed as they arrive, with a dedicated
+timing assertion confirming genuine incremental delivery rather than a
+single post-buffered burst), bidi streaming (interleaved request/response
+messages), plain unary calls (still correct through the same
+streaming-capable dispatch path -- 2c-1's own coverage re-verified
+against this exact build), an RPC-level failure, and a totally
+unreachable upstream. New permanent regression coverage added to
+`tests/test-core.sh`: a raw, stdlib-only hand-rolled h2 "upstream" (no
+h2/hyperframe pip dependency, matching 2c-1's own precedent) sends its
+response DATA in two separately-timed chunks, and a raw socket client
+asserts a measurable gap between their arrival, proving the wire-level
+relay is incremental. Also caught and fixed, during this increment's own
+live verification: `magnus_h2_dispatch()`'s new headers-complete calling
+convention broke the existing h2c `Upgrade: h2c` path (1e-5), which
+synthesizes and dispatches a stream directly rather than going through
+the normal HEADERS-frame flow -- fixed by having it mark
+`request_end_stream_seen` itself, exactly matching its own existing
+"dispatched immediately, as if END_STREAM had just been observed"
+contract. `make clean && make test` and `make sanitize` (ASan+UBSan)
+both green, including this new incremental-relay traffic. Image
+rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.13.0
 
 ### Added

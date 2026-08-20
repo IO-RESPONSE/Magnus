@@ -26,6 +26,14 @@ cleanup() {
     kill -TERM "$backend2_pid" >/dev/null 2>&1 || true
     wait "$backend2_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend3_pid:-}" ]; then
+    kill -TERM "$backend3_pid" >/dev/null 2>&1 || true
+    wait "$backend3_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend4_pid:-}" ]; then
+    kill -TERM "$backend4_pid" >/dev/null 2>&1 || true
+    wait "$backend4_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -1914,6 +1922,8 @@ server_pid=
 port_grpc_fake_upstream=$((port + 50))
 port_grpc=$((port + 51))
 port_grpc_bad=$((port + 52))
+port_grpc_stream_fake_upstream=$((port + 53))
+port_grpc_stream=$((port + 54))
 
 python3 - "$port_grpc_fake_upstream" >"$web_root/grpc-fake-upstream.log" 2>&1 <<'PYEOF' &
 import socket
@@ -2046,6 +2056,202 @@ bad_status=$(curl --http2-prior-knowledge --silent --output /dev/null \
   --write-out '%{http_code}' -X POST \
   "http://127.0.0.1:$port_grpc_bad/echo.Echo/SayHello")
 test "$bad_status" = '200'
+
+# Streaming (roadmap 2c-2): the upstream leg sends its response DATA in
+# two separately-timed chunks (a real sleep in between) before its
+# trailer; a raw socket client (stdlib-only, reading the SAME connection
+# it sent the request on) observes two separate recv()s with a
+# measurable gap between them, proving magnus relayed each chunk to the
+# real client as it arrived rather than buffering the whole response
+# first (2c-1's own shape) -- the deeper RPC-level semantics of
+# client-/server-streaming and bidi (multiple messages each direction,
+# genuinely interleaved over time) were verified live against a real
+# grpcio client and server, not part of this permanent suite, per the
+# same no-new-pip-dependency precedent 2c-1 already established.
+python3 - "$port_grpc_stream_fake_upstream" >"$web_root/grpc-stream-fake-upstream.log" 2>&1 <<'PYEOF' &
+import socket
+import sys
+import threading
+import time
+
+PORT = int(sys.argv[1])
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+def read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("peer closed early")
+        data += chunk
+    return data
+
+
+def handle(conn):
+    read_exact(conn, len(PREFACE))
+    stream_id = None
+    end_stream_seen = False
+    while not end_stream_seen:
+        header = read_exact(conn, 9)
+        length = (header[0] << 16) | (header[1] << 8) | header[2]
+        frame_type = header[3]
+        flags = header[4]
+        sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
+        read_exact(conn, length) if length else b""
+        if frame_type == 0x1:
+            stream_id = sid
+            if flags & 0x1:
+                end_stream_seen = True
+        elif frame_type == 0x0:
+            if flags & 0x1:
+                end_stream_seen = True
+
+    conn.sendall(frame(0x4, 0x0, 0))
+    conn.sendall(frame(0x4, 0x1, 0))
+
+    resp_headers = build_headers_block([
+        (":status", "200"),
+        ("content-type", "application/grpc"),
+    ])
+    conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))
+
+    for chunk_text in ("first-chunk", "second-chunk"):
+        payload = chunk_text.encode()
+        grpc_frame = bytes([0]) + len(payload).to_bytes(4, "big") + payload
+        conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))
+        time.sleep(0.2)
+
+    trailer = build_headers_block([("grpc-status", "0"), ("grpc-message", "")])
+    conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT))
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+backend3_pid=$!
+sleep 1
+
+"$binary" --port "$port_grpc_stream" \
+  --grpc-upstream "127.0.0.1:$port_grpc_stream_fake_upstream" \
+  --route "path_prefix=/; action=grpc" 2>>"$log" &
+backend4_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_grpc_stream/healthz" >/dev/null && break
+  sleep 1
+done
+
+python3 - "$port_grpc_stream" <<'PYEOF'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(PREFACE)
+s.sendall(frame(0x4, 0x0, 0))  # client SETTINGS (empty)
+req_headers = build_headers_block([
+    (":method", "POST"), (":scheme", "http"), (":authority", "x"),
+    (":path", "/stream.Test/Chunks"), ("te", "trailers"),
+    ("content-type", "application/grpc"),
+])
+s.sendall(frame(0x1, 0x4 | 0x1, 1, req_headers))  # END_HEADERS|END_STREAM, no body
+
+arrivals = []
+start = time.monotonic()
+buf = b""
+
+
+def recv_frame():
+    global buf
+    while len(buf) < 9:
+        more = s.recv(4096)
+        assert more, "connection closed early"
+        buf += more
+    length = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+    frame_type = buf[3]
+    while len(buf) < 9 + length:
+        more = s.recv(4096)
+        assert more, "connection closed early"
+        buf += more
+    payload = buf[9:9 + length]
+    buf = buf[9 + length:]
+    return frame_type, payload
+
+
+data_chunks = 0
+while data_chunks < 2:
+    frame_type, payload = recv_frame()
+    if frame_type == 0x0:  # DATA
+        data_chunks += 1
+        arrivals.append(time.monotonic() - start)
+
+gap = arrivals[1] - arrivals[0]
+# The two chunks were sent 0.2s apart by the fake upstream; a generous
+# floor (0.1s) comfortably separates genuine incremental relay from a
+# buffer-then-send implementation, which would deliver both back-to-back
+# (gap near zero) regardless of the upstream's own timing.
+assert gap > 0.1, "response chunks arrived back-to-back, not streamed incrementally: gap=%r" % gap
+print("grpc: response streaming gap=%.3fs (incremental, not buffered)" % gap)
+PYEOF
+
+kill -TERM "$backend4_pid" 2>/dev/null
+wait "$backend4_pid" 2>/dev/null || true
+backend4_pid=
+kill -TERM "$backend3_pid" 2>/dev/null
+wait "$backend3_pid" 2>/dev/null || true
+backend3_pid=
 
 kill -TERM "$server_pid"
 wait "$server_pid"
