@@ -9,6 +9,7 @@
 #include "magnus_ws.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
@@ -32,7 +33,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.6.0"
+#define MAGNUS_VERSION "1.7.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -240,6 +241,22 @@ static bool magnus_upstream_enabled;
 static magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
 static size_t magnus_route_count;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
+/* Parallel to magnus_upstream_owner[] above, for an upstream fd opened on
+ * behalf of one HTTP/2 stream's proxy dispatch (1e-2) rather than a whole
+ * client connection: unlike HTTP/1.1, one h2 connection can have many
+ * streams each proxying to a (possibly different) upstream concurrently,
+ * so ownership cannot be keyed by connection alone. An fd is owned by at
+ * most one of these two tables, never both. */
+static struct magnus_h2_stream *magnus_h2_upstream_owner[MAGNUS_MAX_FDS];
+/* Set once, right after epoll_create1() succeeds in main() -- this
+ * process ever has exactly one epoll instance for its whole lifetime.
+ * Read-only convenience for the handful of nghttp2 callback contexts
+ * (invoked deep inside nghttp2_session_mem_recv2()/_mem_send2(), not by
+ * magnus.c's own dispatch loop) that need to epoll_ctl a stream's
+ * upstream fd but have no epoll_fd parameter of their own to work with --
+ * every other function in this file still takes epoll_fd as a normal
+ * parameter and should keep doing so. */
+static int magnus_global_epoll_fd = -1;
 
 /* Idle upstream connections kept open for reuse, per cluster endpoint.
  * Deliberately *not* registered with epoll while idle -- simpler and
@@ -570,6 +587,11 @@ static int magnus_ws_service(int epoll_fd, magnus_connection_t *connection);
 static int magnus_h2_session_create(magnus_connection_t *connection);
 static int magnus_h2_service(int epoll_fd, magnus_connection_t *connection);
 static void magnus_h2_close(magnus_connection_t *connection);
+static void magnus_h2_proxy_start(magnus_connection_t *connection,
+                                  struct magnus_h2_stream *stream,
+                                  const char *forward_path);
+static int magnus_h2_handle_upstream(struct magnus_h2_stream *stream,
+                                     uint32_t flags);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
@@ -1892,13 +1914,25 @@ struct magnus_h2_stream {
     struct magnus_h2_stream *prev;
     magnus_connection_t *connection;
     int32_t stream_id;
-    char method[8];
-    char path[256];
-    /* True if the client's :method or :path pseudo-header value would
-     * not fit the fixed buffer above -- rather than truncating and
-     * silently resolving the wrong (shorter) path, such a request is
-     * answered with 405/414 and never reaches magnus_open_static() at
-     * all. */
+    /* Captured request, in the same magnus_http_request_t shape the
+     * HTTP/1.1 wire parser (magnus_http_parse()) produces -- but filled
+     * in directly from nghttp2-decoded pseudo-/regular headers instead of
+     * parsing wire bytes, since h2 never has an HTTP/1.1-formatted
+     * request to parse in the first place. This is what lets
+     * magnus_route_matches() (host/path-prefix/method/header/cookie/
+     * query/source-CIDR routing, written once for 1b and never touched
+     * since) work unmodified for h2 traffic too -- the "common internal
+     * request model" the master prompt's Section 3.1 asks for, in its
+     * first, narrowest form (route matching only; proxy/static dispatch
+     * below still branches by protocol). */
+    magnus_http_request_t parsed;
+    /* True if the client's :method, :path, or :authority pseudo-header
+     * value would not fit the fixed buffer it is captured into -- rather
+     * than truncating and silently resolving the wrong (shorter) target,
+     * such a request is answered with 405/414 (method/path) or simply
+     * routed as if it had no Host at all (authority -- a truncated host
+     * cannot safely match a host-based route, so leaving it empty is the
+     * only safe fallback, not picking some prefix of it). */
     bool method_overflow;
     bool path_overflow;
     bool head_only;
@@ -1906,9 +1940,87 @@ struct magnus_h2_stream {
      * bearing frame on the same stream (defensively -- HTTP/2 framing
      * should never actually produce one) cannot dispatch it twice. */
     bool dispatched;
+
+    /* -- static-file dispatch (1e-1) -- */
     int file_fd;
     off_t file_offset;
     off_t file_length;
+
+    /* -- proxy dispatch (1e-2): client h2 stream -> upstream HTTP/1.x --
+     * Each field below is this stream's own private copy of what an
+     * ordinary HTTP/1.1 proxy attempt keeps on magnus_connection_t
+     * itself (proxy_request/body/upstream_fd/proxy_buffer/etc.) --
+     * necessarily duplicated rather than shared, since one h2 connection
+     * can have many streams each proxying to a (possibly different)
+     * upstream concurrently, where HTTP/1.1 only ever has one proxy
+     * attempt in flight per client connection at a time. */
+    bool is_proxy;
+    int upstream_fd;
+    bool upstream_connected;
+    bool upstream_headers_sent;
+    size_t endpoint_index;
+    unsigned attempt;
+    unsigned upstream_requests_served;
+    time_t connect_started;
+    time_t last_activity;
+    uint64_t started_ms;
+    char request_id[33];
+    char log_method[8];
+    char log_target[256];
+    char affinity_key[64];
+    bool issue_affinity_cookie;
+    /* Built once at proxy start: "METHOD target HTTP/1.0\r\nHost: ...
+     * \r\n...\r\n\r\n", sent to the upstream ahead of any request body. */
+    char proxy_request[512];
+    size_t proxy_request_length;
+    size_t proxy_request_sent;
+    /* Client's request body, accumulated from DATA frames (see
+     * magnus_h2_on_data_chunk_recv()) up to MAGNUS_MAX_BODY, same cap
+     * the HTTP/1.1 path enforces -- then relayed to the upstream once
+     * proxy_request has gone out. body_overflow means the client sent
+     * more than that; the stream is answered 413 once END_STREAM
+     * arrives rather than mid-stream, matching how an oversized
+     * Content-Length is rejected up front on the HTTP/1.1 side. */
+    char *body;
+    size_t body_capacity;
+    size_t body_length;
+    size_t body_sent;
+    bool body_overflow;
+    /* Upstream response: one shared buffer reused across two phases,
+     * exactly like connection->proxy_buffer's own dual role for the
+     * HTTP/1.1 path -- first accumulating the raw status-line+headers
+     * block (header_accum counts bytes so far), then (after
+     * magnus_find_header_end() locates the end of it) holding body
+     * chunks for the nghttp2 data-provider read callback to pull from
+     * (io_length/io_sent). Unlike connection->proxy_buffer, nothing here
+     * is ever written straight to a client socket -- io_length/io_sent
+     * are drained by magnus_h2_read_proxy_body() instead, pulled by
+     * nghttp2 whenever it is ready to emit this stream's next DATA
+     * frame. */
+    char *io_buffer;
+    size_t header_accum;
+    size_t io_length;
+    size_t io_sent;
+    bool headers_received;
+    bool response_headers_submitted;
+    bool upstream_eof;
+    /* Set once the response is known to be fully received from the
+     * upstream (Content-Length reached, or the upstream closed) -- tells
+     * magnus_h2_read_proxy_body() it is safe to report
+     * NGHTTP2_DATA_FLAG_EOF once io_buffer is fully drained, rather than
+     * DEFERRED (more is still expected). */
+    bool response_complete;
+    /* True if magnus_h2_read_proxy_body() last returned
+     * NGHTTP2_ERR_DEFERRED because io_buffer was empty and
+     * response_complete was not yet set -- nghttp2 will not call it
+     * again for this stream on its own; whoever next adds bytes to
+     * io_buffer must call nghttp2_session_resume_data() to make it
+     * eligible again. */
+    bool deferred;
+    bool has_response_length;
+    unsigned long response_length;
+    unsigned long response_received;
+    bool upstream_poolable;
 };
 
 static struct magnus_h2_stream *
@@ -1919,11 +2031,33 @@ magnus_h2_stream_new(magnus_connection_t *connection, int32_t stream_id)
     stream->connection = connection;
     stream->stream_id = stream_id;
     stream->file_fd = -1;
+    stream->upstream_fd = -1;
+    stream->started_ms = magnus_now_ms();
     stream->next = connection->h2_streams;
     stream->prev = NULL;
     if (connection->h2_streams != NULL) connection->h2_streams->prev = stream;
     connection->h2_streams = stream;
     return stream;
+}
+
+/* Tears down this stream's upstream connection, if it still has one, as
+ * a plain close -- never a pool checkin. A clean, poolable completion
+ * already checks its upstream fd into the pool (and sets upstream_fd
+ * back to -1) the moment that is known, well before the stream itself
+ * ever closes -- see magnus_h2_proxy_maybe_complete() -- so reaching
+ * here with upstream_fd still >= 0 only ever means an abnormal teardown
+ * (the client connection dying mid-flight, a stream reset, ...), for
+ * which closing plainly is the only safe option. */
+static void
+magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
+{
+    if (stream->upstream_fd < 0) return;
+    if (magnus_global_epoll_fd >= 0)
+        epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, stream->upstream_fd,
+                 NULL);
+    magnus_h2_upstream_owner[stream->upstream_fd] = NULL;
+    close(stream->upstream_fd);
+    stream->upstream_fd = -1;
 }
 
 static void
@@ -1934,6 +2068,9 @@ magnus_h2_stream_free(struct magnus_h2_stream *stream)
     else connection->h2_streams = stream->next;
     if (stream->next != NULL) stream->next->prev = stream->prev;
     if (stream->file_fd >= 0) close(stream->file_fd);
+    magnus_h2_stream_teardown_upstream(stream);
+    free(stream->body);
+    free(stream->io_buffer);
     free(stream);
 }
 
@@ -1988,47 +2125,36 @@ magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
     return got;
 }
 
-/* Serves stream->path as a static file, exactly like the HTTP/1.1 GET
- * path (magnus_open_static() + magnus_content_type(), same helpers) --
- * reused rather than reimplemented so both protocols agree on path
- * resolution/traversal safety by construction. Called once per stream,
- * the moment its request headers (and any body -- ignored, since a
- * static GET/HEAD is never expected to carry one) are fully received. */
+/* Serves stream->parsed.target as a static file, exactly like the
+ * HTTP/1.1 GET path (magnus_open_static() + magnus_content_type(), same
+ * helpers) -- reused rather than reimplemented so both protocols agree
+ * on path resolution/traversal safety by construction. Called from
+ * magnus_h2_dispatch() below once routing has decided this request is
+ * not a proxy match and its method is GET/HEAD. */
 static void
-magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *stream)
+magnus_h2_dispatch_static(magnus_connection_t *connection,
+                          struct magnus_h2_stream *stream)
 {
     nghttp2_session *session = connection->h2_session;
     struct stat metadata;
     int fd;
-    bool method_ok;
     char content_length[32];
     nghttp2_nv headers[4];
 
-    stream->dispatched = true;
-    method_ok = !stream->method_overflow
-        && (strcmp(stream->method, "GET") == 0
-            || strcmp(stream->method, "HEAD") == 0);
-    if (!method_ok) {
-        magnus_h2_submit_status(session, stream->stream_id, "405");
-        return;
-    }
-    if (stream->path_overflow) {
-        magnus_h2_submit_status(session, stream->stream_id, "414");
-        return;
-    }
-    fd = magnus_open_static(stream->path, &metadata);
+    fd = magnus_open_static(stream->parsed.target, &metadata);
     if (fd < 0) {
         magnus_h2_submit_status(session, stream->stream_id, "404");
         return;
     }
-    stream->head_only = strcmp(stream->method, "HEAD") == 0;
+    stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
     stream->file_offset = 0;
     stream->file_length = metadata.st_size;
     snprintf(content_length, sizeof(content_length), "%lld",
             (long long) metadata.st_size);
     headers[0] = magnus_h2_nv(":status", "200");
     headers[1] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
-    headers[2] = magnus_h2_nv("content-type", magnus_content_type(stream->path));
+    headers[2] = magnus_h2_nv("content-type",
+                              magnus_content_type(stream->parsed.target));
     headers[3] = magnus_h2_nv("content-length", content_length);
     if (stream->head_only) {
         close(fd);
@@ -2045,6 +2171,79 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
                                         &data_provider);
     }
+}
+
+/* Routes, then branches to either a proxied upstream request (1e-2) or a
+ * static-file response (1e-1) -- deliberately kept close in shape to
+ * magnus_dispatch_request()'s own route-then-branch structure for
+ * HTTP/1.1 (see that function for the fuller commentary), reusing the
+ * exact same magnus_route_matches() call against stream->parsed rather
+ * than a second routing implementation: a literal "/proxy" path prefix
+ * is equivalent to an unconditional action=proxy route, ahead of
+ * everything configured; routes are evaluated in file order, first
+ * match wins. Neither /healthz, /metrics, nor per-client-IP rate
+ * limiting are wired into the h2 path yet -- see
+ * docs/development-roadmap.md's 1e entry for what remains. Called once
+ * per stream, the moment its request headers and any body (buffered
+ * into stream->body -- see magnus_h2_on_data_chunk_recv()) are fully
+ * received. */
+static void
+magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *stream)
+{
+    nghttp2_session *session = connection->h2_session;
+    bool literal_proxy_prefix;
+    bool is_proxy_route;
+    bool route_denied = false;
+    const char *forward_path;
+
+    stream->dispatched = true;
+    if (stream->method_overflow) {
+        magnus_h2_submit_status(session, stream->stream_id, "405");
+        return;
+    }
+    if (stream->path_overflow) {
+        magnus_h2_submit_status(session, stream->stream_id, "414");
+        return;
+    }
+
+    literal_proxy_prefix = magnus_upstream_enabled
+        && strncmp(stream->parsed.target, "/proxy", 6) == 0
+        && (stream->parsed.target[6] == '/' || stream->parsed.target[6] == '\0');
+    is_proxy_route = literal_proxy_prefix;
+    forward_path = literal_proxy_prefix ? stream->parsed.target + 6
+                                        : stream->parsed.target;
+
+    for (size_t r = 0; r < magnus_route_count; r++) {
+        if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
+                                  connection->client_address))
+            continue;
+        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
+            is_proxy_route = true;
+            forward_path = stream->parsed.target;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
+            route_denied = true;
+        }
+        break;
+    }
+
+    if (route_denied) {
+        magnus_h2_submit_status(session, stream->stream_id, "403");
+        return;
+    }
+    if (is_proxy_route) {
+        if (stream->body_overflow) {
+            magnus_h2_submit_status(session, stream->stream_id, "413");
+            return;
+        }
+        magnus_h2_proxy_start(connection, stream, forward_path);
+        return;
+    }
+    if (strcmp(stream->parsed.method, "GET") != 0
+        && strcmp(stream->parsed.method, "HEAD") != 0) {
+        magnus_h2_submit_status(session, stream->stream_id, "405");
+        return;
+    }
+    magnus_h2_dispatch_static(connection, stream);
 }
 
 static int
@@ -2079,21 +2278,109 @@ magnus_h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
         return 0;
     stream = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
     if (stream == NULL) return 0;
+
     if (namelen == 7 && memcmp(name, ":method", 7) == 0) {
-        if (valuelen >= sizeof(stream->method)) {
+        if (valuelen >= sizeof(stream->parsed.method)) {
             stream->method_overflow = true;
             return 0;
         }
-        memcpy(stream->method, value, valuelen);
-        stream->method[valuelen] = '\0';
-    } else if (namelen == 5 && memcmp(name, ":path", 5) == 0) {
-        if (valuelen >= sizeof(stream->path)) {
+        memcpy(stream->parsed.method, value, valuelen);
+        stream->parsed.method[valuelen] = '\0';
+        return 0;
+    }
+    if (namelen == 5 && memcmp(name, ":path", 5) == 0) {
+        if (valuelen >= sizeof(stream->parsed.target)) {
             stream->path_overflow = true;
             return 0;
         }
-        memcpy(stream->path, value, valuelen);
-        stream->path[valuelen] = '\0';
+        memcpy(stream->parsed.target, value, valuelen);
+        stream->parsed.target[valuelen] = '\0';
+        return 0;
     }
+    if (namelen == 10 && memcmp(name, ":authority", 10) == 0) {
+        /* Left empty (never partially copied) on overflow, unlike a
+         * fixed-size body-relay buffer being truncated would be merely
+         * wasteful -- a truncated Host value could accidentally match a
+         * host-based route condition it should not, so leaving it at
+         * its zero-initialized "" is the only safe fallback. */
+        if (valuelen < sizeof(stream->parsed.host)) {
+            memcpy(stream->parsed.host, value, valuelen);
+            stream->parsed.host[valuelen] = '\0';
+        }
+        return 0;
+    }
+    if (namelen > 0 && name[0] == ':') return 0; /* any other pseudo-header */
+
+    /* An ordinary header field. HTTP/2 field names are already lowercase
+     * by construction (RFC 9113 8.2.1 -- nghttp2 enforces this on
+     * decode), so no case-folding is needed here the way the HTTP/1.1
+     * wire parser has to. Truncated (not rejected) past its fixed-size
+     * slot, and simply not retained past MAGNUS_HTTP_MAX_HEADERS -- both
+     * exactly mirroring magnus_http_parse()'s own handling of an
+     * oversized/over-count header, so route matching behaves
+     * identically regardless of which protocol a request arrived
+     * over. */
+    if (stream->parsed.header_count < MAGNUS_HTTP_MAX_HEADERS) {
+        magnus_http_header_t *stored
+            = &stream->parsed.headers[stream->parsed.header_count];
+        size_t stored_name_length = namelen < sizeof(stored->name) - 1
+            ? namelen : sizeof(stored->name) - 1;
+        size_t stored_value_length = valuelen < sizeof(stored->value) - 1
+            ? valuelen : sizeof(stored->value) - 1;
+        memcpy(stored->name, name, stored_name_length);
+        stored->name[stored_name_length] = '\0';
+        memcpy(stored->value, value, stored_value_length);
+        stored->value[stored_value_length] = '\0';
+        stream->parsed.header_count++;
+    }
+    return 0;
+}
+
+/* Accumulates a proxy-bound stream's request body from DATA frames, up
+ * to MAGNUS_MAX_BODY -- the same cap (and the same "buffer whole before
+ * dispatch" shape) the HTTP/1.1 path enforces via
+ * magnus_begin_body()/magnus_continue_body(). A non-proxy stream (static
+ * file, denied, or not yet routed) has no use for a body at all, so
+ * bytes are simply not retained for it; magnus_h2_dispatch() only ever
+ * looks at stream->body for an is_proxy_route match anyway. Once the cap
+ * is hit, no further bytes are retained (body_overflow latches) --
+ * magnus_h2_dispatch() answers 413 once END_STREAM arrives rather than
+ * failing the stream mid-flight. */
+static int
+magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
+                             int32_t stream_id, const uint8_t *data,
+                             size_t len, void *user_data)
+{
+    struct magnus_h2_stream *stream
+        = nghttp2_session_get_stream_user_data(session, stream_id);
+    (void) session;
+    (void) flags;
+    (void) user_data;
+    if (stream == NULL || stream->body_overflow || len == 0) return 0;
+    if (stream->body_length + len > MAGNUS_MAX_BODY) {
+        stream->body_overflow = true;
+        return 0;
+    }
+    if (stream->body_length + len > stream->body_capacity) {
+        size_t new_capacity = stream->body_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : stream->body_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->body_length + len) new_capacity *= 2;
+        grown = realloc(stream->body, new_capacity);
+        if (grown == NULL) {
+            /* Allocation failure this far under MAGNUS_MAX_BODY (1 MiB)
+             * would mean genuine system-wide memory pressure -- folded
+             * into the same body_overflow/413 path as an oversized body
+             * rather than a distinct code path, since either way this
+             * stream simply cannot be proxied with a body attached. */
+            stream->body_overflow = true;
+            return 0;
+        }
+        stream->body = grown;
+        stream->body_capacity = new_capacity;
+    }
+    memcpy(stream->body + stream->body_length, data, len);
+    stream->body_length += len;
     return 0;
 }
 
@@ -2142,6 +2429,8 @@ magnus_h2_session_create(magnus_connection_t *connection)
         magnus_h2_on_begin_headers);
     nghttp2_session_callbacks_set_on_header_callback(callbacks,
         magnus_h2_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks,
+        magnus_h2_on_data_chunk_recv);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks,
         magnus_h2_on_frame_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
@@ -2258,6 +2547,24 @@ magnus_h2_update_interest(int epoll_fd, magnus_connection_t *connection)
     return magnus_update_interest(epoll_fd, connection, events);
 }
 
+/* Flushes leftover output, then (only if that fully drained) asks
+ * nghttp2 for anything newly ready to send and writes that out too --
+ * the "push whatever nghttp2 has queued onto the wire" sequence used
+ * both at the top of every magnus_h2_service() call (below) and, for
+ * proxy dispatch (1e-2), from magnus_h2_handle_upstream() whenever an
+ * upstream event makes more of some *other* stream's response body
+ * available: that push has to happen from there too, since nothing
+ * guarantees the client fd itself has a pending epoll event at that
+ * moment to otherwise trigger it. */
+static int
+magnus_h2_push(int epoll_fd, magnus_connection_t *connection)
+{
+    if (magnus_h2_flush_output(connection) < 0) return -1;
+    if (connection->h2_output == NULL && magnus_h2_drain_send(connection) < 0)
+        return -1;
+    return magnus_h2_update_interest(epoll_fd, connection);
+}
+
 /* Entry point for any epoll event on an h2_active connection's fd, and
  * also called once, directly, right after magnus_h2_session_create()
  * succeeds -- that first call is what actually gets the server's initial
@@ -2293,6 +2600,643 @@ magnus_h2_service(int epoll_fd, magnus_connection_t *connection)
         return -1;
     }
     return magnus_h2_update_interest(epoll_fd, connection);
+}
+
+/* ---- HTTP/2 proxy dispatch (roadmap Phase 1e-2): an h2 stream matched
+ * to action=proxy (or the literal "/proxy" prefix) is relayed to an
+ * ordinary HTTP/1.x upstream -- the same magnus_cluster/magnus_upstream_pool
+ * every HTTP/1.1 proxy attempt already uses, and the same
+ * magnus_proxy_sanitize_response_headers() hop-by-hop-stripping/framing
+ * logic, translated into h2 response headers + DATA frames rather than
+ * raw bytes written straight to a client socket. Deliberately its own
+ * parallel set of functions rather than a reuse of
+ * magnus_proxy_pick_and_start()/magnus_handle_upstream()/etc.: those are
+ * built around exactly one proxy attempt in flight per client
+ * *connection* at a time (magnus_connection_t's own proxy_* fields),
+ * which an h2 connection's concurrent multiplexing genuinely breaks --
+ * one connection can have many streams each proxying to a (possibly
+ * different) upstream at once, so this proxy state lives on
+ * struct magnus_h2_stream instead. WebSocket upgrades are not attempted
+ * here: h2 has no Upgrade-style handshake at all (RFC 9113 8.5
+ * repurposes :protocol/extended CONNECT for that, which this increment
+ * does not implement -- see docs/development-roadmap.md's 1e entry). */
+
+/* Ends a proxy-dispatched stream before any response headers have been
+ * submitted to the client -- the h2 analogue of magnus_proxy_fail() for
+ * HTTP/1.1. Unlike that function, no client-visible "connection" needs
+ * closing over this: h2 multiplexes many streams over one connection
+ * that stays open regardless of how any single stream's proxy attempt
+ * turned out, so only this one stream ends, answered with a synthesized
+ * status. Must only be called while
+ * stream->response_headers_submitted is still false. */
+static void
+magnus_h2_proxy_fail(magnus_connection_t *connection,
+                     struct magnus_h2_stream *stream, const char *status)
+{
+    unsigned status_code = (unsigned) strtoul(status, NULL, 10);
+    double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+    magnus_h2_stream_teardown_upstream(stream);
+    magnus_h2_submit_status(connection->h2_session, stream->stream_id, status);
+    magnus_requests_total++;
+    if (status_code >= 500) magnus_responses_5xx++;
+    else if (status_code >= 400) magnus_responses_4xx++;
+    magnus_record_latency(latency_ms);
+    magnus_access_log(stream->request_id, stream->log_method, stream->log_target,
+                      status_code, latency_ms);
+}
+
+/* Ends a proxy-dispatched stream after response headers were already
+ * submitted -- the h2 analogue of magnus_proxy_abort() for HTTP/1.1: a
+ * fresh status code is no longer possible (h2 does not allow a second
+ * HEADERS frame after the response has started any more than HTTP/1.1
+ * allows a second status line), so the stream itself is reset instead.
+ * The client sees this as an abruptly terminated response, same as an
+ * HTTP/1.1 client would see a connection abort mid-body. */
+static void
+magnus_h2_proxy_abort(struct magnus_h2_stream *stream)
+{
+    magnus_h2_stream_teardown_upstream(stream);
+    (void) nghttp2_submit_rst_stream(stream->connection->h2_session,
+                                     NGHTTP2_FLAG_NONE, stream->stream_id,
+                                     NGHTTP2_INTERNAL_ERROR);
+}
+
+/* The h2 analogue of magnus_proxy_attach_upstream(): common state setup
+ * once a socket (freshly connected, or handed out of
+ * magnus_upstream_pool) is ready to be this stream's upstream, on
+ * magnus_h2_upstream_owner[] rather than magnus_upstream_owner[] since
+ * ownership here is per-stream, not per-connection. Returns 0 once the
+ * attempt is in flight, -1 on immediate failure (fd already closed). */
+static int
+magnus_h2_proxy_attach_upstream(magnus_connection_t *connection,
+                                struct magnus_h2_stream *stream,
+                                size_t endpoint_index, int fd, bool connected,
+                                unsigned requests_served)
+{
+    struct epoll_event event;
+    (void) connection;
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    if (stream->io_buffer == NULL) {
+        stream->io_buffer = malloc(MAGNUS_PROXY_BUFFER);
+        if (stream->io_buffer == NULL) {
+            close(fd);
+            return -1;
+        }
+    }
+    stream->upstream_fd = fd;
+    stream->upstream_connected = connected;
+    stream->upstream_requests_served = requests_served;
+    stream->endpoint_index = endpoint_index;
+    stream->connect_started = time(NULL);
+    stream->last_activity = stream->connect_started;
+    magnus_h2_upstream_owner[fd] = stream;
+    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
+                                   .data.fd = fd };
+    if (epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        magnus_h2_upstream_owner[fd] = NULL;
+        close(fd);
+        stream->upstream_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+/* The h2 analogue of magnus_proxy_connect_endpoint(): a pooled idle
+ * connection for this endpoint is tried first, exactly like the
+ * HTTP/1.1 path -- this is the connection-pool reuse the master prompt
+ * asked 1e-2 to keep, and it works unmodified here since
+ * magnus_upstream_pool is keyed by cluster endpoint, not by which
+ * client connection or protocol is asking. */
+static int
+magnus_h2_proxy_connect_endpoint(magnus_connection_t *connection,
+                                 struct magnus_h2_stream *stream,
+                                 size_t endpoint_index)
+{
+    struct sockaddr_in address;
+    int result;
+    int fd;
+    unsigned pooled_requests_served;
+    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served);
+
+    if (pooled_fd >= 0) {
+        if (magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
+                                            pooled_fd, true,
+                                            pooled_requests_served) == 0)
+            return 0;
+    }
+    if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
+                                           fd, result == 0, 0);
+}
+
+/* The h2 analogue of magnus_proxy_connect_failed(): records a
+ * connect-stage failure for the endpoint currently in flight and either
+ * retries against a different healthy endpoint -- bounded by
+ * MAGNUS_PROXY_MAX_ATTEMPTS total attempts -- or gives up with a clean
+ * status-coded error. Must only be called while
+ * stream->response_headers_submitted is still false. */
+static void
+magnus_h2_proxy_connect_failed(magnus_connection_t *connection,
+                               struct magnus_h2_stream *stream,
+                               const char *give_up_status)
+{
+    magnus_cluster_result(&magnus_cluster, stream->endpoint_index, false,
+                          magnus_now_ms());
+    magnus_h2_stream_teardown_upstream(stream);
+    if (stream->attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
+        int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
+                                             NULL);
+        if (endpoint >= 0) {
+            stream->attempt++;
+            if (magnus_h2_proxy_connect_endpoint(connection, stream,
+                                                 (size_t) endpoint) == 0) {
+                stream->issue_affinity_cookie = true;
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
+                return;
+            }
+            magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                                  magnus_now_ms());
+        }
+    }
+    magnus_h2_proxy_fail(connection, stream, give_up_status);
+}
+
+/* Entry point from magnus_h2_dispatch(): builds the outbound proxy
+ * request (an h2 analogue of magnus_proxy_pick_and_start(), minus the
+ * WebSocket branch -- see this block's own top-of-section comment for
+ * why), then selects a healthy cluster endpoint and connects, retrying
+ * once on an immediate connect failure exactly like the HTTP/1.1 path.
+ * `forward_path` is what actually goes out on the wire as the upstream
+ * request's target -- stream->parsed.target with the literal "/proxy"
+ * prefix stripped for a request that reached here via that hardcoded
+ * prefix, or unchanged for one that reached here via a matched
+ * action=proxy route (see magnus_h2_dispatch()). Session affinity works
+ * the same way as HTTP/1.1: a valid MAGNUS_AFFINITY cookie in the
+ * request's "cookie" header is preferred for the first attempt only. */
+static void
+magnus_h2_proxy_start(magnus_connection_t *connection,
+                      struct magnus_h2_stream *stream, const char *forward_path)
+{
+    const char *cookie_header = magnus_http_header_find(&stream->parsed, "cookie");
+    char client_affinity[64] = "";
+    bool sticky;
+    size_t preferred_index;
+    int written;
+
+    magnus_generate_token(stream->request_id);
+    strncpy(stream->log_method, stream->parsed.method,
+           sizeof(stream->log_method) - 1);
+    stream->log_method[sizeof(stream->log_method) - 1] = '\0';
+    strncpy(stream->log_target, stream->parsed.target,
+           sizeof(stream->log_target) - 1);
+    stream->log_target[sizeof(stream->log_target) - 1] = '\0';
+
+    written = stream->body_length > 0
+        ? snprintf(stream->proxy_request, sizeof(stream->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: keep-alive\r\nContent-Length: %zu\r\n"
+                   "X-Magnus-Request-Id: %s\r\n\r\n",
+                   stream->parsed.method, forward_path, stream->body_length,
+                   stream->request_id)
+        : snprintf(stream->proxy_request, sizeof(stream->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: keep-alive\r\nX-Magnus-Request-Id: %s\r\n\r\n",
+                   stream->parsed.method, forward_path, stream->request_id);
+    if (written < 0 || (size_t) written >= sizeof(stream->proxy_request)) {
+        magnus_h2_proxy_fail(connection, stream, "502");
+        return;
+    }
+    stream->proxy_request_length = (size_t) written;
+    stream->is_proxy = true;
+
+    if (cookie_header != NULL)
+        (void) magnus_http_extract_cookie(cookie_header, strlen(cookie_header),
+                                          MAGNUS_AFFINITY_COOKIE_NAME,
+                                          client_affinity,
+                                          sizeof(client_affinity));
+    sticky = magnus_decode_affinity_cookie(
+        client_affinity[0] != '\0' ? client_affinity : NULL, &preferred_index);
+    stream->issue_affinity_cookie = !sticky;
+    stream->attempt = 0;
+
+    for (;;) {
+        int endpoint = sticky
+            ? magnus_cluster_select_sticky(&magnus_cluster, magnus_now_ms(),
+                                           preferred_index)
+            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL);
+        if (endpoint < 0) {
+            magnus_h2_proxy_fail(connection, stream, "502");
+            return;
+        }
+        if (sticky) {
+            sticky = false;
+        } else if (stream->attempt > 0) {
+            stream->issue_affinity_cookie = true;
+        }
+        stream->attempt++;
+        if (magnus_h2_proxy_connect_endpoint(connection, stream,
+                                             (size_t) endpoint) == 0) {
+            if (stream->issue_affinity_cookie) {
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
+            }
+            return;
+        }
+        magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                              magnus_now_ms());
+        if (stream->attempt >= MAGNUS_PROXY_MAX_ATTEMPTS) {
+            magnus_h2_proxy_fail(connection, stream, "502");
+            return;
+        }
+    }
+}
+
+/* nghttp2 data-provider read callback for a proxy-dispatched stream's
+ * response body: pulls from stream->io_buffer/io_length/io_sent, which
+ * magnus_h2_proxy_stream_response() below keeps refilled from the
+ * upstream socket. Reports NGHTTP2_ERR_DEFERRED (not EOF, not more
+ * bytes) whenever the buffer is empty but response_complete is not yet
+ * set -- more is still expected from the upstream, it just is not
+ * available *right now*; whichever code next adds bytes to io_buffer
+ * must call nghttp2_session_resume_data() to make this stream eligible
+ * again (see stream->deferred's own comment). */
+static nghttp2_ssize
+magnus_h2_read_proxy_body(nghttp2_session *session, int32_t stream_id,
+                          uint8_t *buf, size_t length, uint32_t *data_flags,
+                          nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    size_t available = stream->io_length - stream->io_sent;
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    if (available == 0) {
+        if (stream->response_complete) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            return 0;
+        }
+        stream->deferred = true;
+        return NGHTTP2_ERR_DEFERRED;
+    }
+    if (length > available) length = available;
+    memcpy(buf, stream->io_buffer + stream->io_sent, length);
+    stream->io_sent += length;
+    if (stream->io_sent == stream->io_length) {
+        stream->io_length = 0;
+        stream->io_sent = 0;
+        if (stream->response_complete) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return (nghttp2_ssize) length;
+}
+
+/* Converts a magnus_proxy_sanitize_response_headers() text block (status
+ * line + hop-by-hop-stripped, framing-rewritten headers, already
+ * NUL-terminated and mutated in place by that call) into h2 response
+ * headers and submits them. The `Connection` header sanitize always
+ * appends is dropped -- forbidden in HTTP/2 by RFC 9113 8.2.2, and
+ * meaningless there regardless (an h2 stream's lifetime is governed by
+ * END_STREAM/RST_STREAM/GOAWAY, not a client-facing keep-alive/close
+ * choice per response) -- every other header (Content-Type,
+ * Content-Length, an affinity Set-Cookie, X-Magnus-Via, ...) is
+ * forwarded as-is, lowercased (h2 field names must be lowercase; an
+ * HTTP/1.x upstream's are not guaranteed to be). */
+static void
+magnus_h2_proxy_submit_response(magnus_connection_t *connection,
+                                struct magnus_h2_stream *stream,
+                                unsigned status, char *sanitized)
+{
+    nghttp2_nv headers[24];
+    char name_storage[24][64];
+    size_t count = 0;
+    char status_text[8];
+    char *saveptr = NULL;
+    char *line;
+
+    snprintf(status_text, sizeof(status_text), "%u", status);
+    headers[count] = magnus_h2_nv(":status", status_text);
+    count++;
+
+    strtok_r(sanitized, "\r\n", &saveptr); /* status line, already captured */
+    for (line = strtok_r(NULL, "\r\n", &saveptr);
+         line != NULL && count < sizeof(headers) / sizeof(headers[0]);
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
+        char *colon = strchr(line, ':');
+        char *value;
+        size_t name_length;
+        if (colon == NULL) continue;
+        name_length = (size_t) (colon - line);
+        if (name_length == 0 || name_length >= sizeof(name_storage[0]))
+            continue;
+        memcpy(name_storage[count], line, name_length);
+        name_storage[count][name_length] = '\0';
+        for (size_t i = 0; i < name_length; i++)
+            name_storage[count][i]
+                = (char) tolower((unsigned char) name_storage[count][i]);
+        if (strcmp(name_storage[count], "connection") == 0) continue;
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        headers[count] = magnus_h2_nv(name_storage[count], value);
+        count++;
+    }
+
+    stream->response_headers_submitted = true;
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_read_proxy_body,
+        };
+        (void) nghttp2_submit_response2(connection->h2_session,
+                                        stream->stream_id, headers, count,
+                                        &data_provider);
+    }
+}
+
+/* Once the response is known to be fully received from the upstream
+ * (Content-Length reached, or the upstream closed), decides -- exactly
+ * like the tail of magnus_proxy_flush() for HTTP/1.1 -- whether the
+ * upstream leg goes back into the pool or is torn down, and marks
+ * response_complete so magnus_h2_read_proxy_body() knows it is safe to
+ * report EOF once io_buffer finishes draining rather than DEFERRED. */
+static void
+magnus_h2_proxy_maybe_complete(struct magnus_h2_stream *stream)
+{
+    bool complete_by_length = stream->has_response_length
+        && stream->response_received >= stream->response_length;
+    if (!stream->upstream_eof && !complete_by_length) return;
+    stream->response_complete = true;
+    if (complete_by_length && stream->upstream_poolable
+        && stream->upstream_fd >= 0) {
+        int fd = stream->upstream_fd;
+        epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        magnus_h2_upstream_owner[fd] = NULL;
+        stream->upstream_fd = -1;
+        magnus_pool_checkin(stream->endpoint_index, fd,
+                            stream->upstream_requests_served + 1);
+    } else {
+        magnus_h2_stream_teardown_upstream(stream);
+    }
+}
+
+/* The h2 analogue of magnus_proxy_receive_headers(): accumulates the
+ * upstream response's status line + header block (which may arrive
+ * split across several recv() calls) into stream->io_buffer, then
+ * rewrites it via magnus_proxy_sanitize_response_headers() -- the exact
+ * same hop-by-hop-stripping/framing logic the HTTP/1.1 path uses --
+ * once the terminating blank line is found, and submits it as this
+ * stream's h2 response. Leftover bytes already read past the header
+ * block become the first chunk of body. Returns true once headers were
+ * fully received (whether the outcome was a clean submit or a failure
+ * this stream is now done for), false while still waiting for more. */
+static bool
+magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
+                                struct magnus_h2_stream *stream)
+{
+    char *body_start;
+    size_t header_length;
+    size_t leftover;
+    char header_copy[MAGNUS_PROXY_HEADER_LIMIT + 1];
+    char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
+    magnus_proxy_response_info_t info;
+    int sanitized_length;
+
+    while (stream->header_accum < MAGNUS_PROXY_BUFFER) {
+        ssize_t received = recv(stream->upstream_fd,
+            stream->io_buffer + stream->header_accum,
+            MAGNUS_PROXY_BUFFER - stream->header_accum, 0);
+        if (received > 0) {
+            stream->header_accum += (size_t) received;
+            stream->last_activity = time(NULL);
+            if (magnus_find_header_end(stream->io_buffer, stream->header_accum)
+                != NULL)
+                break;
+            continue;
+        }
+        if (received == 0) {
+            stream->upstream_eof = true;
+            break;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+        magnus_h2_proxy_connect_failed(connection, stream, "502");
+        return true;
+    }
+
+    body_start = magnus_find_header_end(stream->io_buffer, stream->header_accum);
+    if (body_start == NULL) {
+        if (stream->upstream_eof
+            || stream->header_accum == MAGNUS_PROXY_BUFFER) {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return true;
+        }
+        return false;
+    }
+
+    header_length = (size_t) (body_start - stream->io_buffer);
+    leftover = stream->header_accum - header_length;
+    if (header_length > MAGNUS_PROXY_HEADER_LIMIT) {
+        magnus_h2_proxy_connect_failed(connection, stream, "502");
+        return true;
+    }
+    memcpy(header_copy, stream->io_buffer, header_length);
+    header_copy[header_length] = '\0';
+    sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
+        header_length, sanitized, sizeof(sanitized),
+        stream->issue_affinity_cookie ? stream->affinity_key : NULL,
+        true /* client_wants_close: N/A for h2 -- see magnus_h2_proxy_submit_response()'s
+              * own comment on why the Connection header this produces is
+              * dropped rather than forwarded either way */, &info);
+    if (sanitized_length < 0) {
+        magnus_h2_proxy_connect_failed(connection, stream, "502");
+        return true;
+    }
+
+    if (info.has_content_length && leftover > info.content_length)
+        leftover = info.content_length;
+    memmove(stream->io_buffer, body_start, leftover);
+    stream->io_length = leftover;
+    stream->io_sent = 0;
+    stream->headers_received = true;
+    stream->upstream_poolable = info.upstream_poolable;
+    stream->has_response_length = info.has_content_length;
+    stream->response_length = info.content_length;
+    stream->response_received = leftover;
+
+    magnus_cluster_result(&magnus_cluster, stream->endpoint_index, true,
+                          magnus_now_ms());
+    magnus_h2_proxy_submit_response(connection, stream, info.status, sanitized);
+    magnus_requests_total++;
+    if (info.status >= 500) magnus_responses_5xx++;
+    else if (info.status >= 400) magnus_responses_4xx++;
+    {
+        double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(stream->request_id, stream->log_method,
+                          stream->log_target, info.status, latency_ms);
+    }
+    magnus_h2_proxy_maybe_complete(stream);
+    return true;
+}
+
+/* Once headers are received (magnus_h2_proxy_receive_headers() already
+ * ran and submitted the h2 response), keeps stream->io_buffer filled
+ * from the upstream socket for magnus_h2_read_proxy_body() to pull
+ * from, respecting backpressure (never reads more while the buffer
+ * still holds bytes nghttp2 has not pulled out yet) and never reading
+ * past a declared Content-Length -- exactly the same shape as the tail
+ * of magnus_handle_upstream() for HTTP/1.1, adapted to refill a pull
+ * buffer instead of writing straight to a client socket. */
+static void
+magnus_h2_proxy_stream_response(struct magnus_h2_stream *stream)
+{
+    size_t want;
+    ssize_t received;
+
+    if (stream->io_length > stream->io_sent) return; /* backpressure */
+    want = MAGNUS_PROXY_BUFFER;
+    if (stream->has_response_length) {
+        size_t remaining = stream->response_length - stream->response_received;
+        if (remaining < want) want = remaining;
+    }
+    if (want == 0) {
+        magnus_h2_proxy_maybe_complete(stream);
+        return;
+    }
+    received = recv(stream->upstream_fd, stream->io_buffer, want, 0);
+    if (received > 0) {
+        stream->io_length = (size_t) received;
+        stream->io_sent = 0;
+        stream->response_received += (size_t) received;
+        stream->last_activity = time(NULL);
+        magnus_h2_proxy_maybe_complete(stream);
+        return;
+    }
+    if (received == 0) {
+        stream->upstream_eof = true;
+        magnus_h2_proxy_maybe_complete(stream);
+        return;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+    magnus_h2_proxy_abort(stream);
+}
+
+/* Entry point for any epoll event on a proxy-dispatched stream's
+ * upstream fd -- the h2 analogue of magnus_handle_upstream(). Unlike
+ * that function, a failure here never means the *client* connection
+ * must close: only this one stream is affected (see this block's
+ * top-of-section comment), so this always returns 0 for a stream-local
+ * outcome and -1 only if pushing the resulting h2 output onto the
+ * client fd itself fails (a real client-connection-level problem,
+ * exactly like any other h2_session-wide failure magnus_h2_service()
+ * itself already treats as connection-fatal). */
+static int
+magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
+{
+    magnus_connection_t *connection = stream->connection;
+    int epoll_fd = magnus_global_epoll_fd;
+
+    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        if (stream->response_headers_submitted) magnus_h2_proxy_abort(stream);
+        else magnus_h2_proxy_connect_failed(connection, stream, "502");
+        return magnus_h2_push(epoll_fd, connection);
+    }
+    if (!stream->upstream_connected) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (getsockopt(stream->upstream_fd, SOL_SOCKET, SO_ERROR, &error,
+                       &length) < 0 || error != 0) {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return magnus_h2_push(epoll_fd, connection);
+        }
+        stream->upstream_connected = true;
+        stream->last_activity = time(NULL);
+    }
+    while (!stream->upstream_headers_sent) {
+        ssize_t sent = send(stream->upstream_fd,
+            stream->proxy_request + stream->proxy_request_sent,
+            stream->proxy_request_length - stream->proxy_request_sent,
+            MSG_NOSIGNAL);
+        if (sent > 0) {
+            stream->proxy_request_sent += (size_t) sent;
+            stream->last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        } else {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return magnus_h2_push(epoll_fd, connection);
+        }
+        if (stream->proxy_request_sent == stream->proxy_request_length)
+            stream->upstream_headers_sent = true;
+    }
+    while (stream->body_sent < stream->body_length) {
+        ssize_t sent = send(stream->upstream_fd,
+            stream->body + stream->body_sent,
+            stream->body_length - stream->body_sent, MSG_NOSIGNAL);
+        if (sent > 0) {
+            stream->body_sent += (size_t) sent;
+            stream->last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        } else {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return magnus_h2_push(epoll_fd, connection);
+        }
+    }
+    if (!stream->headers_received) {
+        if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+            if (!magnus_h2_proxy_receive_headers(connection, stream)) {
+                struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                             .data.fd = stream->upstream_fd };
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, stream->upstream_fd, &event);
+                return 0;
+            }
+        } else {
+            /* Just finished connecting and sending the request+body (this
+             * call was driven by that EPOLLOUT event, not an EPOLLIN
+             * one) -- the fd is still only armed for EPOLLOUT|EPOLLRDHUP
+             * from magnus_h2_proxy_attach_upstream(), so it must be
+             * switched to watch for the response now, exactly like
+             * magnus_handle_upstream() does for HTTP/1.1. */
+            struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                         .data.fd = stream->upstream_fd };
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, stream->upstream_fd, &event);
+            return 0;
+        }
+    } else if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+        magnus_h2_proxy_stream_response(stream);
+    }
+
+    /* Whatever just happened above may have added bytes to io_buffer (or
+     * torn the stream down entirely): wake nghttp2 up for this stream if
+     * it had gone DEFERRED, then push anything now ready onto the client
+     * fd -- nothing else will trigger that push, since this event fired
+     * on the *upstream* fd, not the client's. */
+    if (stream->deferred
+        && (stream->io_length > stream->io_sent || stream->response_complete)) {
+        stream->deferred = false;
+        (void) nghttp2_session_resume_data(connection->h2_session,
+                                           stream->stream_id);
+    }
+    return magnus_h2_push(epoll_fd, connection);
 }
 
 static char *
@@ -3063,6 +4007,44 @@ magnus_expire_proxies(int epoll_fd, time_t now)
             magnus_close_connection(epoll_fd, connection);
         }
     }
+
+    /* HTTP/2 proxy dispatch (1e-2): the same connect/read timeout budgets
+     * as the HTTP/1.1 sweep above, but there is no equivalent of
+     * magnus_connections[]'s single set of proxy_* fields to check here
+     * -- one h2 connection can have many streams each proxying
+     * concurrently, so every open stream on every h2-active connection
+     * needs its own check. */
+    for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
+        magnus_connection_t *connection = magnus_connections[fd];
+        struct magnus_h2_stream *stream;
+        bool push_needed = false;
+        if (connection == NULL || !connection->h2_active) continue;
+        for (stream = connection->h2_streams; stream != NULL;
+             stream = stream->next) {
+            if (!stream->is_proxy || stream->upstream_fd < 0) continue;
+            if (!stream->upstream_connected) {
+                if (now - stream->connect_started
+                    < MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS) continue;
+                magnus_h2_proxy_connect_failed(connection, stream, "504");
+                push_needed = true;
+            } else if (now - stream->last_activity
+                       >= MAGNUS_PROXY_READ_TIMEOUT_SECONDS) {
+                if (stream->response_headers_submitted) {
+                    magnus_h2_proxy_abort(stream);
+                } else {
+                    magnus_cluster_result(&magnus_cluster,
+                                          stream->endpoint_index, false,
+                                          magnus_now_ms());
+                    magnus_h2_proxy_fail(connection, stream, "504");
+                }
+                push_needed = true;
+            }
+        }
+        if (push_needed && magnus_h2_push(epoll_fd, connection) < 0
+            && magnus_connections[connection->fd] != NULL) {
+            magnus_close_connection(epoll_fd, connection);
+        }
+    }
 }
 
 /* Active health checking: independent of live traffic, periodically opens
@@ -3600,6 +4582,7 @@ main(int argc, char **argv)
         close(listener);
         return 1;
     }
+    magnus_global_epoll_fd = epoll_fd;
     listener_event = (struct epoll_event) { .events = EPOLLIN,
                                              .data.fd = listener };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener, &listener_event) < 0) {
@@ -3697,6 +4680,21 @@ main(int argc, char **argv)
                 if (result < 0
                     && magnus_connections[connection->fd] != NULL)
                     magnus_close_connection(epoll_fd, connection);
+                continue;
+            }
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_h2_upstream_owner[fd] != NULL) {
+                /* Unlike the HTTP/1.1 branch above, a stream-local
+                 * failure here (magnus_h2_handle_upstream() already
+                 * handles those internally) never implies the whole h2
+                 * client connection must close -- only a failure
+                 * *pushing* the result onto the client fd does, which
+                 * is exactly what a negative return here now means. */
+                struct magnus_h2_stream *stream = magnus_h2_upstream_owner[fd];
+                magnus_connection_t *owner = stream->connection;
+                if (magnus_h2_handle_upstream(stream, flags) < 0
+                    && magnus_connections[owner->fd] != NULL)
+                    magnus_close_connection(epoll_fd, owner);
                 continue;
             }
             if (fd >= 0 && fd < MAGNUS_MAX_FDS

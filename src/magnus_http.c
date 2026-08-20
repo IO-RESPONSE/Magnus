@@ -17,13 +17,9 @@ magnus_equal_ci(const char *left, size_t left_length, const char *right)
         && strncasecmp(left, right, left_length) == 0;
 }
 
-/* Finds `name=value` within a `Cookie:` header's value (";"-separated
- * pairs, optional leading space after each ";") and copies `value` into
- * `out`. Returns false if the cookie is absent or its value does not fit
- * in `out_capacity` (including the NUL terminator). */
-static bool
-magnus_extract_cookie(const char *value, size_t value_length, const char *name,
-                      char *out, size_t out_capacity)
+bool
+magnus_http_extract_cookie(const char *value, size_t value_length,
+                           const char *name, char *out, size_t out_capacity)
 {
     size_t name_length = strlen(name);
     const char *cursor = value;
@@ -143,7 +139,7 @@ magnus_http_parse(const char *data, size_t length, magnus_http_request_t *reques
         }
         if (magnus_equal_ci(cursor, name_length, "cookie")) {
             size_t value_length = (size_t) (line_end - value);
-            (void) magnus_extract_cookie(value, value_length,
+            (void) magnus_http_extract_cookie(value, value_length,
                                          MAGNUS_AFFINITY_COOKIE_NAME,
                                          request->affinity_key,
                                          sizeof(request->affinity_key));

@@ -215,17 +215,69 @@ checkpoint from the prior sub-phase being green.
      requests genuinely multiplexed over one connection — not just unit
      tests against this project's own code, matching the rigor every
      protocol-level feature this project has shipped has used.
-   - **1e-2+ — remaining.** Proxy/route dispatch over h2 (an h2 request
-     resolving through `magnus_routes[]` to a proxied upstream, not just
-     a static file); true h2-to-h1 upstream translation (most upstreams
-     still speak HTTP/1.1); h2c; GOAWAY/RST_STREAM handling and
-     Rapid-Reset-class abuse hardening (Section 306-308's own note: this
-     class of hardening is meaningless before an h2 stack exists at all,
-     so it belongs to 1e's own checkpoint, not a deferred blanket
-     "security phase"); and only then generalizing the static-file-only
-     dispatch above into the master prompt's actual common
-     HTTP/1↔HTTP/2 request model (Section 3.1) that routing/proxy code
-     can stay agnostic against.
+   - **1e-2 — proxy/route dispatch + H2↔H1 upstream translation. Shipped
+     in 1.7.0.** An h2 stream matched to `action=proxy` (or the literal
+     `/proxy` prefix) resolves through the exact same `magnus_routes[]`/
+     `magnus_route_matches()` matcher 1b wrote for HTTP/1.1, now driven
+     by a `magnus_http_request_t` filled in directly from nghttp2-decoded
+     pseudo-/regular headers instead of HTTP/1.1 wire bytes — the first
+     working slice of the master prompt's "common internal request
+     model" (Section 3.1) that reaches routing, not just static dispatch
+     (1e-1's own narrower slice). The proxied request is relayed to an
+     ordinary HTTP/1.x upstream over the *same* `magnus_cluster`/
+     `magnus_upstream_pool` and `magnus_proxy_sanitize_response_headers()`
+     hop-by-hop-stripping/framing logic every HTTP/1.1 proxy attempt
+     already used — reused, not reimplemented, so both protocols agree on
+     upstream selection, health/circuit-breaker state, and response
+     framing by construction — with the response translated into h2
+     response headers (`Connection` dropped: forbidden in h2 by RFC 9113
+     8.2.2) and DATA frames pulled through nghttp2's data-provider
+     callback (`NGHTTP2_ERR_DEFERRED`/`nghttp2_session_resume_data()`
+     while more is still expected from the upstream). Deliberately its
+     own parallel set of functions rather than a reuse of
+     `magnus_proxy_pick_and_start()`/`magnus_handle_upstream()`/etc.:
+     those assume exactly one proxy attempt in flight per client
+     *connection*, which h2's concurrent multiplexing genuinely breaks —
+     one connection can have many streams each proxying to a (possibly
+     different) upstream at once, so this proxy state lives on each
+     stream instead (`struct magnus_h2_stream`'s own request/response
+     buffers, upstream fd, and a parallel `magnus_h2_upstream_owner[]`
+     ownership table alongside the existing per-connection one).
+     Request bodies (POST/PUT/...) are buffered from DATA frames up to
+     `MAGNUS_MAX_BODY` (1 MiB, same cap the HTTP/1.1 path enforces) and
+     relayed to the upstream; session affinity (`MAGNUS_AFFINITY`
+     cookie) and the connect/read timeout sweep both work the same way
+     as HTTP/1.1, now swept per-stream. Not yet covered: h2c (cleartext
+     upgrade); GOAWAY/RST_STREAM handling and Rapid-Reset-class abuse
+     hardening (Section 306-308's own note: this class of hardening is
+     meaningless before an h2 stack exists at all, so it belongs to 1e's
+     own checkpoint, not a deferred blanket "security phase");
+     per-client-IP rate limiting and `/healthz`/`/metrics` are not wired
+     into the h2 path yet either; WebSocket-over-h2 (RFC 9113 8.5
+     extended CONNECT) is out of scope entirely, since h2 has no
+     Upgrade-style handshake for 1d's own relay to attach to. Verified
+     against real, independent HTTP/2 tooling (curl `--http2`) end to
+     end through a real HTTP/1.1 backend: GET and POST-with-body (small
+     and one spanning multiple relay-buffer chunks) both proxy correctly
+     with the upstream's own response headers (Content-Type, a custom
+     header) forwarded; HEAD; a deny route still denies; an oversized
+     body 413s instead of hanging; the connection pool is reused across
+     sequential requests (proven by the backend's own per-accept
+     connection identity coming back unchanged); 20 genuinely concurrent
+     proxied requests all come back correct with no cross-stream
+     corruption and leave no leaked fds behind; ordinary static-file
+     serving keeps working on the same connection a proxy route also
+     matches on; verified clean under `make sanitize` (ASan+UBSan)
+     against this exact live traffic, including the concurrent and
+     oversized-body cases.
+   - **1e-3+ — remaining.** h2c; GOAWAY/RST_STREAM handling and
+     Rapid-Reset-class abuse hardening; per-client-IP rate limiting and
+     `/healthz`/`/metrics` for the h2 path; response trailers;
+     WebSocket-over-h2 (extended CONNECT); and generalizing 1e-1/1e-2's
+     still-protocol-specific dispatch functions into the master prompt's
+     actual unified HTTP/1↔HTTP/2 request-model abstraction (Section
+     3.1) that routing/proxy code can stay fully agnostic against, now
+     that both a static and a proxy path exist to generalize from.
 
 Each sub-phase's own checkpoint report will name its new tests, confirm
 `make`/`make test`/`make sanitize` are green, and give the size/behavior

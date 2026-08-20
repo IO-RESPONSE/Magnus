@@ -37,10 +37,13 @@ independently by IORESPONSE.
   relays an RFC 6455 upgrade handshake and, once the upstream confirms it
   with 101, becomes a raw bidirectional byte pipe for the life of the
   connection
-- HTTP/2 (static files): TLS ALPN negotiates `"h2"` when the client
-  offers it (HTTP/1.1 otherwise, unaffected); an nghttp2-driven session
-  serves GET/HEAD static-file requests, multiplexed, over that
-  connection -- proxy/route dispatch over h2 is a future increment
+- HTTP/2: TLS ALPN negotiates `"h2"` when the client offers it (HTTP/1.1
+  otherwise, unaffected); an nghttp2-driven session multiplexes static
+  file responses and, for a request matching `action=proxy` (or `/proxy`),
+  a full reverse-proxy round trip to an HTTP/1.x upstream over the same
+  connection pool/cluster/health state HTTP/1.1 proxying uses -- request
+  bodies included, translated to/from h2 DATA frames. h2c and per-h2
+  rate limiting/`/healthz`/`/metrics` are future increments
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP
@@ -62,7 +65,7 @@ independently by IORESPONSE.
 - Verified clean under ASan+UBSan across the full test suite (`make
   sanitize`), and against a 4M-iteration mutation fuzz run of the HTTP
   parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
-- Container image: 9,304,883 bytes (~8.87 MiB), non-root, read-only rootfs
+- Container image: 9,309,993 bytes (~8.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

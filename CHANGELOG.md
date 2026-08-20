@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.7.0
+
+### Added
+
+- **HTTP/2 proxy dispatch + H2↔H1 upstream translation** (roadmap Phase
+  1e-2). An h2 stream matched to `action=proxy` (or the literal `/proxy`
+  prefix) now resolves through the exact same route matcher HTTP/1.1
+  uses and is relayed to an ordinary HTTP/1.x upstream over the same
+  connection pool/cluster/health-check state every HTTP/1.1 proxy
+  attempt already shares -- the response is translated into h2 response
+  headers and DATA frames (streamed via nghttp2's data-provider
+  callback, not buffered whole) rather than raw bytes. Request bodies
+  (POST/PUT/...) are buffered from DATA frames up to the same 1 MiB cap
+  the HTTP/1.1 path enforces and relayed to the upstream; session
+  affinity (the `MAGNUS_AFFINITY` cookie) and the connect/read timeout
+  budgets both work the same way as HTTP/1.1, now applied per h2 stream
+  rather than per connection -- necessary since one h2 connection can
+  have many streams each proxying to a (possibly different) upstream
+  concurrently, unlike HTTP/1.1's one-attempt-at-a-time model. GET/HEAD
+  and now any other method with a body; still no h2c (cleartext
+  upgrade); GOAWAY/RST_STREAM handling, Rapid-Reset-class hardening,
+  per-client-IP rate limiting, and `/healthz`/`/metrics` for the h2 path
+  are not wired in yet -- see docs/development-roadmap.md's 1e entry for
+  what remains.
+- `magnus_http_extract_cookie()` (`magnus_http.h`/`.c`) is now a public
+  helper rather than a `magnus_http_parse()`-internal static function,
+  so h2 request handling (which never goes through
+  `magnus_http_parse()`'s wire-format parsing at all) can extract the
+  `MAGNUS_AFFINITY` cookie value the same way HTTP/1.1 does, rather than
+  a second, potentially-divergent implementation.
+
+Verified end-to-end against real, independent HTTP/2 tooling (curl
+`--http2`) through a real HTTP/1.1 backend, not just this project's own
+code: GET and POST-with-body (small and one spanning multiple
+relay-buffer chunks) both proxy correctly with the upstream's own
+response headers (Content-Type, a custom header) forwarded; HEAD; a
+deny route still denies over h2; an oversized body 413s instead of
+hanging; the connection pool is reused across sequential requests
+(proven by the backend's own per-accept connection identity coming back
+unchanged); 20 genuinely concurrent proxied requests all come back
+correct with no cross-stream corruption and leave no leaked fds behind;
+ordinary static-file serving (1e-1) keeps working on the same connection
+a proxy route also matches on. Along the way, found and fixed a real bug
+during this verification: after a proxy-dispatched stream's upstream
+connect completed and its request+body were sent (all driven by that
+one `EPOLLOUT` event), the upstream fd was left armed for `EPOLLOUT`
+only -- nothing ever re-armed it for `EPOLLIN`, so the response could
+never be noticed until the periodic timeout sweep gave up on it 10
+seconds later (every request "succeeded" but via a 504, not the actual
+response). Root-caused by comparing against `magnus_handle_upstream()`'s
+own HTTP/1.1 equivalent, which does re-arm in this exact spot; fixed by
+doing the same. `make clean && make test` and `make sanitize` both green
+(the sanitized build itself served the same live curl traffic above,
+including the concurrent and oversized-body cases, without either
+sanitizer tripping). Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.6.0
 
 ### Added

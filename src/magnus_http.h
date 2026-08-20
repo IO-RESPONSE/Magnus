@@ -51,6 +51,19 @@ typedef struct {
 const char *magnus_http_header_find(const magnus_http_request_t *request,
                                     const char *name);
 
+/* Finds `name=value` within a `Cookie:` header's value (";"-separated
+ * pairs, optional leading space after each ";") and copies `value` into
+ * `out`. Returns false if the cookie is absent or its value does not fit
+ * in `out_capacity` (including the NUL terminator). Exposed (not just
+ * magnus_http_parse()'s own internal use for the MAGNUS_AFFINITY cookie)
+ * so an HTTP/2 request -- which never goes through magnus_http_parse()'s
+ * wire-format parsing at all, since it arrives as nghttp2-decoded
+ * pseudo-/regular headers instead -- can extract the same cookie the same
+ * way, rather than a second, potentially-divergent implementation. */
+bool magnus_http_extract_cookie(const char *value, size_t value_length,
+                                const char *name, char *out,
+                                size_t out_capacity);
+
 typedef enum {
     MAGNUS_HTTP_OK = 0,
     MAGNUS_HTTP_BAD_REQUEST,

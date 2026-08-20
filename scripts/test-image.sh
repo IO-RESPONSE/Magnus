@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image=${MAGNUS_IMAGE:-ioresponse/magnus:1.6.0}
+image=${MAGNUS_IMAGE:-ioresponse/magnus:1.7.0}
 name=magnus-image-test
 
 cleanup() {
