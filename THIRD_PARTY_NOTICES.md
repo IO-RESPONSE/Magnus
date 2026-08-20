@@ -15,7 +15,8 @@ distributions:
 
 - Upstream: https://zlib.net
 - License: zlib License
-- Used for: transitive dependency of the TLS stack (`libz`)
+- Used for: gzip static-response compression and as a TLS-stack dependency
+  (`libz`)
 
 ## Zstandard
 

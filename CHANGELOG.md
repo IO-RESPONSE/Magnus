@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.11.0
+
+### Added
+
+- **Negotiated gzip compression for static files over HTTP/1.1 and HTTP/2.**
+  Clients offering a comma-delimited `gzip` token in `Accept-Encoding` now
+  receive compressible MIME types with `Content-Encoding: gzip`, `Vary:
+  Accept-Encoding`, and the exact compressed `Content-Length`. The same zlib
+  gzip-wrapper implementation serves both protocols; clients that do not
+  offer gzip and binary formats such as PNG/JPEG remain byte-for-byte on the
+  previous path.
+- Compression is deliberately bounded to files from 256 bytes through 8 MiB.
+  This avoids gzip overhead on tiny bodies and caps per-response memory/CPU:
+  bounded files are fully compressed before headers are emitted, while larger
+  files keep streaming unchanged. A compressed plain-HTTP response uses a
+  buffered socket write because transformed bytes cannot use zero-copy
+  `sendfile`; every uncompressed plain-HTTP response retains `sendfile`.
+  This increment is static-files-only and gzip-only. Proxied-response
+  compression, streaming/chunked compression for larger files, Brotli, and
+  zstd are explicitly deferred.
+- New `tests/fuzz-compression.c`: `magnus_accepts_gzip()` parses the
+  client-supplied `Accept-Encoding` header directly, so it gets the same
+  mutation-based fuzz harness (200k iterations in `make test`, 4M+ verified
+  separately across two seeds) every other new parser of untrusted bytes in
+  this project already gets, matching the standing rule
+  `magnus_base64.c`'s own fuzz harness (1.10.0) followed.
+- The HTTP/2 static-compressed-body data-provider callback reuses the
+  existing `magnus_h2_read_io_buffer()` (already serving `/healthz`/
+  `/metrics`, 1.9.0) rather than a near-duplicate sibling -- setting
+  `stream->response_complete = true` before submitting is all a
+  fully-buffered, synchronously-ready body like this ever needed.
+
+Verified with an assert-based zlib round-trip unit test covering empty,
+threshold-sized, and multi-call-sized inputs, plus permanent HTTP/1.1 and
+HTTP/2 regressions using curl's independent `--compressed` decoder. Coverage
+also confirms requests without gzip stay plain, PNG stays uncompressed, and a
+raw gzip response decodes byte-exact through `gzip -dc`. Independently
+re-verified end to end against the exact 256-byte/8-MiB boundary (255 vs.
+256 vs. 257 bytes), a real HTTP/2 request, 30 concurrent compressed
+requests, and a HEAD request (compressed `Content-Length`, no body) --
+`make sanitize` (ASan+UBSan) clean against all of it with no fd or memory
+leaks. `make clean && make test` and `make sanitize` both green. Image
+rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.10.0
 
 ### Added

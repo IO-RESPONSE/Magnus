@@ -1733,3 +1733,58 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# Static response gzip: the same bounded, pre-compressed representation is
+# negotiated independently for HTTP/1.1 and HTTP/2. Binary types and clients
+# that do not offer gzip remain on their existing paths.
+port_compression=$((port + 48))
+compression_root="$web_root/compression"
+mkdir -p "$compression_root"
+for line in $(seq 1 200); do
+  printf '<p>Magnus compression regression line %s</p>\n' "$line"
+done >"$compression_root/page.html"
+printf '\211PNG\r\n\032\nnot-really-an-image-but-a-binary-mime-type\n' \
+  >"$compression_root/image.png"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/compression-server.key" \
+  -out "$web_root/compression-server.crt" >/dev/null 2>&1
+"$binary" --port "$port_compression" --root "$compression_root" \
+  --tls-cert "$web_root/compression-server.crt" \
+  --tls-key "$web_root/compression-server.key" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --insecure --fail --silent \
+    "https://127.0.0.1:$port_compression/healthz" >/dev/null && break
+  sleep 1
+done
+
+for protocol in --http1.1 --http2; do
+  plain_headers="$web_root/plain-${protocol#--}.headers"
+  gzip_headers="$web_root/gzip-${protocol#--}.headers"
+  decoded_body="$web_root/decoded-${protocol#--}.html"
+  curl "$protocol" --insecure --fail --silent --dump-header "$plain_headers" \
+    --output "$decoded_body" \
+    "https://127.0.0.1:$port_compression/page.html"
+  ! grep -qi '^content-encoding: gzip' "$plain_headers"
+  cmp "$compression_root/page.html" "$decoded_body"
+
+  curl "$protocol" --insecure --fail --silent --compressed \
+    --dump-header "$gzip_headers" --output "$decoded_body" \
+    "https://127.0.0.1:$port_compression/page.html"
+  grep -qi '^content-encoding: gzip' "$gzip_headers"
+  grep -qi '^vary: Accept-Encoding' "$gzip_headers"
+  cmp "$compression_root/page.html" "$decoded_body"
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+    --dump-header "$gzip_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compression/image.png"
+  ! grep -qi '^content-encoding: gzip' "$gzip_headers"
+done
+
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  "https://127.0.0.1:$port_compression/page.html" \
+  | gzip -dc | cmp "$compression_root/page.html" -
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=

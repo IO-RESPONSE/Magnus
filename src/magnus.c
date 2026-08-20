@@ -1,6 +1,7 @@
 #include "magnus_phase.h"
 #include "magnus_base64.h"
 #include "magnus_config.h"
+#include "magnus_compression.h"
 #include "magnus_http.h"
 #include "magnus_policy.h"
 #include "magnus_dns.h"
@@ -136,6 +137,9 @@ typedef struct {
     char *file_buffer;
     size_t file_buffer_length;
     size_t file_buffer_sent;
+    unsigned char *compressed_body;
+    size_t compressed_body_length;
+    size_t compressed_body_sent;
     int upstream_fd;
     bool proxy_active;
     bool proxy_connected;
@@ -762,6 +766,7 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     if (connection->tls != NULL) SSL_free(connection->tls);
     free(connection->input);
     free(connection->file_buffer);
+    free(connection->compressed_body);
     free(connection->proxy_buffer);
     free(connection->proxy_header_out);
     free(connection->ws_buffer);
@@ -1907,6 +1912,43 @@ magnus_content_type(const char *path)
     return "application/octet-stream";
 }
 
+/* The first compression increment buffers bounded static files completely so
+ * both protocols can send an exact compressed Content-Length. Files outside
+ * the 256-byte..8-MiB window retain their existing streaming path. */
+static int
+magnus_compress_static(int fd, const struct stat *metadata,
+                       const magnus_http_request_t *request,
+                       const char *content_type, unsigned char **output,
+                       size_t *output_length)
+{
+    unsigned char *input;
+    size_t length;
+    size_t offset = 0;
+    if (metadata->st_size < MAGNUS_COMPRESSION_MIN_SIZE
+        || metadata->st_size > MAGNUS_COMPRESSION_MAX_SIZE
+        || !magnus_content_type_compressible(content_type)
+        || !magnus_accepts_gzip(
+            magnus_http_header_find(request, "accept-encoding"))) return 0;
+    length = (size_t) metadata->st_size;
+    input = malloc(length);
+    if (input == NULL) return 0;
+    while (offset < length) {
+        ssize_t got = pread(fd, input + offset, length - offset, (off_t) offset);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            free(input);
+            return 0;
+        }
+        offset += (size_t) got;
+    }
+    if (magnus_gzip_compress(input, length, output, output_length) != 0) {
+        free(input);
+        return 0;
+    }
+    free(input);
+    return 1;
+}
+
 static int
 magnus_open_static(const char *target, struct stat *metadata)
 {
@@ -1952,21 +1994,33 @@ magnus_open_static(const char *target, struct stat *metadata)
 static void
 magnus_prepare_file_response(magnus_connection_t *connection, int file_fd,
                              const struct stat *metadata, bool head_only,
-                             bool close_connection, magnus_request_t *request)
+                             bool close_connection, magnus_request_t *request,
+                             const magnus_http_request_t *parsed)
 {
     int written;
+    const char *content_type = magnus_content_type(request->path);
+    unsigned char *compressed = NULL;
+    size_t compressed_length = 0;
+    bool use_gzip = magnus_compress_static(file_fd, metadata, parsed,
+                                           content_type, &compressed,
+                                           &compressed_length) == 1;
+    long long response_length = use_gzip
+        ? (long long) compressed_length : (long long) metadata->st_size;
     request->status = 200;
     magnus_requests_total++;
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_RESPONSE, request);
     written = snprintf(connection->output, sizeof(connection->output),
         "HTTP/1.1 200 OK\r\nServer: Magnus/%s\r\nContent-Type: %s\r\n"
-        "Content-Length: %lld\r\nConnection: %s\r\nAccept-Ranges: bytes\r\n"
+        "Content-Length: %lld\r\n%s%sConnection: %s\r\nAccept-Ranges: bytes\r\n"
         "X-Magnus-Engine: native-c17/0.1\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-        MAGNUS_VERSION, magnus_content_type(request->path),
-        (long long) metadata->st_size, close_connection ? "close" : "keep-alive",
+        MAGNUS_VERSION, content_type, response_length,
+        use_gzip ? "Content-Encoding: gzip\r\n" : "",
+        use_gzip ? "Vary: Accept-Encoding\r\n" : "",
+        close_connection ? "close" : "keep-alive",
         request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->output)) {
         close(file_fd);
+        free(compressed);
         connection->output_length = 0;
         connection->close_after_write = true;
         return;
@@ -1974,10 +2028,21 @@ magnus_prepare_file_response(magnus_connection_t *connection, int file_fd,
     connection->output_length = (size_t) written;
     connection->output_sent = 0;
     connection->close_after_write = close_connection;
-    connection->file_fd = head_only ? -1 : file_fd;
+    connection->file_fd = (head_only || use_gzip) ? -1 : file_fd;
     connection->file_offset = 0;
     connection->file_length = head_only ? 0 : metadata->st_size;
-    if (head_only) close(file_fd);
+    if (use_gzip) {
+        close(file_fd);
+        if (head_only) {
+            free(compressed);
+        } else {
+            connection->compressed_body = compressed;
+            connection->compressed_body_length = compressed_length;
+            connection->compressed_body_sent = 0;
+        }
+    } else if (head_only) {
+        close(file_fd);
+    }
 }
 
 static int
@@ -2222,6 +2287,27 @@ magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
     return got;
 }
 
+static nghttp2_ssize
+magnus_h2_read_static_buffer(nghttp2_session *session, int32_t stream_id,
+                             uint8_t *buf, size_t length,
+                             uint32_t *data_flags,
+                             nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    size_t remaining = stream->io_length - stream->io_sent;
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    if (length > remaining) length = remaining;
+    if (length > 0) {
+        memcpy(buf, stream->io_buffer + stream->io_sent, length);
+        stream->io_sent += length;
+    }
+    if (stream->io_sent == stream->io_length)
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return (nghttp2_ssize) length;
+}
+
 /* Serves stream->parsed.target as a static file, exactly like the
  * HTTP/1.1 GET path (magnus_open_static() + magnus_content_type(), same
  * helpers) -- reused rather than reimplemented so both protocols agree
@@ -2236,7 +2322,12 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     struct stat metadata;
     int fd;
     char content_length[32];
-    nghttp2_nv headers[4];
+    nghttp2_nv headers[6];
+    size_t header_count = 4;
+    const char *content_type;
+    unsigned char *compressed = NULL;
+    size_t compressed_length = 0;
+    bool use_gzip;
 
     fd = magnus_open_static(stream->parsed.target, &metadata);
     if (fd < 0) {
@@ -2244,29 +2335,46 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
         return;
     }
     stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
+    content_type = magnus_content_type(stream->parsed.target);
+    use_gzip = magnus_compress_static(fd, &metadata, &stream->parsed,
+                                      content_type, &compressed,
+                                      &compressed_length) == 1;
     stream->file_offset = 0;
-    stream->file_length = metadata.st_size;
+    stream->file_length = use_gzip ? (off_t) compressed_length : metadata.st_size;
     snprintf(content_length, sizeof(content_length), "%lld",
-            (long long) metadata.st_size);
+            (long long) stream->file_length);
     headers[0] = magnus_h2_nv(":status", "200");
     headers[1] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
-    headers[2] = magnus_h2_nv("content-type",
-                              magnus_content_type(stream->parsed.target));
+    headers[2] = magnus_h2_nv("content-type", content_type);
     headers[3] = magnus_h2_nv("content-length", content_length);
+    if (use_gzip) {
+        headers[4] = magnus_h2_nv("content-encoding", "gzip");
+        headers[5] = magnus_h2_nv("vary", "Accept-Encoding");
+        header_count = 6;
+    }
     if (stream->head_only) {
         close(fd);
-        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
-                                        NULL);
+        free(compressed);
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers,
+                                        header_count, NULL);
         return;
     }
-    stream->file_fd = fd;
+    if (use_gzip) {
+        close(fd);
+        stream->io_buffer = (char *) compressed;
+        stream->io_length = compressed_length;
+        stream->io_sent = 0;
+    } else {
+        stream->file_fd = fd;
+    }
     {
         nghttp2_data_provider2 data_provider = {
             .source = { .ptr = stream },
-            .read_callback = magnus_h2_read_file,
+            .read_callback = use_gzip ? magnus_h2_read_static_buffer
+                                      : magnus_h2_read_file,
         };
-        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
-                                        &data_provider);
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers,
+                                        header_count, &data_provider);
     }
 }
 
@@ -3739,7 +3847,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         int file_fd = magnus_open_static(request.path, &metadata);
         if (file_fd >= 0)
             magnus_prepare_file_response(connection, file_fd, &metadata,
-                                         head_only, close_connection, &request);
+                                         head_only, close_connection, &request,
+                                         parsed);
         else
             magnus_prepare_response(connection, 404, "Not Found", "text/plain",
                                     "not found\n", head_only, close_connection,
@@ -4207,6 +4316,22 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
         }
         return -1;
     }
+    while (connection->compressed_body_sent
+           < connection->compressed_body_length) {
+        sent = magnus_socket_write(connection,
+            connection->compressed_body + connection->compressed_body_sent,
+            connection->compressed_body_length
+                - connection->compressed_body_sent);
+        if (sent > 0) {
+            connection->compressed_body_sent += (size_t) sent;
+            magnus_bytes_sent += (uint64_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
     while (connection->tls == NULL && connection->file_fd >= 0
            && connection->file_offset < connection->file_length) {
         sent = sendfile(connection->fd, connection->file_fd,
@@ -4252,6 +4377,10 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
         close(connection->file_fd);
         connection->file_fd = -1;
     }
+    free(connection->compressed_body);
+    connection->compressed_body = NULL;
+    connection->compressed_body_length = 0;
+    connection->compressed_body_sent = 0;
     if (connection->close_after_write) {
         return -1;
     }

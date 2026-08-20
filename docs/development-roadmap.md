@@ -433,6 +433,16 @@ connection-pool and common-request-model decisions).
   PROXY protocol trust) is small and self-contained; doing it early despite
   being listed in Phase 2 is worth reconsidering since ACL/rate-limit
   correctness downstream depends on it.
+  - **Compression 2a — static-file gzip. Implemented for review on
+    `feature/response-compression`.** HTTP/1.1 and
+    HTTP/2 negotiate gzip through a bounded `Accept-Encoding` token scan for
+    compressible MIME types. Files from 256 bytes through 8 MiB are buffered
+    and compressed completely, allowing an exact compressed Content-Length;
+    compressed plain-HTTP responses therefore use the buffered write path
+    while every uncompressed response retains zero-copy `sendfile`. `Vary:
+    Accept-Encoding` prevents a future cache from mixing representations.
+    Proxied-response compression, Brotli/zstd, and streaming/chunked
+    compression for files above 8 MiB remain separate future increments.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section
@@ -483,7 +493,7 @@ what each Phase 1 sub-phase actually needs to not make `magnus.c` worse:
 |---|---|---|---|
 | HTTP/2 (1e) | nghttp2 (C, widely deployed, HPACK included) | MIT | Hand-rolling HPACK is explicitly the kind of thing this roadmap avoids (Section 4's own CVE-history warning); evaluate binary size / static-link footprint against the current ~9 MiB image budget before committing |
 | HTTP/3 (Phase 4) | ngtcp2+nghttp3, or quiche (Rust, violates Section 2.2's "don't bring in another language's runtime" unless it's a leaf dependency with a C ABI, evaluate accordingly), or defer entirely if the size/complexity trade-off fails Section 2.4's memory-safety bar | varies | Explicitly deferred to Phase 4's own dependency review; not decided here |
-| Compression (Phase 2) | zlib (gzip, already a near-universal system dependency), brotli, zstd | zlib/MIT/BSD | Start with gzip only per Section 4.2's "최소" wording; add brotli/zstd only once the gzip path's CPU-exhaustion guard (Section 4.3) is proven |
+| Compression (Phase 2) | zlib (gzip, direct dependency in the review branch), brotli, zstd | zlib/MIT/BSD | Static-file gzip is implemented with 256-byte/8-MiB CPU and memory bounds; proxied streaming and brotli/zstd remain deferred |
 | DNS (1c) | `getaddrinfo_a` (glibc, no new dependency) vs. a minimal vendored async resolver | n/a / varies | Prefer no new dependency unless `getaddrinfo_a`'s behavior (thread-pool based, not epoll-native) proves unworkable under load in 1c's own benchmark step |
 
 Every dependency actually adopted gets its license, maintenance status, and

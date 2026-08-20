@@ -2,12 +2,12 @@ CC ?= cc
 CFLAGS ?= -O2 -pipe -std=c17 -Wall -Wextra -Werror -Wpedantic
 CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
-LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2
+LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz
 
-SOURCES := src/magnus.c src/magnus_base64.c src/magnus_config.c src/magnus_dns.c \
-           src/magnus_h2.c src/magnus_http.c src/magnus_phase.c \
-           src/magnus_policy.c src/magnus_proxy.c src/magnus_route.c \
-           src/magnus_ws.c
+SOURCES := src/magnus.c src/magnus_base64.c src/magnus_compression.c \
+           src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
+           src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
+           src/magnus_proxy.c src/magnus_route.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -62,8 +62,9 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
-		build/test-base64 build/fuzz-http build/fuzz-route build/fuzz-ws \
-		build/fuzz-h2 build/fuzz-base64
+		build/test-base64 build/test-compression build/fuzz-http \
+		build/fuzz-route build/fuzz-ws build/fuzz-h2 build/fuzz-base64 \
+		build/fuzz-compression
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
@@ -73,11 +74,13 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-ws
 	./build/test-h2
 	./build/test-base64
+	./build/test-compression
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
 	./build/fuzz-h2
 	./build/fuzz-base64
+	./build/fuzz-compression
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -145,6 +148,18 @@ build/test-base64: tests/test-base64.c src/magnus_base64.c src/magnus_base64.h
 build/fuzz-base64: tests/fuzz-base64.c src/magnus_base64.c src/magnus_base64.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-base64.c src/magnus_base64.c -o $@
+
+build/test-compression: tests/test-compression.c src/magnus_compression.c \
+		src/magnus_compression.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-compression.c \
+		src/magnus_compression.c -lz -o $@
+
+build/fuzz-compression: tests/fuzz-compression.c src/magnus_compression.c \
+		src/magnus_compression.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-compression.c \
+		src/magnus_compression.c -lz -o $@
 
 clean:
 	rm -rf build

@@ -11,6 +11,8 @@ independently by IORESPONSE.
   server runtime
 - Strict HTTP/1.0/1.1 parser, keep-alive, 8KiB request cap
 - Safe document root, MIME/HEAD, zero-copy `sendfile` static delivery
+- Negotiated gzip compression for 256-byte through 8 MiB compressible static
+  files over HTTP/1.1 and HTTP/2; other responses retain their streaming path
 - Structured access log keyed by request ID
 - Native phase API: ingress → route → response → log
 - Per-request 128-bit trace ID, health endpoint, explicit error responses
