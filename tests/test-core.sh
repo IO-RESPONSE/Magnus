@@ -1924,6 +1924,8 @@ port_grpc=$((port + 51))
 port_grpc_bad=$((port + 52))
 port_grpc_stream_fake_upstream=$((port + 53))
 port_grpc_stream=$((port + 54))
+port_grpc_slow_fake_upstream=$((port + 55))
+port_grpc_slow=$((port + 56))
 
 python3 - "$port_grpc_fake_upstream" >"$web_root/grpc-fake-upstream.log" 2>&1 <<'PYEOF' &
 import socket
@@ -2244,6 +2246,190 @@ gap = arrivals[1] - arrivals[0]
 # (gap near zero) regardless of the upstream's own timing.
 assert gap > 0.1, "response chunks arrived back-to-back, not streamed incrementally: gap=%r" % gap
 print("grpc: response streaming gap=%.3fs (incremental, not buffered)" % gap)
+PYEOF
+
+kill -TERM "$backend4_pid" 2>/dev/null
+wait "$backend4_pid" 2>/dev/null || true
+backend4_pid=
+kill -TERM "$backend3_pid" 2>/dev/null
+wait "$backend3_pid" 2>/dev/null || true
+backend3_pid=
+
+# grpc-timeout deadline propagation (roadmap 2c-3): the upstream leg
+# takes 3 real seconds to answer at all; a raw socket client (no
+# grpc-python, no client-side timer of its own -- see this block's own
+# comment on why that matters) sends grpc-timeout: 500m and asserts a
+# response arrives well under 3s, proving magnus's own periodic sweep
+# (magnus_expire_proxies()) enforced the client-supplied deadline rather
+# than ever waiting on the (much later) upstream response. The deeper
+# semantic content (a real client library decoding the response as
+# DEADLINE_EXCEEDED, and an ample timeout letting the same slow-but-
+# within-budget RPC succeed normally) was verified live against a real
+# grpcio client, not part of this permanent suite, per the same
+# no-new-pip-dependency precedent 2c-1 already established.
+python3 - "$port_grpc_slow_fake_upstream" >"$web_root/grpc-slow-fake-upstream.log" 2>&1 <<'PYEOF' &
+import socket
+import sys
+import threading
+import time
+
+PORT = int(sys.argv[1])
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+def read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("peer closed early")
+        data += chunk
+    return data
+
+
+def handle(conn):
+    read_exact(conn, len(PREFACE))
+    stream_id = None
+    end_stream_seen = False
+    while not end_stream_seen:
+        header = read_exact(conn, 9)
+        length = (header[0] << 16) | (header[1] << 8) | header[2]
+        frame_type = header[3]
+        flags = header[4]
+        sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
+        read_exact(conn, length) if length else b""
+        if frame_type == 0x1:
+            stream_id = sid
+            if flags & 0x1:
+                end_stream_seen = True
+        elif frame_type == 0x0:
+            if flags & 0x1:
+                end_stream_seen = True
+
+    conn.sendall(frame(0x4, 0x0, 0))
+    conn.sendall(frame(0x4, 0x1, 0))
+    time.sleep(3.0)
+    try:
+        resp_headers = build_headers_block([
+            (":status", "200"), ("content-type", "application/grpc"),
+        ])
+        conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))
+        payload = b"too-late"
+        grpc_frame = bytes([0]) + len(payload).to_bytes(4, "big") + payload
+        conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))
+        trailer = build_headers_block([("grpc-status", "0"), ("grpc-message", "")])
+        conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))
+    except OSError:
+        pass  # client (magnus) already gave up and closed -- expected
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT))
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+backend3_pid=$!
+sleep 1
+
+"$binary" --port "$port_grpc_slow" \
+  --grpc-upstream "127.0.0.1:$port_grpc_slow_fake_upstream" \
+  --route "path_prefix=/; action=grpc" 2>>"$log" &
+backend4_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_grpc_slow/healthz" >/dev/null && break
+  sleep 1
+done
+
+python3 - "$port_grpc_slow" <<'PYEOF'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+def read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        assert chunk, "connection closed early"
+        data += chunk
+    return data
+
+
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(PREFACE)
+s.sendall(frame(0x4, 0x0, 0))
+req_headers = build_headers_block([
+    (":method", "POST"), (":scheme", "http"), (":authority", "x"),
+    (":path", "/slow.Test/Wait"), ("te", "trailers"),
+    ("content-type", "application/grpc"), ("grpc-timeout", "500m"),
+])
+s.sendall(frame(0x1, 0x4 | 0x1, 1, req_headers))
+
+start = time.monotonic()
+# Read frames (ignoring the two SETTINGS-shaped ones nghttp2 sends first)
+# until something HEADERS/RST_STREAM-shaped for our stream arrives.
+while True:
+    header = read_exact(s, 9)
+    length = (header[0] << 16) | (header[1] << 8) | header[2]
+    frame_type = header[3]
+    read_exact(s, length) if length else b""
+    if frame_type in (0x1, 0x3):  # HEADERS or RST_STREAM
+        break
+
+elapsed = time.monotonic() - start
+print("grpc: deadline response at t=%.3fs (upstream answers at 3.0s)" % elapsed)
+assert elapsed < 2.0, (
+    "response took %.3fs -- grpc-timeout: 500m was not enforced by magnus's "
+    "own sweep (it waited for the slow upstream instead)" % elapsed)
 PYEOF
 
 kill -TERM "$backend4_pid" 2>/dev/null

@@ -472,10 +472,16 @@ connection-pool and common-request-model decisions).
       incremental delivery. See `CHANGELOG.md` 1.14.0 for the full
       detail, including a real h2c (1e-5) regression this increment's
       own dispatch-timing change caused and fixed along the way.
-    - **2c-3 — `grpc-timeout` deadline propagation.** Parses the request
-      header into an absolute deadline and applies it as this stream's
-      own connect/read timeout budget, extending the existing proxy
-      timeout sweep.
+    - **2c-3 — `grpc-timeout` deadline propagation. Shipped in 1.15.0.**
+      Parses the request header into an absolute deadline (clamped to a
+      new `MAGNUS_GRPC_MAX_TIMEOUT_MS`, 5 minutes) that replaces this
+      stream's own connect/read timeout budget in the existing
+      `magnus_expire_proxies()` sweep when present, falling back to the
+      pre-existing default budget unchanged otherwise. Verified against
+      a real `grpcio` client raising `DEADLINE_EXCEEDED` correctly, plus
+      a raw socket client with no client-side timer of its own proving
+      magnus's own server-side sweep is what enforces it. See
+      `CHANGELOG.md` 1.15.0 for the full detail.
     - **2c-4 — gRPC-aware routing/observability polish.** Route matching
       on `content-type: application/grpc` (or a `grpc_service=<name>`
       condition parsed from `:path`) as an alternative to requiring an

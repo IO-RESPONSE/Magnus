@@ -87,7 +87,11 @@ independently by IORESPONSE.
   response (including a total gateway failure) carries `:status 200`,
   with `grpc-status` conveying the real outcome. An HTTP/1.1 request
   against an `action=grpc` route gets an explicit `505`, never a silent
-  proxy/static fallback
+  proxy/static fallback. A client's own `grpc-timeout` request header is
+  propagated into an absolute deadline (clamped to 5 minutes) that
+  replaces the stream's default connect/read timeout budget; exceeding
+  it answers `grpc-status: 4` (DEADLINE_EXCEEDED) rather than waiting on
+  a slow or stuck upstream indefinitely
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

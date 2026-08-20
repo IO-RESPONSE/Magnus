@@ -36,7 +36,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.14.0"
+#define MAGNUS_VERSION "1.15.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -57,6 +57,16 @@
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_PROXY_MAX_ATTEMPTS 2
+/* gRPC deadline propagation (roadmap 2c-3): an explicit upper bound on
+ * how far a client-supplied grpc-timeout may extend a stream's
+ * connect/read budget past the default MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/
+ * MAGNUS_PROXY_READ_TIMEOUT_SECONDS -- every new resource this codebase
+ * introduces gets one (see e.g. MAGNUS_MAX_BODY), and an unbounded
+ * client-claimed deadline would otherwise let one request hold an
+ * upstream connection (and this stream's memory) open indefinitely. Five
+ * minutes is generous for a real streaming RPC while still being a world
+ * away from "unbounded." */
+#define MAGNUS_GRPC_MAX_TIMEOUT_MS (5 * 60 * 1000)
 #define MAGNUS_HEALTH_CHECK_INTERVAL_SECONDS 5
 #define MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS 2
 #define MAGNUS_CLUSTER_FAILURE_THRESHOLD 3
@@ -2274,6 +2284,18 @@ struct magnus_h2_stream {
     unsigned char *grpc_output;
     size_t grpc_output_length;
     size_t grpc_output_sent;
+    /* Deadline propagation (roadmap 2c-3): an absolute magnus_now_ms()
+     * deadline parsed from the client's own "grpc-timeout" request
+     * header (magnus_grpc_parse_timeout()), clamped to
+     * MAGNUS_GRPC_MAX_TIMEOUT_MS -- 0 means the client sent no
+     * grpc-timeout at all (or a malformed one), in which case this
+     * stream falls back to the same default MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/
+     * MAGNUS_PROXY_READ_TIMEOUT_SECONDS budget every other proxy/gRPC
+     * stream already gets (see magnus_expire_proxies()). Set exactly
+     * once, in magnus_h2_grpc_start(), and never recomputed across a
+     * connect retry to a different endpoint -- it is the deadline for
+     * the *whole* RPC as the client defined it, not a per-attempt one. */
+    uint64_t grpc_deadline_ms;
     /* True if magnus_h2_grpc_read_request_body() last returned
      * NGHTTP2_ERR_DEFERRED because it caught up with everything the
      * client has sent so far and request_end_stream_seen was not yet
@@ -3905,6 +3927,44 @@ magnus_grpc_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
                      &out->sin_addr) == 1;
 }
 
+/* Parses a gRPC "grpc-timeout" request header value -- 1 to 8 ASCII
+ * decimal digits followed by exactly one unit character (H/M/S hours/
+ * minutes/seconds, m/u/n milli-/micro-/nanoseconds -- the full set the
+ * gRPC-over-HTTP/2 wire spec defines) -- into a millisecond duration.
+ * Returns false (leaving *out_ms untouched) for anything that does not
+ * match that shape exactly, including empty, digit-only, unit-only, too
+ * many digits, or an unrecognized unit -- a malformed grpc-timeout is
+ * simply treated as though the header had been absent (see
+ * magnus_h2_grpc_start()'s own comment), not itself an error worth
+ * rejecting the request over. A sub-millisecond result (a client asking
+ * for e.g. "1n") is rounded up to 1ms rather than 0, since 0 is reserved
+ * on the struct field to mean "no deadline at all." */
+static bool
+magnus_grpc_parse_timeout(const char *value, uint64_t *out_ms)
+{
+    char *end;
+    unsigned long digits;
+    double ms;
+    size_t value_length = strlen(value);
+    if (value_length < 2 || value_length > 9) return false;
+    errno = 0;
+    digits = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || (size_t) (end - value) > 8) return false;
+    if ((size_t) (end - value) != value_length - 1) return false;
+    switch (*end) {
+        case 'H': ms = (double) digits * 3600000.0; break;
+        case 'M': ms = (double) digits * 60000.0; break;
+        case 'S': ms = (double) digits * 1000.0; break;
+        case 'm': ms = (double) digits; break;
+        case 'u': ms = (double) digits / 1000.0; break;
+        case 'n': ms = (double) digits / 1000000.0; break;
+        default: return false;
+    }
+    if (ms < 1.0) ms = 1.0;
+    *out_ms = (uint64_t) ms;
+    return true;
+}
+
 /* Submits a "Trailers-Only" gRPC error response directly to the real
  * client -- :status 200 (see this block's own top comment on why),
  * content-type: application/grpc, grpc-status/grpc-message, and no body
@@ -4523,6 +4583,8 @@ static void
 magnus_h2_grpc_start(magnus_connection_t *connection,
                      struct magnus_h2_stream *stream)
 {
+    const char *timeout_header;
+
     magnus_generate_token(stream->request_id);
     strncpy(stream->log_method, stream->parsed.method,
            sizeof(stream->log_method) - 1);
@@ -4532,6 +4594,22 @@ magnus_h2_grpc_start(magnus_connection_t *connection,
     stream->log_target[sizeof(stream->log_target) - 1] = '\0';
     stream->is_grpc = true;
     stream->attempt = 0;
+
+    /* Deadline propagation (roadmap 2c-3): parsed and clamped exactly
+     * once here, never recomputed on a connect retry (see
+     * grpc_deadline_ms's own comment on the struct). Left at 0 (no
+     * deadline -- falls back to the default connect/read timeout budget
+     * in magnus_expire_proxies()) when the header is absent or
+     * malformed. */
+    timeout_header = magnus_http_header_find(&stream->parsed, "grpc-timeout");
+    if (timeout_header != NULL) {
+        uint64_t timeout_ms;
+        if (magnus_grpc_parse_timeout(timeout_header, &timeout_ms)) {
+            if (timeout_ms > MAGNUS_GRPC_MAX_TIMEOUT_MS)
+                timeout_ms = MAGNUS_GRPC_MAX_TIMEOUT_MS;
+            stream->grpc_deadline_ms = magnus_now_ms() + timeout_ms;
+        }
+    }
 
     for (;;) {
         int endpoint = magnus_cluster_select(&magnus_grpc_cluster,
@@ -6013,19 +6091,49 @@ magnus_expire_proxies(int epoll_fd, time_t now)
         }
     }
 
-    /* HTTP/2 proxy dispatch (1e-2): the same connect/read timeout budgets
-     * as the HTTP/1.1 sweep above, but there is no equivalent of
-     * magnus_connections[]'s single set of proxy_* fields to check here
-     * -- one h2 connection can have many streams each proxying
-     * concurrently, so every open stream on every h2-active connection
-     * needs its own check. */
+    /* HTTP/2 proxy dispatch (1e-2) and gRPC dispatch (2c-1/2c-2): the
+     * same connect/read timeout budgets as the HTTP/1.1 sweep above, but
+     * there is no equivalent of magnus_connections[]'s single set of
+     * proxy_* fields to check here -- one h2 connection can have many
+     * streams each proxying (or relaying gRPC) concurrently, so every
+     * open stream on every h2-active connection needs its own check. A
+     * gRPC stream carrying a client-supplied grpc-timeout (roadmap 2c-3,
+     * grpc_deadline_ms != 0) is bounded by that absolute deadline
+     * instead -- entirely replacing the default connect/read budget for
+     * that one stream, not added on top of it, since the client has
+     * already told us exactly how long the *whole* RPC may take. */
     for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
         magnus_connection_t *connection = magnus_connections[fd];
         struct magnus_h2_stream *stream;
         bool push_needed = false;
+        uint64_t now_ms = 0;
         if (connection == NULL || !connection->h2_active) continue;
         for (stream = connection->h2_streams; stream != NULL;
              stream = stream->next) {
+            if (stream->is_grpc && stream->upstream_fd >= 0
+                && stream->grpc_deadline_ms != 0) {
+                if (now_ms == 0) now_ms = magnus_now_ms();
+                if (now_ms < stream->grpc_deadline_ms) continue;
+                magnus_h2_grpc_fail_or_abort(connection, stream, "4",
+                                             "deadline exceeded");
+                push_needed = true;
+                continue;
+            }
+            if (stream->is_grpc && stream->upstream_fd >= 0) {
+                if (!stream->upstream_connected) {
+                    if (now - stream->connect_started
+                        < MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS) continue;
+                    magnus_h2_grpc_connect_failed(connection, stream);
+                } else if (now - stream->last_activity
+                           >= MAGNUS_PROXY_READ_TIMEOUT_SECONDS) {
+                    magnus_h2_grpc_fail_or_abort(connection, stream, "4",
+                                                 "gRPC upstream timed out");
+                } else {
+                    continue;
+                }
+                push_needed = true;
+                continue;
+            }
             if (!stream->is_proxy || stream->upstream_fd < 0) continue;
             if (!stream->upstream_connected) {
                 if (now - stream->connect_started

@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.15.0
+
+### Added
+
+- **`grpc-timeout` deadline propagation (roadmap 2c-3).** A client's own
+  `grpc-timeout` request header (e.g. `500m`, `5S`, `2M` -- the full unit
+  set the gRPC-over-HTTP/2 wire spec defines: hours/minutes/seconds/
+  milli-/micro-/nanoseconds) is parsed once at dispatch time into an
+  absolute deadline, clamped to a new `MAGNUS_GRPC_MAX_TIMEOUT_MS` (5
+  minutes) so no client-claimed deadline can hold an upstream connection
+  open indefinitely. When present, that deadline entirely replaces the
+  stream's default connect/read timeout budget (the same
+  `magnus_expire_proxies()` sweep every proxy/gRPC stream already uses)
+  rather than adding to it -- the client has already told magnus exactly
+  how long the whole RPC may take. A stream whose deadline is exceeded is
+  answered `grpc-status: 4` (DEADLINE_EXCEEDED): a clean "Trailers-Only"
+  response if nothing was sent to the client yet, or a stream reset
+  (`magnus_h2_grpc_abort()`) if a response was already in flight,
+  exactly mirroring 2c-1/2c-2's own connect/mid-stream failure handling.
+  A missing or malformed `grpc-timeout` falls back to the pre-existing
+  default budget unchanged -- this is purely additive for a request that
+  carries none.
+
+Verified against a real, independent gRPC implementation (`grpcio`,
+Python): a real client's own `timeout=` call correctly raises
+`DEADLINE_EXCEEDED` against a deliberately slow (3-real-second) upstream
+when the propagated deadline is shorter than that; an ample deadline
+(10s) against the same slow upstream succeeds normally rather than
+prematurely cutting it off; a call with no timeout at all still falls
+back to the existing default read-timeout behavior unchanged. Separately
+verified with a raw, stdlib-only socket client carrying **no client-side
+timer of its own** (proving magnus's own server-side sweep enforced the
+deadline, not the grpc client library's parallel local one) that a
+response arrives around 1 second after a 500ms `grpc-timeout` -- the
+sweep's own ~1s granularity -- well before the upstream's unrelated 3s
+delay. A dozen malformed `grpc-timeout` values (empty, unit-only,
+non-numeric, out-of-range digit counts, negative, embedded NUL, ...)
+sent directly over a raw socket all fall back to the default budget
+cleanly with no crash, confirmed by continued normal service afterward.
+New permanent regression coverage added to `tests/test-core.sh` (a raw
+hand-rolled h2 client asserting the same timing bound against a
+deliberately slow hand-rolled upstream, no pip dependency). `make clean
+&& make test` and `make sanitize` (ASan+UBSan) both green. Image
+rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.14.0
 
 ### Added
