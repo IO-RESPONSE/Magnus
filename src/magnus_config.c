@@ -254,6 +254,34 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             config->upstreams[config->upstream_count++] = upstream;
+        } else if (strcmp(key, "grpc_upstream") == 0) {
+            magnus_config_upstream_t upstream;
+            if (config->grpc_upstream_count == MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'grpc_upstream' entries "
+                                        "(max %d)",
+                                        MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_parse_upstream(value, &upstream)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'grpc_upstream' must be "
+                                        "ipv4:port[:weight], got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (upstream.is_hostname) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'grpc_upstream' must be a literal "
+                                        "IPv4 address, not a hostname (got "
+                                        "'%s') -- DNS resolution is not yet "
+                                        "supported for gRPC upstreams",
+                                        upstream.address);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->grpc_upstreams[config->grpc_upstream_count++] = upstream;
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,
@@ -393,6 +421,16 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 magnus_config_set_error(error, error_capacity, 0,
                                         "a 'route' with action=proxy needs "
                                         "at least one 'upstream'");
+                return MAGNUS_CONFIG_ERROR;
+            }
+        }
+    }
+    if (config->grpc_upstream_count == 0) {
+        for (size_t index = 0; index < config->route_count; index++) {
+            if (config->routes[index].action == MAGNUS_ROUTE_ACTION_GRPC) {
+                magnus_config_set_error(error, error_capacity, 0,
+                                        "a 'route' with action=grpc needs "
+                                        "at least one 'grpc_upstream'");
                 return MAGNUS_CONFIG_ERROR;
             }
         }

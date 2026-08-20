@@ -1893,3 +1893,167 @@ test "$(curl --fail --silent "http://127.0.0.1:$port_realip/hello.txt")" = 'real
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
+
+# gRPC (roadmap 2c-1): a client h2 stream matched to action=grpc relays to
+# an HTTP/2-native upstream over magnus's own second, client-role nghttp2
+# session -- verified against a raw, stdlib-only (no h2/hyperframe pip
+# dependency, matching 1e-3's own precedent) hand-rolled h2 "upstream"
+# that only ever *encodes* frames, never decodes any (it does not need to
+# understand magnus's own HPACK-compressed request to answer), so no
+# hand-rolled HPACK decoder is needed either -- the actual gRPC semantics
+# (grpc-status/grpc-message trailers, custom trailing metadata, RPC-level
+# vs. gateway-level failure) were independently verified live against a
+# real grpcio client and server (not part of this permanent suite, per
+# the same no-new-pip-dependency precedent); this block instead proves
+# the wire-level plumbing a curl-only regression *can* check: status,
+# content-type, and the upstream's exact response bytes relayed
+# byte-for-byte, an HTTP/1.1 request to the same route answered with an
+# explicit error rather than silently mis-served, and the "always
+# :status 200, even on total gateway failure" contract from a completely
+# unreachable upstream.
+port_grpc_fake_upstream=$((port + 50))
+port_grpc=$((port + 51))
+port_grpc_bad=$((port + 52))
+
+python3 - "$port_grpc_fake_upstream" >"$web_root/grpc-fake-upstream.log" 2>&1 <<'PYEOF' &
+import socket
+import sys
+import threading
+
+PORT = int(sys.argv[1])
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+def read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("peer closed early")
+        data += chunk
+    return data
+
+
+def handle(conn):
+    read_exact(conn, len(PREFACE))  # client connection preface
+    stream_id = None
+    end_stream_seen = False
+    while not end_stream_seen:
+        header = read_exact(conn, 9)
+        length = (header[0] << 16) | (header[1] << 8) | header[2]
+        frame_type = header[3]
+        flags = header[4]
+        sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
+        payload = read_exact(conn, length) if length else b""
+        if frame_type == 0x1:  # HEADERS
+            stream_id = sid
+            if flags & 0x1:
+                end_stream_seen = True
+        elif frame_type == 0x0:  # DATA
+            if flags & 0x1:
+                end_stream_seen = True
+
+    conn.sendall(frame(0x4, 0x0, 0))  # SETTINGS (empty)
+    conn.sendall(frame(0x4, 0x1, 0))  # SETTINGS ACK
+
+    resp_headers = build_headers_block([
+        (":status", "200"),
+        ("content-type", "application/grpc"),
+    ])
+    conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))  # HEADERS, END_HEADERS
+
+    grpc_payload = b"fake-upstream-payload"
+    grpc_frame = bytes([0]) + len(grpc_payload).to_bytes(4, "big") + grpc_payload
+    conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))  # DATA, no END_STREAM
+
+    trailer = build_headers_block([
+        ("grpc-status", "0"),
+        ("grpc-message", ""),
+    ])
+    conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))  # trailer HEADERS, END_STREAM
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT))
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+backend_pid=$!
+sleep 1
+
+"$binary" --port "$port_grpc" --grpc-upstream "127.0.0.1:$port_grpc_fake_upstream" \
+  --route "path_prefix=/; action=grpc" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_grpc/healthz" >/dev/null && break
+  sleep 1
+done
+
+grpc_headers="$web_root/grpc.headers"
+grpc_body="$web_root/grpc.body"
+curl --http2-prior-knowledge --silent -X POST --dump-header "$grpc_headers" \
+  --output "$grpc_body" "http://127.0.0.1:$port_grpc/echo.Echo/SayHello"
+grep -qi '^HTTP/2 200' "$grpc_headers"
+grep -qi '^content-type: application/grpc' "$grpc_headers"
+grep -qi '^grpc-status: 0' "$grpc_headers"
+printf '\000\000\000\000\025fake-upstream-payload' | cmp - "$grpc_body"
+
+# HTTP/1.1 against the same action=grpc route: an explicit error, never
+# silently mis-served as static/proxy.
+h1_status=$(curl --http1.1 --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST "http://127.0.0.1:$port_grpc/echo.Echo/SayHello")
+test "$h1_status" = '505'
+
+"$binary" --port "$port_grpc_bad" --grpc-upstream "127.0.0.1:$((port_grpc_fake_upstream + 500))" \
+  --route "path_prefix=/; action=grpc" 2>>"$log" &
+backend2_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_grpc_bad/healthz" >/dev/null && break
+  sleep 1
+done
+# Total gateway failure (no reachable upstream at all) is still answered
+# with :status 200 -- a real gRPC client treats any other :status as a
+# *transport* failure, not the RPC-level outcome grpc-status conveys, so
+# magnus must never send a raw 502/504 here (see magnus_h2_grpc_fail()'s
+# own comment).
+bad_status=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_code}' -X POST \
+  "http://127.0.0.1:$port_grpc_bad/echo.Echo/SayHello")
+test "$bad_status" = '200'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend2_pid" 2>/dev/null
+wait "$backend2_pid" 2>/dev/null || true
+backend2_pid=
+kill -TERM "$backend_pid" 2>/dev/null
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+echo "grpc: ok"

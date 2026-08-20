@@ -116,11 +116,13 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
                 out->action = MAGNUS_ROUTE_ACTION_DENY;
             else if (strcmp(action_value, "static") == 0)
                 out->action = MAGNUS_ROUTE_ACTION_STATIC;
+            else if (strcmp(action_value, "grpc") == 0)
+                out->action = MAGNUS_ROUTE_ACTION_GRPC;
             else {
                 if (error != NULL && error_capacity > 0)
                     snprintf(error, error_capacity,
-                            "'action' must be proxy, deny, or static, got '%s'",
-                            action_value);
+                            "'action' must be proxy, deny, static, or grpc, "
+                            "got '%s'", action_value);
                 return false;
             }
             action_seen = true;

@@ -447,6 +447,37 @@ connection-pool and common-request-model decisions).
     rest of Phase 2 exactly for the reason flagged above: ACL/rate-limit
     correctness downstream depends on knowing the real client address
     first.
+  - **gRPC 2c — sub-scoped the same way 1e was, given the same "expected
+    to be the largest single piece of work" sizing:**
+    - **2c-1 — h2-to-h2 upstream dispatch, unary RPCs only. Shipped in
+      1.13.0.** New `action=grpc` route + separate `grpc_upstream`
+      cluster; a second, magnus-owned CLIENT-role nghttp2 session per
+      stream drives the upstream leg (translating through the existing
+      HTTP/1.x `action=proxy` path was never viable -- no trailers).
+      Whole-response buffering (no true streaming yet), no upstream
+      connection pooling/session affinity, IPv4-literal upstreams only.
+      Verified against a real `grpcio` client and server. See
+      `CHANGELOG.md` 1.13.0 for the full detail.
+    - **2c-2 — true client-/server-streaming and bidi support.** Removes
+      2c-1's "buffer the whole request/response before dispatch" shape on
+      both legs -- DATA frames need to flow through as they arrive in
+      each direction independently, via nghttp2's DEFERRED/resume
+      mechanism on both the client-facing and upstream-facing sessions at
+      once. The largest, riskiest remaining piece of gRPC support.
+    - **2c-3 — `grpc-timeout` deadline propagation.** Parses the request
+      header into an absolute deadline and applies it as this stream's
+      own connect/read timeout budget, extending the existing proxy
+      timeout sweep.
+    - **2c-4 — gRPC-aware routing/observability polish.** Route matching
+      on `content-type: application/grpc` (or a `grpc_service=<name>`
+      condition parsed from `:path`) as an alternative to requiring an
+      explicit `action=grpc` route; `grpc-status`-aware access logging
+      and `/metrics` (2c-1 deliberately does not touch
+      `magnus_responses_4xx/5xx` for a gRPC outcome, since the wire
+      `:status` is always 200 -- see `magnus_h2_grpc_fail()`'s own
+      comment); session affinity and upstream connection
+      pooling/multiplexing for the gRPC cluster, mirroring 1a's own for
+      the HTTP/1.x one.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

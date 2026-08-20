@@ -39,7 +39,15 @@ typedef struct {
 typedef enum {
     MAGNUS_ROUTE_ACTION_PROXY,
     MAGNUS_ROUTE_ACTION_DENY,
-    MAGNUS_ROUTE_ACTION_STATIC
+    MAGNUS_ROUTE_ACTION_STATIC,
+    /* gRPC (roadmap 2c-1): relays to an HTTP/2-native upstream (a real
+     * gRPC server, which HTTP/1.1 cannot speak to at all -- no trailers)
+     * rather than the ordinary action=proxy path's HTTP/1.x upstream.
+     * Only ever dispatched for an h2 client stream; an HTTP/1.1 request
+     * matching this action is answered with an explicit error instead of
+     * silently falling through to proxy/static (see
+     * magnus_dispatch_request()). */
+    MAGNUS_ROUTE_ACTION_GRPC
 } magnus_route_action_t;
 
 typedef struct {

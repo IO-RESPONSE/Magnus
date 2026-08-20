@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.13.0
+
+### Added
+
+- **gRPC reverse-proxy dispatch, unary RPCs (roadmap 2c-1).** A route
+  with the new `action=grpc` (mirroring the existing `action=proxy`/
+  `deny`/`static` DSL) relays a client h2 stream to a real, HTTP/2-native
+  gRPC upstream -- configured via a new, separate `grpc_upstream =
+  ipv4:port[:weight]` cluster (config key and `--grpc-upstream` CLI flag,
+  repeatable, IPv4-literal only for now). Translating through the
+  existing HTTP/1.x reverse-proxy path (`action=proxy`) was never an
+  option: a real gRPC server requires actual HTTP/2 trailers
+  (`grpc-status`/`grpc-message`) to report an RPC's outcome, which
+  HTTP/1.1 cannot carry at all. Magnus now drives the upstream leg with a
+  second, magnus-owned CLIENT-role nghttp2 session per stream (a genuine
+  h2-to-h2 gateway, not a translation), opened fresh per RPC and torn
+  down with it -- no upstream connection pooling/reuse or session
+  affinity yet, matching how the very first HTTP/1.1 reverse proxy
+  started this same narrow before 1a/1b broadened it.
+- Every non-hop-by-hop request header is forwarded to the upstream
+  (unlike `action=proxy`'s minimal synthetic request), including `te:
+  trailers` -- the one HTTP/2 hop-by-hop exception RFC 9113 8.2.2 still
+  allows, and which every real gRPC client sends on every request; a real
+  gRPC server (grpc-core) rejects a request missing it outright, which is
+  exactly what an early build of this increment hit and fixed before ever
+  reaching a live client test.
+- The upstream's response headers, body, and trailer (`grpc-status`/
+  `grpc-message` plus any custom trailing metadata a service sets) are
+  all forwarded to the real client once the whole exchange is known
+  complete -- this increment buffers a unary RPC's entire response before
+  ever submitting anything to the client, rather than streaming it
+  through as it arrives; true client-/server-streaming and bidi support
+  is exactly what a later increment (2c-2) is scoped to add.
+- Per the gRPC-over-HTTP/2 wire spec, every response -- including a total
+  gateway failure (no reachable upstream, a connect failure, or a
+  malformed/absent upstream response) -- is answered with `:status 200`;
+  a real gRPC client treats any other `:status` as a transport failure
+  rather than the RPC-level outcome `grpc-status` conveys, so a gateway
+  failure is a "Trailers-Only" 200 response with `grpc-status: 14`
+  (UNAVAILABLE), never a raw 502/504 the way `action=proxy` answers one.
+  An HTTP/1.1 request against an `action=grpc` route is answered `505`
+  explicitly (gRPC requires HTTP/2 end to end) rather than silently
+  falling through to static/proxy dispatch.
+
+Verified against a real, independent gRPC implementation (`grpcio`,
+Python) on both ends -- not just this project's own code: a successful
+unary call through magnus with the correct payload; a service's own
+custom trailing metadata (`context.set_trailing_metadata()`) surviving
+the round trip; an RPC-level failure (`INVALID_ARGUMENT`) correctly
+raising the real client library's own typed error with the right code
+and message; and a totally unreachable upstream correctly raising
+`UNAVAILABLE` rather than a raw connection error the client library
+cannot interpret as gRPC at all. New permanent regression coverage added
+to `tests/test-core.sh`, using a raw, stdlib-only hand-rolled h2
+"upstream" (no h2/hyperframe pip dependency, matching the 1e-3 Rapid
+Reset test's own precedent) that proves the same wire-level plumbing a
+curl-only regression can check: status, content-type, and the upstream's
+exact response bytes relayed byte-for-byte; the HTTP/1.1 505 rejection;
+and the always-200-even-on-total-failure contract. `make clean && make
+test` and `make sanitize` (ASan+UBSan) both green, including this new
+h2-to-h2 upstream traffic. Image rebuilt, `./scripts/test-image.sh`
+passes.
+
 ## 1.12.0
 
 ### Added

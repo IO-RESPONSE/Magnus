@@ -36,7 +36,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.12.0"
+#define MAGNUS_VERSION "1.13.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -333,6 +333,14 @@ static int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
 static magnus_cluster_t magnus_cluster;
 static bool magnus_upstream_enabled;
+/* gRPC upstream cluster (roadmap 2c-1): a separate pool from magnus_cluster
+ * above, targeted only by a route with action=grpc -- reuses
+ * magnus_cluster_t's own weighted-RR/health/circuit-breaker logic
+ * unmodified (no new load-balancer code needed), just a second instance,
+ * since a real gRPC backend fleet and an ordinary HTTP/1.x one are rarely
+ * the same servers. */
+static magnus_cluster_t magnus_grpc_cluster;
+static bool magnus_grpc_upstream_enabled;
 /* Evaluated in order, first match wins, ahead of the built-in
  * healthz/metrics/proxy-prefix/static dispatch -- see
  * magnus_dispatch_request(). Empty (route_count == 0, the default) means
@@ -692,8 +700,12 @@ static void magnus_h2_close(magnus_connection_t *connection);
 static void magnus_h2_proxy_start(magnus_connection_t *connection,
                                   struct magnus_h2_stream *stream,
                                   const char *forward_path);
+static void magnus_h2_grpc_start(magnus_connection_t *connection,
+                                 struct magnus_h2_stream *stream);
 static int magnus_h2_handle_upstream(struct magnus_h2_stream *stream,
                                      uint32_t flags);
+static int magnus_h2_grpc_handle_upstream(struct magnus_h2_stream *stream,
+                                          uint32_t flags);
 static void magnus_h2_submit_text(magnus_connection_t *connection,
                                   struct magnus_h2_stream *stream,
                                   const char *status, const char *content_type,
@@ -2194,6 +2206,14 @@ struct magnus_h2_stream {
     size_t header_accum;
     size_t io_length;
     size_t io_sent;
+    /* gRPC path only (2c-1): io_buffer's current malloc()'d size, grown
+     * (realloc, doubling) as the upstream's response DATA accumulates --
+     * unlike the h1-proxy path above, which streams a fixed
+     * MAGNUS_PROXY_BUFFER window and never needs to grow it, gRPC's
+     * "buffer the whole unary response before ever telling the client
+     * anything" design (see magnus_h2_grpc_client_on_stream_close()) needs
+     * genuine growth. Stays 0 for an h1-proxy stream. */
+    size_t io_capacity;
     bool headers_received;
     bool response_headers_submitted;
     bool upstream_eof;
@@ -2214,6 +2234,61 @@ struct magnus_h2_stream {
     unsigned long response_length;
     unsigned long response_received;
     bool upstream_poolable;
+
+    /* -- gRPC dispatch (roadmap 2c-1): client h2 stream -> upstream h2
+     * (gRPC) server -- see the block comment above magnus_h2_grpc_start()
+     * for the full design. Reuses body/body_length/body_sent above (the
+     * client's request, already fully buffered before dispatch) as the
+     * outbound gRPC request's DATA source, and io_buffer/io_length/io_sent
+     * above for the upstream's response body -- both already exist for
+     * exactly this "hold one buffer this stream owns" purpose; only what
+     * genuinely differs (a second, magnus-owned nghttp2 CLIENT session
+     * driving the upstream leg, since a real gRPC server requires actual
+     * h2 trailers HTTP/1.1 cannot carry) gets new fields below. */
+    bool is_grpc;
+    nghttp2_session *grpc_session;
+    int32_t grpc_stream_id;
+    unsigned char *grpc_output;
+    size_t grpc_output_length;
+    size_t grpc_output_sent;
+    /* Set (only) by magnus_h2_grpc_client_on_stream_close() -- the
+     * upstream nghttp2 session's callback context, where it is unsafe to
+     * do anything more than record the fact (see this section's own
+     * comment on why nghttp2_session_del() must never be called from
+     * inside one of that same session's own callbacks). The real
+     * response-submission/teardown work happens back in
+     * magnus_h2_grpc_handle_upstream(), checked right after each
+     * nghttp2_session_mem_recv2() round. */
+    bool grpc_stream_closed;
+    /* Captured from the upstream response's leading HEADERS frame
+     * (NGHTTP2_HCAT_RESPONSE) -- :status, plus every ordinary header
+     * (content-type, grpc-encoding, ...) -- to forward to the real client
+     * once the whole exchange is known complete (see
+     * magnus_h2_grpc_client_on_stream_close()). grpc-status/grpc-message
+     * are captured separately below, not into this array, since they
+     * belong in the *trailer* this stream submits to the client, not its
+     * initial response headers. */
+    char grpc_response_status[8];
+    magnus_http_header_t grpc_response_headers[16];
+    size_t grpc_response_header_count;
+    /* Captured from whichever HEADERS frame actually carries them --
+     * either the trailer proper, or the single HEADERS frame of a
+     * "Trailers-Only" error response that never sent a body at all; both
+     * shapes are treated identically here, deliberately (see
+     * magnus_h2_grpc_client_on_header()). Left empty until one arrives;
+     * still empty at stream-close means the upstream never produced a
+     * gRPC-shaped response at all (a raw transport failure, not an RPC
+     * error), answered as grpc-status=14 (UNAVAILABLE) instead. */
+    char grpc_status[16];
+    char grpc_message[256];
+    /* Any other trailer field (custom trailing metadata, e.g.
+     * server-timing/cache-tag-style values a real gRPC service sets via
+     * its own context.set_trailing_metadata()) -- forwarded to the real
+     * client's trailer alongside grpc-status/grpc-message, not dropped,
+     * since trailing metadata is a first-class part of gRPC's own
+     * request/response model, not an edge case. */
+    magnus_http_header_t grpc_response_trailers[8];
+    size_t grpc_response_trailer_count;
 };
 
 static struct magnus_h2_stream *
@@ -2251,13 +2326,29 @@ magnus_h2_stream_new(magnus_connection_t *connection, int32_t stream_id)
 static void
 magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
 {
-    if (stream->upstream_fd < 0) return;
-    if (magnus_global_epoll_fd >= 0)
-        epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, stream->upstream_fd,
-                 NULL);
-    magnus_h2_upstream_owner[stream->upstream_fd] = NULL;
-    close(stream->upstream_fd);
-    stream->upstream_fd = -1;
+    if (stream->upstream_fd >= 0) {
+        if (magnus_global_epoll_fd >= 0)
+            epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL,
+                     stream->upstream_fd, NULL);
+        magnus_h2_upstream_owner[stream->upstream_fd] = NULL;
+        close(stream->upstream_fd);
+        stream->upstream_fd = -1;
+    }
+    /* gRPC (2c-1): the upstream-facing client nghttp2 session is created
+     * before the TCP connect() is even attempted (see
+     * magnus_h2_grpc_build_session()'s own comment on why), so it can
+     * outlive upstream_fd already being -1 (a connect() that failed
+     * synchronously, before magnus_h2_proxy_attach_upstream() ever set
+     * upstream_fd) -- checked unconditionally, not folded into the
+     * upstream_fd guard above. */
+    if (stream->grpc_session != NULL) {
+        nghttp2_session_del(stream->grpc_session);
+        stream->grpc_session = NULL;
+    }
+    free(stream->grpc_output);
+    stream->grpc_output = NULL;
+    stream->grpc_output_length = 0;
+    stream->grpc_output_sent = 0;
 }
 
 static void
@@ -2435,6 +2526,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     nghttp2_session *session = connection->h2_session;
     bool literal_proxy_prefix;
     bool is_proxy_route;
+    bool is_grpc_route = false;
     bool route_denied = false;
     bool is_healthz_path;
     bool is_metrics_path;
@@ -2485,6 +2577,8 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
             forward_path = stream->parsed.target;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
             route_denied = true;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
+            is_grpc_route = true;
         }
         break;
     }
@@ -2509,7 +2603,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     }
     head_only = strcmp(stream->parsed.method, "HEAD") == 0;
     if (strcmp(stream->parsed.method, "GET") != 0 && !head_only
-        && !is_proxy_route) {
+        && !is_proxy_route && !is_grpc_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
          * the reverse proxy is the one route that has always been meant
          * to relay whatever method (and body) the client sent. */
@@ -2526,6 +2620,14 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         magnus_build_metrics(metrics, sizeof(metrics));
         magnus_h2_submit_text(connection, stream, "200",
                               "text/plain; version=0.0.4", metrics, head_only);
+        return;
+    }
+    if (is_grpc_route) {
+        if (stream->body_overflow) {
+            magnus_h2_submit_status(session, stream->stream_id, "413");
+            return;
+        }
+        magnus_h2_grpc_start(connection, stream);
         return;
     }
     if (is_proxy_route) {
@@ -3025,6 +3127,7 @@ magnus_h2_proxy_attach_upstream(magnus_connection_t *connection,
             close(fd);
             return -1;
         }
+        stream->io_capacity = MAGNUS_PROXY_BUFFER;
     }
     stream->upstream_fd = fd;
     stream->upstream_connected = connected;
@@ -3545,6 +3648,11 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
     magnus_connection_t *connection = stream->connection;
     int epoll_fd = magnus_global_epoll_fd;
 
+    /* gRPC (2c-1) streams drive an entirely different upstream leg (a
+     * client-role nghttp2 session, not raw HTTP/1.0 text) -- see
+     * magnus_h2_grpc_handle_upstream()'s own top comment. */
+    if (stream->is_grpc) return magnus_h2_grpc_handle_upstream(stream, flags);
+
     if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
         if (stream->response_headers_submitted) magnus_h2_proxy_abort(stream);
         else magnus_h2_proxy_connect_failed(connection, stream, "502");
@@ -3631,6 +3739,755 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
         (void) nghttp2_session_resume_data(connection->h2_session,
                                            stream->stream_id);
     }
+    return magnus_h2_push(epoll_fd, connection);
+}
+
+/* ---- gRPC dispatch (roadmap 2c-1): client h2 stream -> upstream h2
+ * (real gRPC) server -- an h2-to-h2 sibling of the h2-to-HTTP/1.x proxy
+ * dispatch above (1e-2), needed because a real gRPC server is HTTP/2-
+ * native end to end and requires actual trailers (grpc-status/
+ * grpc-message) to report an RPC's outcome, which HTTP/1.1 cannot carry
+ * at all -- translating through the existing h1-upstream proxy path the
+ * way every other action=proxy route does would simply not work for
+ * gRPC. A second, magnus-owned CLIENT-role nghttp2 session
+ * (stream->grpc_session) drives the upstream leg instead, one per
+ * stream, created fresh for this one RPC and torn down with it.
+ *
+ * Scoped to unary RPCs only for this increment (see
+ * docs/development-roadmap.md's 2c-1 entry): the whole client request is
+ * already fully buffered before dispatch runs (same as the h1-proxy path
+ * above, reusing its body/body_length fields), and this dispatch
+ * likewise buffers the *entire* upstream response -- headers, body, and
+ * trailer -- into stream->io_buffer before ever submitting anything to
+ * the real client, rather than streaming it through as it arrives. That
+ * collapses away most of the deferred/backpressure machinery the
+ * h1-proxy path needs, at the cost of true client-streaming/
+ * server-streaming/bidi support, which is exactly what a later increment
+ * (2c-2) is scoped to add.
+ *
+ * Also unlike the h1-proxy path: no upstream connection pooling/reuse (a
+ * fresh TCP + h2 handshake is opened per unary RPC and closed after --
+ * see MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own comment), no DNS-resolved
+ * hostnames (magnus_grpc_cluster is IPv4-literal only), and no session
+ * affinity (every attempt uses plain weighted-RR, magnus_cluster_select()
+ * only, never magnus_cluster_select_sticky()). All three are reasonable,
+ * explicitly-scoped-out follow-ups, not silent gaps -- matching how the
+ * very first HTTP/1.1 reverse proxy (pre-1a) started exactly this narrow
+ * before the connection pool (1a) and DNS (1c) increments broadened it.
+ *
+ * Per the gRPC-over-HTTP/2 wire spec, every response this dispatch ever
+ * sends the real client uses :status 200 regardless of RPC outcome -- a
+ * gRPC client treats any other :status as a *transport*-level failure,
+ * not the RPC-level one grpc-status conveys, so a gateway-level failure
+ * (no healthy upstream, connect failure, a malformed/absent upstream
+ * response) is always answered as a "Trailers-Only" 200 response with
+ * grpc-status=14 (UNAVAILABLE) rather than an ordinary 502/504 the way
+ * action=proxy would. */
+
+static bool
+magnus_grpc_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
+{
+    if (index >= magnus_grpc_cluster.count) return false;
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port = htons((uint16_t) magnus_grpc_cluster.endpoints[index].port);
+    return inet_pton(AF_INET, magnus_grpc_cluster.endpoints[index].address,
+                     &out->sin_addr) == 1;
+}
+
+/* Submits a "Trailers-Only" gRPC error response directly to the real
+ * client -- :status 200 (see this block's own top comment on why),
+ * content-type: application/grpc, grpc-status/grpc-message, and no body
+ * at all. The gRPC analogue of magnus_h2_proxy_fail() for the h1 proxy
+ * path -- but unlike that function, never tears down stream->upstream_fd/
+ * grpc_session itself (magnus_h2_stream_teardown_upstream() deletes
+ * grpc_session, which is only ever safe to do *outside* one of that same
+ * session's own nghttp2 callbacks -- see grpc_stream_closed's own
+ * comment); every caller is responsible for that teardown itself, at
+ * whichever point is safe for it. Must only be called before any
+ * client-facing response has been submitted for this stream. gRPC
+ * failures deliberately do not increment magnus_responses_4xx/5xx (both
+ * are HTTP-status-code buckets, and the wire status here is always 200) --
+ * grpc-status-aware metrics are left to a later increment (2c-4). */
+static void
+magnus_h2_grpc_fail(magnus_connection_t *connection,
+                    struct magnus_h2_stream *stream,
+                    const char *grpc_status_code, const char *message)
+{
+    nghttp2_nv headers[4];
+    size_t count = 0;
+    double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+    headers[count++] = magnus_h2_nv(":status", "200");
+    headers[count++] = magnus_h2_nv("content-type", "application/grpc");
+    headers[count++] = magnus_h2_nv("grpc-status", grpc_status_code);
+    if (message != NULL && message[0] != '\0')
+        headers[count++] = magnus_h2_nv("grpc-message", message);
+    stream->response_headers_submitted = true;
+    (void) nghttp2_submit_response2(connection->h2_session, stream->stream_id,
+                                    headers, count, NULL);
+    magnus_requests_total++;
+    magnus_record_latency(latency_ms);
+    magnus_access_log(stream->request_id, stream->effective_client_address,
+                      stream->log_method, stream->log_target, 200, latency_ms);
+}
+
+/* nghttp2 data-provider read callback for a gRPC-dispatched stream's
+ * response to the real client -- pulls from stream->io_buffer/io_length/
+ * io_sent exactly like magnus_h2_read_io_buffer() does for every other h2
+ * response, but cannot simply reuse that callback: at EOF it must also
+ * submit this stream's trailer (grpc-status/grpc-message), which no other
+ * caller of magnus_h2_read_io_buffer() ever needs to do. By the time this
+ * is ever called, the whole upstream response is already fully buffered
+ * (see this block's own top comment) -- response_complete is implicitly
+ * always true here, so this never returns NGHTTP2_ERR_DEFERRED the way
+ * the h1-proxy path's callback sometimes does. */
+static nghttp2_ssize
+magnus_h2_grpc_read_response(nghttp2_session *session, int32_t stream_id,
+                             uint8_t *buf, size_t length, uint32_t *data_flags,
+                             nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    size_t available = stream->io_length - stream->io_sent;
+    (void) stream_id;
+    (void) user_data;
+    if (available == 0) {
+        nghttp2_nv trailer[2 + 8];
+        size_t trailer_count = 0;
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        trailer[trailer_count++] = magnus_h2_nv("grpc-status",
+            stream->grpc_status[0] != '\0' ? stream->grpc_status : "0");
+        if (stream->grpc_message[0] != '\0')
+            trailer[trailer_count++] = magnus_h2_nv("grpc-message",
+                                                     stream->grpc_message);
+        for (size_t i = 0; i < stream->grpc_response_trailer_count
+                           && trailer_count < sizeof(trailer) / sizeof(trailer[0]);
+             i++) {
+            trailer[trailer_count++] = magnus_h2_nv(
+                stream->grpc_response_trailers[i].name,
+                stream->grpc_response_trailers[i].value);
+        }
+        (void) nghttp2_submit_trailer(session, stream->stream_id, trailer,
+                                      trailer_count);
+        return 0;
+    }
+    if (length > available) length = available;
+    memcpy(buf, stream->io_buffer + stream->io_sent, length);
+    stream->io_sent += length;
+    return (nghttp2_ssize) length;
+}
+
+/* Called once stream->grpc_stream_closed is observed (from
+ * magnus_h2_grpc_handle_upstream(), never from inside a grpc_session
+ * callback -- see that field's own comment) with stream->grpc_status
+ * non-empty, meaning the upstream produced a genuine, complete
+ * gRPC-shaped response: everything needed is already sitting in
+ * stream->grpc_response_status/grpc_response_headers/io_buffer/
+ * grpc_status/grpc_message, so this only ever submits, never blocks or
+ * defers. */
+static void
+magnus_h2_grpc_submit_response(magnus_connection_t *connection,
+                               struct magnus_h2_stream *stream)
+{
+    nghttp2_nv headers[2 + 16];
+    size_t count = 0;
+    unsigned status_for_log;
+    double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+    const char *status_text = stream->grpc_response_status[0] != '\0'
+        ? stream->grpc_response_status : "200";
+
+    headers[count++] = magnus_h2_nv(":status", status_text);
+    headers[count++] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
+    for (size_t i = 0; i < stream->grpc_response_header_count
+                       && count < sizeof(headers) / sizeof(headers[0]); i++) {
+        headers[count++] = magnus_h2_nv(stream->grpc_response_headers[i].name,
+                                        stream->grpc_response_headers[i].value);
+    }
+
+    stream->response_complete = true; /* whole body is already buffered */
+    stream->response_headers_submitted = true;
+    status_for_log = (unsigned) strtoul(status_text, NULL, 10);
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_grpc_read_response,
+        };
+        (void) nghttp2_submit_response2(connection->h2_session,
+                                        stream->stream_id, headers, count,
+                                        &data_provider);
+    }
+    magnus_requests_total++;
+    magnus_record_latency(latency_ms);
+    magnus_access_log(stream->request_id, stream->effective_client_address,
+                      stream->log_method, stream->log_target, status_for_log,
+                      latency_ms);
+}
+
+/* nghttp2 data-provider read callback for this stream's outbound gRPC
+ * request body, sent to the upstream -- pulls from stream->body/
+ * body_length/body_sent, already fully buffered by
+ * magnus_h2_on_data_chunk_recv() before dispatch ever ran (same buffer
+ * the h1-proxy path's own raw send() loop drains -- reused here, not
+ * duplicated, since the two dispatch modes are mutually exclusive per
+ * stream). The whole body is already known up front, so -- unlike the
+ * response side -- this never needs to defer either. */
+static nghttp2_ssize
+magnus_h2_grpc_read_request_body(nghttp2_session *session, int32_t stream_id,
+                                 uint8_t *buf, size_t length,
+                                 uint32_t *data_flags,
+                                 nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    size_t available = stream->body_length - stream->body_sent;
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    if (available == 0) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+    if (length > available) length = available;
+    memcpy(buf, stream->body + stream->body_sent, length);
+    stream->body_sent += length;
+    return (nghttp2_ssize) length;
+}
+
+/* on_header callback for stream->grpc_session (the upstream-facing
+ * CLIENT-role session) -- captures the upstream's response :status and
+ * ordinary headers (content-type, grpc-encoding, custom metadata, ...)
+ * from its leading HEADERS frame (NGHTTP2_HCAT_RESPONSE) into
+ * grpc_response_status/grpc_response_headers, and grpc-status/
+ * grpc-message from *whichever* HEADERS frame actually carries them --
+ * either a real trailer, or the single HEADERS frame of a
+ * "Trailers-Only" error response that never sent a body at all. Both
+ * shapes are deliberately treated identically: grpc-status is checked
+ * for on every HEADERS frame regardless of category, so this dispatch
+ * never needs to special-case Trailers-Only separately. Every other
+ * trailer field (custom trailing metadata) is captured into
+ * grpc_response_trailers, bounded the same way grpc_response_headers is
+ * -- see that field's own comment. */
+static int
+magnus_h2_grpc_client_on_header(nghttp2_session *session,
+                                const nghttp2_frame *frame,
+                                const uint8_t *name, size_t namelen,
+                                const uint8_t *value, size_t valuelen,
+                                uint8_t flags, void *user_data)
+{
+    struct magnus_h2_stream *stream = user_data;
+    (void) session;
+    (void) flags;
+    if (frame->hd.type != NGHTTP2_HEADERS
+        || frame->hd.stream_id != stream->grpc_stream_id)
+        return 0;
+
+    if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0) {
+        if (valuelen < sizeof(stream->grpc_status)) {
+            memcpy(stream->grpc_status, value, valuelen);
+            stream->grpc_status[valuelen] = '\0';
+        }
+        return 0;
+    }
+    if (namelen == 12 && memcmp(name, "grpc-message", 12) == 0) {
+        if (valuelen < sizeof(stream->grpc_message)) {
+            memcpy(stream->grpc_message, value, valuelen);
+            stream->grpc_message[valuelen] = '\0';
+        }
+        return 0;
+    }
+    if (frame->headers.cat != NGHTTP2_HCAT_RESPONSE) {
+        /* Any other trailer field (custom trailing metadata) -- captured
+         * for magnus_h2_grpc_read_response() to forward, same truncation/
+         * bound-count precedent as grpc_response_headers below. */
+        if (stream->grpc_response_trailer_count
+            < sizeof(stream->grpc_response_trailers)
+                  / sizeof(stream->grpc_response_trailers[0])) {
+            magnus_http_header_t *stored = &stream->grpc_response_trailers[
+                stream->grpc_response_trailer_count];
+            size_t stored_name_length = namelen < sizeof(stored->name) - 1
+                ? namelen : sizeof(stored->name) - 1;
+            size_t stored_value_length = valuelen < sizeof(stored->value) - 1
+                ? valuelen : sizeof(stored->value) - 1;
+            memcpy(stored->name, name, stored_name_length);
+            stored->name[stored_name_length] = '\0';
+            memcpy(stored->value, value, stored_value_length);
+            stored->value[stored_value_length] = '\0';
+            stream->grpc_response_trailer_count++;
+        }
+        return 0;
+    }
+    if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+        if (valuelen < sizeof(stream->grpc_response_status)) {
+            memcpy(stream->grpc_response_status, value, valuelen);
+            stream->grpc_response_status[valuelen] = '\0';
+        }
+        return 0;
+    }
+    if (namelen > 0 && name[0] == ':') return 0; /* any other pseudo-header */
+    if (stream->grpc_response_header_count
+        < sizeof(stream->grpc_response_headers)
+              / sizeof(stream->grpc_response_headers[0])) {
+        magnus_http_header_t *stored = &stream->grpc_response_headers[
+            stream->grpc_response_header_count];
+        size_t stored_name_length = namelen < sizeof(stored->name) - 1
+            ? namelen : sizeof(stored->name) - 1;
+        size_t stored_value_length = valuelen < sizeof(stored->value) - 1
+            ? valuelen : sizeof(stored->value) - 1;
+        memcpy(stored->name, name, stored_name_length);
+        stored->name[stored_name_length] = '\0';
+        memcpy(stored->value, value, stored_value_length);
+        stored->value[stored_value_length] = '\0';
+        stream->grpc_response_header_count++;
+    }
+    return 0;
+}
+
+/* on_data_chunk_recv callback for stream->grpc_session -- appends the
+ * upstream response body into stream->io_buffer, growing it (realloc,
+ * doubling) as needed up to MAGNUS_MAX_BODY, the same cap the client
+ * request-body side already enforces (magnus_h2_on_data_chunk_recv()).
+ * Unlike the h1-proxy path's fixed MAGNUS_PROXY_BUFFER window, io_buffer
+ * genuinely grows here -- see io_capacity's own comment on the struct. */
+static int
+magnus_h2_grpc_client_on_data_chunk_recv(nghttp2_session *session,
+                                         uint8_t flags, int32_t stream_id,
+                                         const uint8_t *data, size_t len,
+                                         void *user_data)
+{
+    struct magnus_h2_stream *stream = user_data;
+    (void) session;
+    (void) flags;
+    if (stream_id != stream->grpc_stream_id || len == 0) return 0;
+    if (stream->io_length + len > MAGNUS_MAX_BODY) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (stream->io_length + len > stream->io_capacity) {
+        size_t new_capacity = stream->io_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : stream->io_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->io_length + len) new_capacity *= 2;
+        grown = realloc(stream->io_buffer, new_capacity);
+        if (grown == NULL) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        stream->io_buffer = grown;
+        stream->io_capacity = new_capacity;
+    }
+    memcpy(stream->io_buffer + stream->io_length, data, len);
+    stream->io_length += len;
+    return 0;
+}
+
+/* on_stream_close callback for stream->grpc_session -- deliberately does
+ * nothing but record the fact (see grpc_stream_closed's own comment on
+ * why: nghttp2_session_del() must never be called from inside one of
+ * that same session's own callbacks, and submitting the real client's
+ * response from here would be reachable from exactly such a context).
+ * The actual response-submission/teardown work happens back in
+ * magnus_h2_grpc_handle_upstream(), once nghttp2_session_mem_recv2()
+ * (which is what invokes this) has returned. */
+static int
+magnus_h2_grpc_client_on_stream_close(nghttp2_session *session,
+                                      int32_t stream_id, uint32_t error_code,
+                                      void *user_data)
+{
+    struct magnus_h2_stream *stream = user_data;
+    (void) session;
+    (void) error_code;
+    if (stream_id == stream->grpc_stream_id) stream->grpc_stream_closed = true;
+    return 0;
+}
+
+/* Builds this stream's outbound gRPC request: creates a fresh client-role
+ * nghttp2 session (deliberately not shared/reused across requests -- see
+ * this block's own top comment) and immediately submits the actual
+ * HEADERS+DATA for this one RPC into it. Nothing here touches a socket at
+ * all -- nghttp2_submit_request2() only queues frames inside the
+ * session's own internal state, exactly like nghttp2_submit_settings()
+ * already does for the connection-level *server* session at creation
+ * time (magnus_h2_session_create()); the frames are not actually
+ * serialized onto the wire until magnus_h2_grpc_handle_upstream() later
+ * calls nghttp2_session_mem_send2() against a connected fd. Requires
+ * stream->endpoint_index to already be set (the outbound request's
+ * :authority depends on which endpoint was chosen). Resets every
+ * per-attempt gRPC capture field, so this is also what a retry (a fresh
+ * endpoint, a fresh session) calls again cleanly. Returns 0 on success,
+ * -1 on failure (out of memory, or the endpoint's address could not be
+ * resolved) -- the caller decides how to respond to a -1. */
+static int
+magnus_h2_grpc_build_session(struct magnus_h2_stream *stream)
+{
+    nghttp2_session_callbacks *callbacks;
+    nghttp2_nv headers[4 + MAGNUS_HTTP_MAX_HEADERS];
+    size_t count = 0;
+    char authority[80];
+    struct sockaddr_in address;
+    int result;
+    int32_t submitted_stream_id;
+
+    stream->grpc_stream_closed = false;
+    stream->grpc_status[0] = '\0';
+    stream->grpc_message[0] = '\0';
+    stream->grpc_response_status[0] = '\0';
+    stream->grpc_response_header_count = 0;
+    stream->grpc_response_trailer_count = 0;
+    stream->io_length = 0;
+    stream->io_sent = 0;
+    stream->body_sent = 0;
+
+    if (!magnus_grpc_endpoint_sockaddr(stream->endpoint_index, &address))
+        return -1;
+    snprintf(authority, sizeof(authority), "%s:%u",
+            magnus_grpc_cluster.endpoints[stream->endpoint_index].address,
+            magnus_grpc_cluster.endpoints[stream->endpoint_index].port);
+
+    headers[count++] = magnus_h2_nv(":method", stream->parsed.method);
+    headers[count++] = magnus_h2_nv(":scheme", "http");
+    headers[count++] = magnus_h2_nv(":authority", authority);
+    headers[count++] = magnus_h2_nv(":path", stream->parsed.target);
+    for (size_t i = 0; i < stream->parsed.header_count
+                       && count < sizeof(headers) / sizeof(headers[0]); i++) {
+        const char *name = stream->parsed.headers[i].name;
+        const char *value = stream->parsed.headers[i].value;
+        /* Hop-by-hop (never meaningful in h2 anyway, RFC 9113 8.2.2) plus
+         * "host" -- already carried as :authority above. "te" is hop-by-hop
+         * too, EXCEPT for the one value RFC 9113 8.2.2 explicitly still
+         * allows: "trailers" -- which is exactly what every real gRPC
+         * client sends on every request (RFC-mandated, to signal trailer
+         * support), so stripping it unconditionally here breaks gRPC
+         * outright: grpc-core rejects a request missing it with an
+         * immediate RST_STREAM before ever reaching the application
+         * handler, which is indistinguishable from any other transport
+         * failure without capturing wire traffic to notice. */
+        if (strcmp(name, "connection") == 0 || strcmp(name, "keep-alive") == 0
+            || strcmp(name, "proxy-connection") == 0
+            || strcmp(name, "transfer-encoding") == 0
+            || strcmp(name, "upgrade") == 0
+            || (strcmp(name, "te") == 0 && strcmp(value, "trailers") != 0)
+            || strcmp(name, "host") == 0)
+            continue;
+        headers[count++] = magnus_h2_nv(name, stream->parsed.headers[i].value);
+    }
+
+    if (nghttp2_session_callbacks_new(&callbacks) != 0) return -1;
+    nghttp2_session_callbacks_set_on_header_callback(callbacks,
+        magnus_h2_grpc_client_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks,
+        magnus_h2_grpc_client_on_data_chunk_recv);
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
+        magnus_h2_grpc_client_on_stream_close);
+
+    result = nghttp2_session_client_new(&stream->grpc_session, callbacks,
+                                        stream);
+    nghttp2_session_callbacks_del(callbacks);
+    if (result != 0) return -1;
+
+    {
+        nghttp2_settings_entry settings[1] = {
+            { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1 },
+        };
+        if (nghttp2_submit_settings(stream->grpc_session, NGHTTP2_FLAG_NONE,
+                                    settings, 1) != 0) {
+            nghttp2_session_del(stream->grpc_session);
+            stream->grpc_session = NULL;
+            return -1;
+        }
+    }
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_grpc_read_request_body,
+        };
+        submitted_stream_id = nghttp2_submit_request2(stream->grpc_session,
+            NULL, headers, count,
+            stream->body_length > 0 ? &data_provider : NULL, NULL);
+    }
+    if (submitted_stream_id < 0) {
+        nghttp2_session_del(stream->grpc_session);
+        stream->grpc_session = NULL;
+        return -1;
+    }
+    stream->grpc_stream_id = submitted_stream_id;
+    return 0;
+}
+
+/* The gRPC analogue of magnus_h2_proxy_connect_endpoint(): no pooled-
+ * connection checkout (see this block's own top comment on why 2c-1 has
+ * no upstream pooling), just a fresh non-blocking connect(), reusing
+ * magnus_h2_proxy_attach_upstream() as-is -- it is already fully generic
+ * (does not reference magnus_cluster; endpoint_index is just stored, not
+ * resolved there), so it works unmodified for the gRPC cluster too. */
+static int
+magnus_h2_grpc_connect_endpoint(magnus_connection_t *connection,
+                                struct magnus_h2_stream *stream,
+                                size_t endpoint_index)
+{
+    struct sockaddr_in address;
+    int result;
+    int fd;
+    if (!magnus_grpc_endpoint_sockaddr(endpoint_index, &address)) return -1;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
+                                           fd, result == 0, 0);
+}
+
+/* The gRPC analogue of magnus_h2_proxy_connect_failed(): records a
+ * failure for the endpoint currently in flight and either retries against
+ * a different healthy endpoint (a fresh session + fresh connect, per this
+ * block's own top comment) -- bounded by MAGNUS_PROXY_MAX_ATTEMPTS total
+ * attempts, same as the h1-proxy path -- or gives up with a clean
+ * UNAVAILABLE gRPC error. Reused for both a literal connect() failure and
+ * any later mid-exchange transport failure, exactly like
+ * magnus_h2_proxy_connect_failed() already is for the h1-proxy path. */
+static void
+magnus_h2_grpc_connect_failed(magnus_connection_t *connection,
+                              struct magnus_h2_stream *stream)
+{
+    magnus_cluster_result(&magnus_grpc_cluster, stream->endpoint_index, false,
+                          magnus_now_ms());
+    magnus_h2_stream_teardown_upstream(stream);
+    if (stream->attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
+        int endpoint = magnus_cluster_select(&magnus_grpc_cluster,
+                                             magnus_now_ms(), NULL);
+        if (endpoint >= 0) {
+            stream->attempt++;
+            stream->endpoint_index = (size_t) endpoint;
+            if (magnus_h2_grpc_build_session(stream) == 0
+                && magnus_h2_grpc_connect_endpoint(connection, stream,
+                                                   (size_t) endpoint) == 0) {
+                return;
+            }
+            if (stream->grpc_session != NULL) {
+                nghttp2_session_del(stream->grpc_session);
+                stream->grpc_session = NULL;
+            }
+            magnus_cluster_result(&magnus_grpc_cluster, (size_t) endpoint,
+                                  false, magnus_now_ms());
+        }
+    }
+    magnus_h2_grpc_fail(connection, stream, "14",
+                        "gRPC upstream connect failed");
+}
+
+/* Entry point from magnus_h2_dispatch(): picks a healthy
+ * magnus_grpc_cluster endpoint, builds this stream's outbound gRPC
+ * request/session, and connects -- retrying once on an immediate connect
+ * failure exactly like the h1-proxy path. No session affinity (see this
+ * block's own top comment). */
+static void
+magnus_h2_grpc_start(magnus_connection_t *connection,
+                     struct magnus_h2_stream *stream)
+{
+    magnus_generate_token(stream->request_id);
+    strncpy(stream->log_method, stream->parsed.method,
+           sizeof(stream->log_method) - 1);
+    stream->log_method[sizeof(stream->log_method) - 1] = '\0';
+    strncpy(stream->log_target, stream->parsed.target,
+           sizeof(stream->log_target) - 1);
+    stream->log_target[sizeof(stream->log_target) - 1] = '\0';
+    stream->is_grpc = true;
+    stream->attempt = 0;
+
+    for (;;) {
+        int endpoint = magnus_cluster_select(&magnus_grpc_cluster,
+                                             magnus_now_ms(), NULL);
+        if (endpoint < 0) {
+            magnus_h2_grpc_fail(connection, stream, "14",
+                                "no healthy gRPC upstream available");
+            return;
+        }
+        stream->attempt++;
+        stream->endpoint_index = (size_t) endpoint;
+        if (magnus_h2_grpc_build_session(stream) == 0
+            && magnus_h2_grpc_connect_endpoint(connection, stream,
+                                               (size_t) endpoint) == 0) {
+            return;
+        }
+        if (stream->grpc_session != NULL) {
+            nghttp2_session_del(stream->grpc_session);
+            stream->grpc_session = NULL;
+        }
+        magnus_cluster_result(&magnus_grpc_cluster, (size_t) endpoint, false,
+                              magnus_now_ms());
+        if (stream->attempt >= MAGNUS_PROXY_MAX_ATTEMPTS) {
+            magnus_h2_grpc_fail(connection, stream, "14",
+                                "gRPC upstream connect failed");
+            return;
+        }
+    }
+}
+
+/* Flushes whatever was left over from a previous magnus_h2_grpc_drain_send()
+ * call that could not be written in one go -- the gRPC analogue of
+ * magnus_h2_flush_output(), against stream->upstream_fd/grpc_output
+ * instead of connection->fd/h2_output. */
+static int
+magnus_h2_grpc_flush_output(struct magnus_h2_stream *stream)
+{
+    while (stream->grpc_output != NULL
+           && stream->grpc_output_sent < stream->grpc_output_length) {
+        ssize_t sent = send(stream->upstream_fd,
+            stream->grpc_output + stream->grpc_output_sent,
+            stream->grpc_output_length - stream->grpc_output_sent,
+            MSG_NOSIGNAL);
+        if (sent > 0) {
+            stream->grpc_output_sent += (size_t) sent;
+            stream->last_activity = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    if (stream->grpc_output != NULL) {
+        free(stream->grpc_output);
+        stream->grpc_output = NULL;
+        stream->grpc_output_length = 0;
+        stream->grpc_output_sent = 0;
+    }
+    return 0;
+}
+
+/* Pulls as much serialized output as stream->grpc_session currently has
+ * queued and writes it to stream->upstream_fd -- the gRPC analogue of
+ * magnus_h2_drain_send(), plaintext-only (plain send(), not
+ * magnus_socket_write(): grpc_upstream has no TLS support yet, see this
+ * block's own top comment). Same "copy the unwritten remainder into our
+ * own buffer rather than retrying against nghttp2's pointer later" shape,
+ * for the identical reason magnus_h2_drain_send() already documents. */
+static int
+magnus_h2_grpc_drain_send(struct magnus_h2_stream *stream)
+{
+    nghttp2_session *session = stream->grpc_session;
+    for (;;) {
+        const uint8_t *data = NULL;
+        nghttp2_ssize length = nghttp2_session_mem_send2(session, &data);
+        ssize_t sent;
+        if (length < 0) return -1;
+        if (length == 0) return 0;
+        sent = send(stream->upstream_fd, data, (size_t) length, MSG_NOSIGNAL);
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) sent = 0;
+        else if (sent < 0 && errno == EINTR) sent = 0;
+        else if (sent < 0) return -1;
+        if ((size_t) sent == (size_t) length) {
+            stream->last_activity = time(NULL);
+            continue;
+        }
+        stream->grpc_output = malloc((size_t) length - (size_t) sent);
+        if (stream->grpc_output == NULL) return -1;
+        memcpy(stream->grpc_output, data + sent,
+              (size_t) length - (size_t) sent);
+        stream->grpc_output_length = (size_t) length - (size_t) sent;
+        stream->grpc_output_sent = 0;
+        return 0;
+    }
+}
+
+/* The gRPC analogue of magnus_h2_update_interest(), against
+ * stream->upstream_fd/grpc_session instead of connection->fd/h2_session.
+ * Returns -1 if the session has nothing left to read or write and no
+ * buffered output remains -- magnus_h2_grpc_handle_upstream() treats that
+ * as unexpected (grpc_stream_closed should always have already been
+ * observed and handled before this could ever be reached idle) rather
+ * than silently leaving an fd epoll has stopped watching. */
+static int
+magnus_h2_grpc_update_interest(int epoll_fd, struct magnus_h2_stream *stream)
+{
+    uint32_t events = EPOLLRDHUP;
+    int want_read = nghttp2_session_want_read(stream->grpc_session);
+    int want_write = nghttp2_session_want_write(stream->grpc_session);
+    struct epoll_event event;
+    if (!want_read && !want_write && stream->grpc_output == NULL) return -1;
+    if (want_read) events |= EPOLLIN;
+    if (want_write || stream->grpc_output != NULL) events |= EPOLLOUT;
+    event = (struct epoll_event) { .events = events,
+                                   .data.fd = stream->upstream_fd };
+    return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, stream->upstream_fd, &event);
+}
+
+/* Entry point for any epoll event on a gRPC-dispatched stream's upstream
+ * fd -- the gRPC analogue of magnus_h2_handle_upstream(), driving
+ * stream->grpc_session's send/recv instead of the h1-proxy path's raw
+ * HTTP/1.0 text state machine. Same non-client-connection-fatal contract:
+ * always returns 0 for a stream-local outcome, -1 only if pushing h2
+ * output onto the client fd itself fails. */
+static int
+magnus_h2_grpc_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
+{
+    magnus_connection_t *connection = stream->connection;
+    int epoll_fd = magnus_global_epoll_fd;
+    unsigned char recv_buffer[MAGNUS_PROXY_BUFFER];
+
+    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        magnus_h2_grpc_connect_failed(connection, stream);
+        return magnus_h2_push(epoll_fd, connection);
+    }
+    if (!stream->upstream_connected) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (getsockopt(stream->upstream_fd, SOL_SOCKET, SO_ERROR, &error,
+                       &length) < 0 || error != 0) {
+            magnus_h2_grpc_connect_failed(connection, stream);
+            return magnus_h2_push(epoll_fd, connection);
+        }
+        stream->upstream_connected = true;
+        stream->last_activity = time(NULL);
+    }
+
+    if (magnus_h2_grpc_flush_output(stream) < 0
+        || (stream->grpc_output == NULL
+            && magnus_h2_grpc_drain_send(stream) < 0)) {
+        magnus_h2_grpc_connect_failed(connection, stream);
+        return magnus_h2_push(epoll_fd, connection);
+    }
+
+    if (stream->grpc_output == NULL && (flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+        for (;;) {
+            ssize_t received = recv(stream->upstream_fd, recv_buffer,
+                                    sizeof(recv_buffer), 0);
+            if (received > 0) {
+                nghttp2_ssize consumed = nghttp2_session_mem_recv2(
+                    stream->grpc_session, recv_buffer, (size_t) received);
+                stream->last_activity = time(NULL);
+                if (consumed < 0 || magnus_h2_grpc_drain_send(stream) < 0) {
+                    magnus_h2_grpc_connect_failed(connection, stream);
+                    return magnus_h2_push(epoll_fd, connection);
+                }
+                if (stream->grpc_stream_closed || stream->grpc_output != NULL)
+                    break;
+                continue;
+            }
+            if (received == 0) {
+                if (!stream->grpc_stream_closed) {
+                    magnus_h2_grpc_connect_failed(connection, stream);
+                    return magnus_h2_push(epoll_fd, connection);
+                }
+                break;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            magnus_h2_grpc_connect_failed(connection, stream);
+            return magnus_h2_push(epoll_fd, connection);
+        }
+    }
+
+    if (stream->grpc_stream_closed) {
+        if (stream->grpc_status[0] == '\0') {
+            magnus_h2_grpc_fail(connection, stream, "14",
+                                "upstream did not return a valid gRPC "
+                                "response");
+        } else {
+            magnus_h2_grpc_submit_response(connection, stream);
+        }
+        magnus_h2_stream_teardown_upstream(stream);
+        return magnus_h2_push(epoll_fd, connection);
+    }
+
+    if (magnus_h2_grpc_update_interest(epoll_fd, stream) < 0)
+        magnus_h2_grpc_connect_failed(connection, stream);
     return magnus_h2_push(epoll_fd, connection);
 }
 
@@ -3775,6 +4632,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     bool close_connection = parsed->close_connection;
     bool head_only = parsed->head_only;
     bool is_proxy_route;
+    bool is_grpc_route = false;
     bool literal_proxy_prefix;
     bool route_denied = false;
     const char *proxy_forward_path;
@@ -3826,6 +4684,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                 proxy_forward_path = request.path;
             } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
                 route_denied = true;
+            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
+                is_grpc_route = true;
             }
             break;
         }
@@ -3859,7 +4719,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         magnus_prepare_response(connection, 403, "Forbidden", "text/plain",
                                 "forbidden\n", head_only, close_connection,
                                 &request);
-    } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route) {
+    } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route
+               && !is_grpc_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
          * the reverse proxy is the one route that has always been meant
          * to relay whatever method (and body) the client sent -- see the
@@ -3882,6 +4743,24 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         /* Everything else is off-limits on the admin channel. */
         magnus_prepare_response(connection, 404, "Not Found", "text/plain",
                                 "not found\n", head_only, close_connection,
+                                &request);
+    } else if (is_grpc_route) {
+        /* A real gRPC server requires HTTP/2 end to end (trailers alone
+         * make it impossible over HTTP/1.1) -- explicit and immediate
+         * here, per this codebase's standing convention of never silently
+         * mis-serving a request that reached an incompatible dispatch
+         * path, rather than letting it fall through to ordinary static
+         * dispatch as if action=grpc were not there at all. Checked after
+         * the /healthz//metrics literal-path exemptions above, same
+         * precedent as is_proxy_route below: a literal /healthz or
+         * /metrics request still gets its ordinary built-in answer even
+         * if it happens to also match an action=grpc route's conditions.
+         * See magnus_h2_dispatch()'s own action=grpc branch for the real,
+         * HTTP/2-only path this exists for. */
+        magnus_prepare_response(connection, 505, "HTTP Version Not Supported",
+                                "text/plain",
+                                "gRPC requires HTTP/2 (TLS ALPN \"h2\" or "
+                                "h2c)\n", head_only, close_connection,
                                 &request);
     } else if (is_proxy_route) {
         if (magnus_proxy_pick_and_start(epoll_fd, connection, &request, parsed,
@@ -4982,6 +5861,7 @@ magnus_apply_config(const magnus_config_t *config)
     int new_root_fd = -1;
     SSL_CTX *new_tls_context = NULL;
     magnus_cluster_t new_cluster;
+    magnus_cluster_t new_grpc_cluster;
     size_t index;
 
     if (config->has_root) {
@@ -5017,6 +5897,18 @@ magnus_apply_config(const magnus_config_t *config)
             return -1;
         }
     }
+    magnus_cluster_init(&new_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS);
+    for (index = 0; index < config->grpc_upstream_count; index++) {
+        if (magnus_cluster_add(&new_grpc_cluster,
+                               config->grpc_upstreams[index].address,
+                               config->grpc_upstreams[index].port,
+                               config->grpc_upstreams[index].weight) != 0) {
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+    }
 
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     magnus_root_fd = new_root_fd;
@@ -5034,6 +5926,14 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_cluster = new_cluster;
     magnus_upstream_enabled = new_cluster.count > 0;
     magnus_dns_apply_upstreams(config->upstreams, config->upstream_count);
+    /* No pool to flush for magnus_grpc_cluster -- 2c-1 opens a fresh
+     * one-shot upstream h2 connection per RPC, never pools/reuses one
+     * across requests (see docs/development-roadmap.md's 2c-1 entry), so
+     * there is nothing stale-by-position for a reload to invalidate the
+     * way magnus_pool_close_all() above must for the pooled HTTP/1.x
+     * cluster. */
+    magnus_grpc_cluster = new_grpc_cluster;
+    magnus_grpc_upstream_enabled = new_grpc_cluster.count > 0;
     memcpy(magnus_routes, config->routes, sizeof(magnus_routes));
     magnus_route_count = config->route_count;
     memcpy(magnus_trusted_proxies, config->trusted_proxies,
@@ -5129,6 +6029,8 @@ magnus_parse_options(int argc, char **argv)
     const char *private_key = NULL;
     magnus_cluster_init(&magnus_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS);
+    magnus_cluster_init(&magnus_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS);
     for (index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) break;
         if (strcmp(argv[index], "--port") == 0) {
@@ -5187,6 +6089,41 @@ magnus_parse_options(int argc, char **argv)
             magnus_upstream_enabled = true;
             if (is_hostname)
                 magnus_dns_track(magnus_cluster.count - 1, address);
+        } else if (strcmp(argv[index], "--grpc-upstream") == 0) {
+            /* ipv4:port or ipv4:port:weight; repeatable to build a gRPC
+             * cluster. Literal IPv4 only for now -- unlike --upstream, no
+             * hostname/DNS resolution yet (roadmap 2c-1's own explicit
+             * scope cut; see MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's comment). */
+            char spec[80];
+            char *saveptr = NULL;
+            char *address;
+            char *port_text;
+            char *weight_text;
+            char *end;
+            unsigned long upstream_port;
+            unsigned long weight = 1;
+            struct in_addr probe;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
+            strcpy(spec, argv[index + 1]);
+            address = strtok_r(spec, ":", &saveptr);
+            port_text = strtok_r(NULL, ":", &saveptr);
+            weight_text = strtok_r(NULL, ":", &saveptr);
+            if (address == NULL || port_text == NULL) break;
+            if (inet_pton(AF_INET, address, &probe) != 1) break;
+            errno = 0;
+            upstream_port = strtoul(port_text, &end, 10);
+            if (errno != 0 || *end != '\0' || upstream_port == 0
+                || upstream_port > 65535) break;
+            if (weight_text != NULL) {
+                errno = 0;
+                weight = strtoul(weight_text, &end, 10);
+                if (errno != 0 || *end != '\0' || weight == 0
+                    || weight > 1000) break;
+            }
+            if (magnus_cluster_add(&magnus_grpc_cluster, address,
+                                   (unsigned) upstream_port,
+                                   (unsigned) weight) != 0) break;
+            magnus_grpc_upstream_enabled = true;
         } else if (strcmp(argv[index], "--rate-limit") == 0) {
             /* requests-per-second, or requests-per-second:burst */
             char spec[32];
@@ -5286,6 +6223,12 @@ magnus_parse_options(int argc, char **argv)
             && !magnus_upstream_enabled) {
             fprintf(stderr, "magnus: --route: a route with action=proxy "
                             "needs at least one --upstream\n");
+            exit(2);
+        }
+        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC
+            && !magnus_grpc_upstream_enabled) {
+            fprintf(stderr, "magnus: --route: a route with action=grpc "
+                            "needs at least one --grpc-upstream\n");
             exit(2);
         }
     }

@@ -68,6 +68,22 @@ independently by IORESPONSE.
   the resolved address feeds `source_cidr` route matching, rate limiting,
   and access logging alike, always trusted against the connection's real
   direct TCP peer so a spoofed hop can never forge trust for the next
+- gRPC reverse-proxy dispatch (unary RPCs): a route with `action=grpc`
+  relays a client h2 stream to a real, HTTP/2-native gRPC upstream
+  (`grpc_upstream=`/`--grpc-upstream`, its own separate cluster, IPv4-
+  literal only) over a second, magnus-owned CLIENT-role nghttp2 session --
+  a genuine h2-to-h2 gateway, not a translation through the HTTP/1.x
+  `action=proxy` path, since a real gRPC server requires actual HTTP/2
+  trailers (`grpc-status`/`grpc-message`) HTTP/1.1 cannot carry. Every
+  non-hop-by-hop request header (including the RFC 9113 `te: trailers`
+  exception every real gRPC client sends) is forwarded, and the
+  upstream's response headers/body/trailer -- including custom trailing
+  metadata -- are relayed back once the whole exchange completes; per the
+  gRPC-over-HTTP/2 wire spec, every response (including a total gateway
+  failure) carries `:status 200`, with `grpc-status` conveying the real
+  outcome. An HTTP/1.1 request against an `action=grpc` route gets an
+  explicit `505`, never a silent proxy/static fallback. Client-/server-
+  streaming and bidi RPCs are not yet supported (unary only)
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked
@@ -95,8 +111,8 @@ and `docs/ROADMAP.md`.
 
 - `magnus`: the standalone HTTP/event data plane. Configured by flags
   (`--port`, `--root`, `--tls-cert`/`--tls-key`, `--upstream`,
-  `--rate-limit`, `--trusted-proxies`) or by `--config <file>`, the only
-  mode SIGHUP reload can target.
+  `--grpc-upstream`, `--rate-limit`, `--trusted-proxies`) or by
+  `--config <file>`, the only mode SIGHUP reload can target.
 - `magnusd`: supervises one `magnus` child -- validates config before ever
   applying it, reloads it via SIGHUP, and rolls back to the last-known-good
   config (respawning the child if it did not survive) on a failed reload

@@ -11,6 +11,12 @@
 #define MAGNUS_CONFIG_PATH_MAX 256
 #define MAGNUS_CONFIG_MAX_ROUTES 32
 #define MAGNUS_CONFIG_MAX_TRUSTED_PROXIES 16
+/* Separate, smaller cap from MAGNUS_CONFIG_MAX_UPSTREAMS: a gRPC upstream
+ * cluster (roadmap 2c-1) is its own pool, not a shared namespace with the
+ * ordinary HTTP/1.x `upstream` cluster -- a real gRPC deployment typically
+ * has far fewer distinct backend clusters than a general reverse-proxy
+ * fleet might, so 8 is generous without copying the 16 bound blindly. */
+#define MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS 8
 
 typedef struct {
     struct in_addr network;
@@ -42,6 +48,13 @@ typedef struct {
     char tls_key[MAGNUS_CONFIG_PATH_MAX];
     size_t upstream_count;
     magnus_config_upstream_t upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
+    /* gRPC upstream cluster (roadmap 2c-1): same ipv4:port[:weight] shape
+     * and validation as `upstreams` above (magnus_config_parse_upstream()
+     * is reused as-is), but a hostname entry is rejected here -- DNS
+     * resolution (1c) is not wired up for this cluster yet, unlike the
+     * ordinary one. Targeted only by a route with action=grpc. */
+    size_t grpc_upstream_count;
+    magnus_config_upstream_t grpc_upstreams[MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS];
     bool has_rate_limit;
     double rate_limit_rps;
     double rate_limit_burst;
