@@ -33,12 +33,18 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.8.0"
+#define MAGNUS_VERSION "1.9.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
 #define MAGNUS_MAX_BODY (1 * 1024 * 1024)
 #define MAGNUS_OUTPUT_LIMIT 2048
+/* Sized to stay well clear of MAGNUS_OUTPUT_LIMIT once wrapped in
+ * response headers; magnus_build_metrics()'s per-endpoint/per-bucket
+ * loops stop appending once they run out of room rather than risk
+ * overflowing the response envelope, so the fixed aggregate lines are
+ * always present even when there is not room for full detail. */
+#define MAGNUS_METRICS_BUFFER 1536
 #define MAGNUS_IDLE_SECONDS 30
 #define MAGNUS_HEADER_TIMEOUT_SECONDS 10
 #define MAGNUS_PROXY_BUFFER 16384
@@ -625,6 +631,11 @@ static void magnus_h2_proxy_start(magnus_connection_t *connection,
                                   const char *forward_path);
 static int magnus_h2_handle_upstream(struct magnus_h2_stream *stream,
                                      uint32_t flags);
+static void magnus_h2_submit_text(magnus_connection_t *connection,
+                                  struct magnus_h2_stream *stream,
+                                  const char *status, const char *content_type,
+                                  const char *body, bool head_only);
+static void magnus_build_metrics(char *out, size_t out_capacity);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
@@ -2027,7 +2038,7 @@ struct magnus_h2_stream {
      * chunks for the nghttp2 data-provider read callback to pull from
      * (io_length/io_sent). Unlike connection->proxy_buffer, nothing here
      * is ever written straight to a client socket -- io_length/io_sent
-     * are drained by magnus_h2_read_proxy_body() instead, pulled by
+     * are drained by magnus_h2_read_io_buffer() instead, pulled by
      * nghttp2 whenever it is ready to emit this stream's next DATA
      * frame. */
     char *io_buffer;
@@ -2039,11 +2050,11 @@ struct magnus_h2_stream {
     bool upstream_eof;
     /* Set once the response is known to be fully received from the
      * upstream (Content-Length reached, or the upstream closed) -- tells
-     * magnus_h2_read_proxy_body() it is safe to report
+     * magnus_h2_read_io_buffer() it is safe to report
      * NGHTTP2_DATA_FLAG_EOF once io_buffer is fully drained, rather than
      * DEFERRED (more is still expected). */
     bool response_complete;
-    /* True if magnus_h2_read_proxy_body() last returned
+    /* True if magnus_h2_read_io_buffer() last returned
      * NGHTTP2_ERR_DEFERRED because io_buffer was empty and
      * response_complete was not yet set -- nghttp2 will not call it
      * again for this stream on its own; whoever next adds bytes to
@@ -2206,20 +2217,30 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     }
 }
 
-/* Routes, then branches to either a proxied upstream request (1e-2) or a
- * static-file response (1e-1) -- deliberately kept close in shape to
+/* Routes, then branches to either a proxied upstream request (1e-2), a
+ * built-in /healthz//metrics response (1e-4), or a static-file response
+ * (1e-1) -- deliberately kept close in shape to
  * magnus_dispatch_request()'s own route-then-branch structure for
- * HTTP/1.1 (see that function for the fuller commentary), reusing the
- * exact same magnus_route_matches() call against stream->parsed rather
- * than a second routing implementation: a literal "/proxy" path prefix
- * is equivalent to an unconditional action=proxy route, ahead of
+ * HTTP/1.1 (see that function for the fuller commentary, and note this
+ * mirrors its exact branch *order* too, not just which branches exist:
+ * rate-limit check first -- consuming a token even for a request that
+ * turns out denied, matching HTTP/1.1's own quirk here exactly rather
+ * than "fixing" it into a divergence -- then route_denied, then the
+ * method check, then /healthz, then /metrics, then proxy, then static;
+ * a literal "/healthz" or "/metrics" path wins over a route that
+ * happened to match action=proxy for that same literal path, exactly
+ * like HTTP/1.1's own if/else-if chain), reusing the exact same
+ * magnus_route_matches() call against stream->parsed rather than a
+ * second routing implementation: a literal "/proxy" path prefix is
+ * equivalent to an unconditional action=proxy route, ahead of
  * everything configured; routes are evaluated in file order, first
- * match wins. Neither /healthz, /metrics, nor per-client-IP rate
- * limiting are wired into the h2 path yet -- see
- * docs/development-roadmap.md's 1e entry for what remains. Called once
- * per stream, the moment its request headers and any body (buffered
- * into stream->body -- see magnus_h2_on_data_chunk_recv()) are fully
- * received. */
+ * match wins. connection->admin_only is never true for an h2 connection
+ * (h2 requires TLS+ALPN; the admin channel is a plain, non-TLS Unix
+ * socket), so the HTTP/1.1 path's various `admin_only ||`/`!admin_only
+ * &&` conditions collapse to their non-admin case here without needing
+ * to be repeated. Called once per stream, the moment its request headers
+ * and any body (buffered into stream->body -- see
+ * magnus_h2_on_data_chunk_recv()) are fully received. */
 static void
 magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *stream)
 {
@@ -2227,6 +2248,9 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     bool literal_proxy_prefix;
     bool is_proxy_route;
     bool route_denied = false;
+    bool is_healthz_path;
+    bool is_metrics_path;
+    bool head_only;
     const char *forward_path;
 
     stream->dispatched = true;
@@ -2259,8 +2283,43 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         break;
     }
 
+    /* /healthz and /metrics stay exempt from rate limiting for the same
+     * reason as HTTP/1.1: they are exactly what an operator or
+     * monitoring system needs to reach to see *why* real traffic is
+     * being throttled, so gating them behind the same limiter would be
+     * self-defeating. */
+    is_healthz_path = strcmp(stream->parsed.target, "/healthz") == 0;
+    is_metrics_path = strcmp(stream->parsed.target, "/metrics") == 0;
+    if (!is_healthz_path && !is_metrics_path
+        && !magnus_rate_check(connection->client_address, time(NULL))) {
+        magnus_rate_limited_total++;
+        magnus_h2_submit_status(session, stream->stream_id, "429");
+        return;
+    }
+
     if (route_denied) {
         magnus_h2_submit_status(session, stream->stream_id, "403");
+        return;
+    }
+    head_only = strcmp(stream->parsed.method, "HEAD") == 0;
+    if (strcmp(stream->parsed.method, "GET") != 0 && !head_only
+        && !is_proxy_route) {
+        /* Static files, /healthz, and /metrics are inherently read-only;
+         * the reverse proxy is the one route that has always been meant
+         * to relay whatever method (and body) the client sent. */
+        magnus_h2_submit_status(session, stream->stream_id, "405");
+        return;
+    }
+    if (is_healthz_path) {
+        magnus_h2_submit_text(connection, stream, "200", "text/plain",
+                              "magnus: ok\n", head_only);
+        return;
+    }
+    if (is_metrics_path && !magnus_admin_enabled) {
+        char metrics[MAGNUS_METRICS_BUFFER];
+        magnus_build_metrics(metrics, sizeof(metrics));
+        magnus_h2_submit_text(connection, stream, "200",
+                              "text/plain; version=0.0.4", metrics, head_only);
         return;
     }
     if (is_proxy_route) {
@@ -2269,11 +2328,6 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
             return;
         }
         magnus_h2_proxy_start(connection, stream, forward_path);
-        return;
-    }
-    if (strcmp(stream->parsed.method, "GET") != 0
-        && strcmp(stream->parsed.method, "HEAD") != 0) {
-        magnus_h2_submit_status(session, stream->stream_id, "405");
         return;
     }
     magnus_h2_dispatch_static(connection, stream);
@@ -2944,17 +2998,23 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
     }
 }
 
-/* nghttp2 data-provider read callback for a proxy-dispatched stream's
- * response body: pulls from stream->io_buffer/io_length/io_sent, which
- * magnus_h2_proxy_stream_response() below keeps refilled from the
- * upstream socket. Reports NGHTTP2_ERR_DEFERRED (not EOF, not more
- * bytes) whenever the buffer is empty but response_complete is not yet
- * set -- more is still expected from the upstream, it just is not
- * available *right now*; whichever code next adds bytes to io_buffer
- * must call nghttp2_session_resume_data() to make this stream eligible
- * again (see stream->deferred's own comment). */
+/* nghttp2 data-provider read callback that pulls from
+ * stream->io_buffer/io_length/io_sent, generic across every h2 response
+ * that streams its body out of that one buffer: a proxy-dispatched
+ * stream's upstream response (magnus_h2_proxy_stream_response() below
+ * keeps it refilled from the upstream socket as more arrives, setting
+ * response_complete only once the upstream is fully drained), and
+ * /healthz//metrics (roadmap 1e-4, magnus_h2_submit_text() below), whose
+ * entire body is already sitting in io_buffer with response_complete
+ * set to true from the very start -- nothing ever needs to defer for
+ * those. Reports NGHTTP2_ERR_DEFERRED (not EOF, not more bytes) whenever
+ * the buffer is empty but response_complete is not yet set -- more is
+ * still expected, it just is not available *right now*; whichever code
+ * next adds bytes to io_buffer must call nghttp2_session_resume_data()
+ * to make this stream eligible again (see stream->deferred's own
+ * comment). */
 static nghttp2_ssize
-magnus_h2_read_proxy_body(nghttp2_session *session, int32_t stream_id,
+magnus_h2_read_io_buffer(nghttp2_session *session, int32_t stream_id,
                           uint8_t *buf, size_t length, uint32_t *data_flags,
                           nghttp2_data_source *source, void *user_data)
 {
@@ -2980,6 +3040,54 @@ magnus_h2_read_proxy_body(nghttp2_session *session, int32_t stream_id,
         if (stream->response_complete) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     }
     return (nghttp2_ssize) length;
+}
+
+/* Submits a complete, already-known, in-memory text response --
+ * /healthz and /metrics (roadmap 1e-4) are the only callers -- using the
+ * same stream->io_buffer/magnus_h2_read_io_buffer() plumbing the proxy
+ * path streams an upstream response body through, just with the whole
+ * body copied in and response_complete set to true from the very start:
+ * nothing here ever needs to defer, since there is no upstream (or
+ * anything else asynchronous) to wait on. */
+static void
+magnus_h2_submit_text(magnus_connection_t *connection,
+                      struct magnus_h2_stream *stream, const char *status,
+                      const char *content_type, const char *body,
+                      bool head_only)
+{
+    nghttp2_session *session = connection->h2_session;
+    size_t body_length = strlen(body);
+    char content_length[32];
+    nghttp2_nv headers[4];
+
+    snprintf(content_length, sizeof(content_length), "%zu", body_length);
+    headers[0] = magnus_h2_nv(":status", status);
+    headers[1] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
+    headers[2] = magnus_h2_nv("content-type", content_type);
+    headers[3] = magnus_h2_nv("content-length", content_length);
+
+    if (head_only || body_length == 0) {
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
+                                        NULL);
+        return;
+    }
+    stream->io_buffer = malloc(body_length);
+    if (stream->io_buffer == NULL) {
+        magnus_h2_submit_status(session, stream->stream_id, "500");
+        return;
+    }
+    memcpy(stream->io_buffer, body, body_length);
+    stream->io_length = body_length;
+    stream->io_sent = 0;
+    stream->response_complete = true;
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_read_io_buffer,
+        };
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
+                                        &data_provider);
+    }
 }
 
 /* Converts a magnus_proxy_sanitize_response_headers() text block (status
@@ -3036,7 +3144,7 @@ magnus_h2_proxy_submit_response(magnus_connection_t *connection,
     {
         nghttp2_data_provider2 data_provider = {
             .source = { .ptr = stream },
-            .read_callback = magnus_h2_read_proxy_body,
+            .read_callback = magnus_h2_read_io_buffer,
         };
         (void) nghttp2_submit_response2(connection->h2_session,
                                         stream->stream_id, headers, count,
@@ -3048,7 +3156,7 @@ magnus_h2_proxy_submit_response(magnus_connection_t *connection,
  * (Content-Length reached, or the upstream closed), decides -- exactly
  * like the tail of magnus_proxy_flush() for HTTP/1.1 -- whether the
  * upstream leg goes back into the pool or is torn down, and marks
- * response_complete so magnus_h2_read_proxy_body() knows it is safe to
+ * response_complete so magnus_h2_read_io_buffer() knows it is safe to
  * report EOF once io_buffer finishes draining rather than DEFERRED. */
 static void
 magnus_h2_proxy_maybe_complete(struct magnus_h2_stream *stream)
@@ -3172,7 +3280,7 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
 
 /* Once headers are received (magnus_h2_proxy_receive_headers() already
  * ran and submitted the h2 response), keeps stream->io_buffer filled
- * from the upstream socket for magnus_h2_read_proxy_body() to pull
+ * from the upstream socket for magnus_h2_read_io_buffer() to pull
  * from, respecting backpressure (never reads more while the buffer
  * still holds bytes nghttp2 has not pulled out yet) and never reading
  * past a declared Content-Length -- exactly the same shape as the tail
@@ -3366,6 +3474,79 @@ magnus_prepare_response(magnus_connection_t *connection, unsigned status,
     connection->close_after_write = close_connection;
 }
 
+/* Renders the Prometheus text-exposition-format /metrics body into
+ * `out` (an at-least-MAGNUS_METRICS_BUFFER-byte buffer), NUL-terminated.
+ * Shared by both the HTTP/1.1 dispatch path below and the HTTP/2 one
+ * (magnus_h2_dispatch_metrics(), roadmap 1e-4) so the two protocols
+ * cannot drift into reporting different numbers for the same process. */
+static void
+magnus_build_metrics(char *out, size_t out_capacity)
+{
+    size_t written;
+    size_t healthy = 0;
+    for (size_t index = 0; index < magnus_cluster.count; index++) {
+        if (magnus_cluster.endpoints[index].healthy) healthy++;
+    }
+    written = (size_t) snprintf(out, out_capacity,
+        "# TYPE magnus_connections_total counter\n"
+        "magnus_connections_total %llu\n"
+        "# TYPE magnus_connections_active gauge\n"
+        "magnus_connections_active %llu\n"
+        "# TYPE magnus_requests_total counter\n"
+        "magnus_requests_total %llu\n"
+        "magnus_responses_4xx_total %llu\n"
+        "magnus_responses_5xx_total %llu\n"
+        "magnus_bytes_sent_total %llu\n"
+        "magnus_rate_limited_total %llu\n"
+        "# TYPE magnus_upstream_endpoints gauge\n"
+        "magnus_upstream_endpoints_total %zu\n"
+        "magnus_upstream_endpoints_healthy %zu\n",
+        (unsigned long long) magnus_connections_total,
+        (unsigned long long) magnus_connections_active,
+        (unsigned long long) magnus_requests_total,
+        (unsigned long long) magnus_responses_4xx,
+        (unsigned long long) magnus_responses_5xx,
+        (unsigned long long) magnus_bytes_sent,
+        (unsigned long long) magnus_rate_limited_total,
+        magnus_cluster.count, healthy);
+    for (size_t index = 0; index < magnus_cluster.count
+         && written < out_capacity; index++) {
+        int line = snprintf(out + written, out_capacity - written,
+            "magnus_upstream_healthy{endpoint=\"%s:%u\"} %d\n",
+            magnus_cluster.endpoints[index].address,
+            magnus_cluster.endpoints[index].port,
+            magnus_cluster.endpoints[index].healthy ? 1 : 0);
+        if (line < 0 || (size_t) line >= out_capacity - written) return;
+        written += (size_t) line;
+    }
+    if (written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "# TYPE magnus_request_duration_milliseconds histogram\n");
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+    }
+    for (size_t index = 0; index < MAGNUS_LATENCY_BUCKETS
+         && written < out_capacity; index++) {
+        int line = snprintf(out + written, out_capacity - written,
+            "magnus_request_duration_milliseconds_bucket{le=\"%g\"} %llu\n",
+            magnus_latency_bucket_bounds_ms[index],
+            (unsigned long long) magnus_latency_bucket_counts[index]);
+        if (line < 0 || (size_t) line >= out_capacity - written) return;
+        written += (size_t) line;
+    }
+    if (written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "magnus_request_duration_milliseconds_bucket{le=\"+Inf\"} %llu\n"
+            "magnus_request_duration_milliseconds_sum %.2f\n"
+            "magnus_request_duration_milliseconds_count %llu\n",
+            (unsigned long long) magnus_latency_count,
+            magnus_latency_sum_ms,
+            (unsigned long long) magnus_latency_count);
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+    }
+}
+
 /* Runs the already-parsed request through ingress/route, rate limiting,
  * and the final route dispatch (static file, proxy, healthz/metrics,
  * admin). connection->body/body_length carry whatever request body was
@@ -3464,75 +3645,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 &request);
     } else if (strcmp(request.path, "/metrics") == 0
                && (connection->admin_only || !magnus_admin_enabled)) {
-        /* Sized to stay well clear of MAGNUS_OUTPUT_LIMIT once wrapped in
-         * response headers; the per-endpoint/per-bucket loops below stop
-         * appending once they run out of room rather than risk
-         * overflowing the response envelope, so the fixed aggregate lines
-         * are always present even when there is not room for full detail. */
-        char metrics[1536];
-        size_t written;
-        size_t healthy = 0;
-        for (size_t index = 0; index < magnus_cluster.count; index++) {
-            if (magnus_cluster.endpoints[index].healthy) healthy++;
-        }
-        written = (size_t) snprintf(metrics, sizeof(metrics),
-            "# TYPE magnus_connections_total counter\n"
-            "magnus_connections_total %llu\n"
-            "# TYPE magnus_connections_active gauge\n"
-            "magnus_connections_active %llu\n"
-            "# TYPE magnus_requests_total counter\n"
-            "magnus_requests_total %llu\n"
-            "magnus_responses_4xx_total %llu\n"
-            "magnus_responses_5xx_total %llu\n"
-            "magnus_bytes_sent_total %llu\n"
-            "magnus_rate_limited_total %llu\n"
-            "# TYPE magnus_upstream_endpoints gauge\n"
-            "magnus_upstream_endpoints_total %zu\n"
-            "magnus_upstream_endpoints_healthy %zu\n",
-            (unsigned long long) magnus_connections_total,
-            (unsigned long long) magnus_connections_active,
-            (unsigned long long) magnus_requests_total,
-            (unsigned long long) magnus_responses_4xx,
-            (unsigned long long) magnus_responses_5xx,
-            (unsigned long long) magnus_bytes_sent,
-            (unsigned long long) magnus_rate_limited_total,
-            magnus_cluster.count, healthy);
-        for (size_t index = 0; index < magnus_cluster.count
-             && written < sizeof(metrics); index++) {
-            int line = snprintf(metrics + written, sizeof(metrics) - written,
-                "magnus_upstream_healthy{endpoint=\"%s:%u\"} %d\n",
-                magnus_cluster.endpoints[index].address,
-                magnus_cluster.endpoints[index].port,
-                magnus_cluster.endpoints[index].healthy ? 1 : 0);
-            if (line < 0 || (size_t) line >= sizeof(metrics) - written) break;
-            written += (size_t) line;
-        }
-        if (written < sizeof(metrics)) {
-            int line = snprintf(metrics + written, sizeof(metrics) - written,
-                "# TYPE magnus_request_duration_milliseconds histogram\n");
-            if (line > 0 && (size_t) line < sizeof(metrics) - written)
-                written += (size_t) line;
-        }
-        for (size_t index = 0; index < MAGNUS_LATENCY_BUCKETS
-             && written < sizeof(metrics); index++) {
-            int line = snprintf(metrics + written, sizeof(metrics) - written,
-                "magnus_request_duration_milliseconds_bucket{le=\"%g\"} %llu\n",
-                magnus_latency_bucket_bounds_ms[index],
-                (unsigned long long) magnus_latency_bucket_counts[index]);
-            if (line < 0 || (size_t) line >= sizeof(metrics) - written) break;
-            written += (size_t) line;
-        }
-        if (written < sizeof(metrics)) {
-            int line = snprintf(metrics + written, sizeof(metrics) - written,
-                "magnus_request_duration_milliseconds_bucket{le=\"+Inf\"} %llu\n"
-                "magnus_request_duration_milliseconds_sum %.2f\n"
-                "magnus_request_duration_milliseconds_count %llu\n",
-                (unsigned long long) magnus_latency_count,
-                magnus_latency_sum_ms,
-                (unsigned long long) magnus_latency_count);
-            if (line > 0 && (size_t) line < sizeof(metrics) - written)
-                written += (size_t) line;
-        }
+        char metrics[MAGNUS_METRICS_BUFFER];
+        magnus_build_metrics(metrics, sizeof(metrics));
         magnus_prepare_response(connection, 200, "OK",
                                 "text/plain; version=0.0.4", metrics,
                                 head_only, close_connection, &request);

@@ -42,8 +42,10 @@ independently by IORESPONSE.
   file responses and, for a request matching `action=proxy` (or `/proxy`),
   a full reverse-proxy round trip to an HTTP/1.x upstream over the same
   connection pool/cluster/health state HTTP/1.1 proxying uses -- request
-  bodies included, translated to/from h2 DATA frames. h2c and per-h2
-  rate limiting/`/healthz`/`/metrics` are future increments
+  bodies included, translated to/from h2 DATA frames; `/healthz`,
+  `/metrics`, and per-client-IP rate limiting all work the same way over
+  h2 as HTTP/1.1, genuinely sharing the same rate-limit state across both
+  protocols. h2c is a future increment
 - HTTP/2 Rapid-Reset-class abuse hardening: a per-connection, one-second
   window caps both new-stream opens and client-sent `RST_STREAM` frames,
   terminating a connection that exceeds either (the CVE-2023-44487
@@ -71,7 +73,7 @@ independently by IORESPONSE.
 - Verified clean under ASan+UBSan across the full test suite (`make
   sanitize`), and against a 4M-iteration mutation fuzz run of the HTTP
   parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
-- Container image: 9,310,253 bytes (~8.88 MiB), non-root, read-only rootfs
+- Container image: 9,310,698 bytes (~8.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

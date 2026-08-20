@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.9.0
+
+### Added
+
+- **HTTP/2 operational parity: `/healthz`, `/metrics`, per-client-IP rate
+  limiting** (roadmap Phase 1e-4). The h2 dispatch path now answers
+  `/healthz` and `/metrics` exactly like HTTP/1.1 does, and applies the
+  same per-client-IP rate limiter -- genuinely shared with HTTP/1.1 (the
+  limiter is keyed by client IP alone), not a separate h2-only limiter a
+  client could evade by splitting traffic across both protocols.
+  `/healthz`/`/metrics` stay exempt from the limiter even while it is
+  exhausted, matching HTTP/1.1's own exemption exactly.
+- `magnus_build_metrics()`: the Prometheus `/metrics` text body is now
+  built by one shared function instead of HTTP/1.1-dispatch-inline code,
+  so HTTP/1.1 and h2 cannot drift into reporting different numbers for the
+  same process (a pure extraction -- no behavior change for HTTP/1.1).
+- `magnus_h2_submit_text()`: submits a small in-memory canned-text h2
+  response, reusing the same `io_buffer`/data-provider plumbing the 1e-2
+  proxy path already streams an upstream response through (the read
+  callback was accordingly generalized and renamed,
+  `magnus_h2_read_proxy_body` -> `magnus_h2_read_io_buffer`, rather than
+  given a near-duplicate sibling).
+
+Verified against real HTTP/2 tooling (`curl --http2`): `/healthz`/
+`/metrics` (GET and HEAD) answer correctly and stay exempt from rate
+limiting even mid-exhaustion; an ordinary static file hits a configured
+burst-of-2 limit and 429s on the third rapid request, recovering after the
+refill window, mirroring the pre-existing HTTP/1.1 rate-limit test's own
+shape exactly; a same-client HTTP/1.1 request is confirmed rejected too
+while the h2-side bucket is still exhausted, proving the shared-state claim
+end to end rather than by code inspection alone. `make clean && make test`
+and `make sanitize` both green against this exact live traffic. Image
+rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.8.0
 
 ### Added

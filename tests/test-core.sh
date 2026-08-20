@@ -1576,3 +1576,71 @@ wait "$server_pid"
 server_pid=
 wait "$goaway_client_pid"
 grep -q '^GOAWAY_SEEN=True$' "$goaway_out"
+
+# HTTP/2 operational parity (1e-4): /healthz, /metrics, and per-client-IP
+# rate limiting all now work the same way over h2 as they already do over
+# HTTP/1.1 -- exercised with the exact same --rate-limit 0.5:2 shape (and
+# the same burst-of-2-then-429-then-refill sequence) as the pre-existing
+# M4 HTTP/1.1 rate-limit block above, so any behavioral drift between the
+# two protocols would show up as a divergence from that established
+# baseline, not just a fresh assumption about what "should" happen.
+port_h2ops=$((port + 45))
+h2ops_root="$web_root/h2ops"
+mkdir -p "$h2ops_root"
+printf '%s\n' 'h2ops static' >"$h2ops_root/hello.txt"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/h2ops-server.key" -out "$web_root/h2ops-server.crt" \
+  >/dev/null 2>&1
+"$binary" --port "$port_h2ops" --root "$h2ops_root" \
+  --tls-cert "$web_root/h2ops-server.crt" --tls-key "$web_root/h2ops-server.key" \
+  --rate-limit 0.5:2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2 --insecure --fail --silent \
+    "https://127.0.0.1:$port_h2ops/healthz" >/dev/null && break
+  sleep 1
+done
+
+healthz_body=$(curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2ops/healthz")
+test "$healthz_body" = 'magnus: ok'
+head_healthz=$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' --head "https://127.0.0.1:$port_h2ops/healthz")
+test "$head_healthz" = '200'
+
+curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2ops/metrics" \
+  | grep -Eq '^magnus_rate_limited_total [0-9]+$'
+
+# /healthz and /metrics stay exempt from rate limiting over h2 too, so
+# the full burst of 2 is still available for ordinary traffic: the first
+# two requests to an ordinary static file succeed and the third is
+# rejected -- and /healthz/metrics themselves keep answering throughout,
+# even mid-exhaustion.
+test "$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/hello.txt")" = '200'
+test "$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/hello.txt")" = '200'
+test "$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/hello.txt")" = '429'
+test "$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/healthz")" = '200'
+curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2ops/metrics" \
+  | grep -Eq '^magnus_rate_limited_total [1-9][0-9]*$'
+
+# The rate-limit bucket is genuinely shared across protocols, keyed by
+# client IP alone: an HTTP/1.1 request from the same client, while the
+# bucket is still exhausted, is rejected too -- not a separate h2-only
+# limiter that a client could bypass by only ever using one protocol for
+# its throttled traffic and the other for everything else.
+test "$(curl --http1.1 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/hello.txt")" = '429'
+
+sleep 3
+test "$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2ops/hello.txt")" = '200'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=

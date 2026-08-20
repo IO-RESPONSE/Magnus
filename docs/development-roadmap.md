@@ -315,13 +315,52 @@ checkpoint from the prior sub-phase being green.
      to deny service to every other client; all of the above re-verified
      clean under `make sanitize` (ASan+UBSan), including repeated attack
      cycles back-to-back with no fd or memory leaks.
-   - **1e-4+ — remaining.** h2c; per-client-IP rate limiting and
-     `/healthz`/`/metrics` for the h2 path; response trailers;
-     WebSocket-over-h2 (extended CONNECT); and generalizing 1e-1/1e-2's
-     still-protocol-specific dispatch functions into the master prompt's
-     actual unified HTTP/1↔HTTP/2 request-model abstraction (Section
-     3.1) that routing/proxy code can stay fully agnostic against, now
-     that both a static and a proxy path exist to generalize from.
+   - **1e-4 — h2 path operational parity: `/healthz`, `/metrics`,
+     per-client-IP rate limiting. Shipped in 1.9.0.** `magnus_h2_dispatch()`
+     now mirrors `magnus_dispatch_request()`'s exact branch order for
+     HTTP/1.1 (rate-limit check first — including its own pre-existing
+     quirk of consuming a token even for a request that turns out denied,
+     matched deliberately rather than "fixed" into a divergence — then
+     route-denied, then the method check, then `/healthz`, then
+     `/metrics`, then proxy, then static; a literal `/healthz` or
+     `/metrics` path wins over a route that happened to match
+     `action=proxy` for that same literal path, exactly like HTTP/1.1's
+     own if/else-if chain), reusing `magnus_rate_check()` unmodified — the
+     token-bucket table is keyed by client IP alone, so it is genuinely
+     shared across HTTP/1.1 and h2 traffic from the same client, not two
+     independent limiters a client could evade by splitting its traffic
+     across both protocols. The Prometheus `/metrics` text body itself is
+     now built by a single shared `magnus_build_metrics()` (extracted from
+     what was previously HTTP/1.1-dispatch-inline code, a pure
+     refactor -- no behavior change for HTTP/1.1) so the two protocols
+     cannot drift into reporting different numbers for the same process. A
+     new `magnus_h2_submit_text()` submits a small in-memory canned-text
+     h2 response (used by both `/healthz` and `/metrics`) by reusing the
+     exact same `stream->io_buffer`/data-provider-callback plumbing the
+     1e-2 proxy path already streams an upstream response body through —
+     the callback itself was accordingly generalized and renamed
+     (`magnus_h2_read_proxy_body` → `magnus_h2_read_io_buffer`) rather than
+     given a near-duplicate sibling. `connection->admin_only` is always
+     false for an h2 connection (h2 requires TLS+ALPN; the admin channel
+     is a plain, non-TLS Unix socket), so the HTTP/1.1 path's various
+     `admin_only`-conditioned branches collapse to their non-admin case
+     here without needing to be repeated. Verified against real HTTP/2
+     tooling (`curl --http2`): `/healthz`/`/metrics` (GET and HEAD) answer
+     correctly and stay exempt from rate limiting even mid-exhaustion; an
+     ordinary static file hits a configured burst-of-2 limit and 429s on
+     the third rapid request, recovering after the configured refill
+     window, mirroring the pre-existing HTTP/1.1 rate-limit test's own
+     shape exactly; a same-client HTTP/1.1 request is confirmed rejected
+     too while the h2-side bucket is still exhausted, proving the shared-
+     state claim end to end rather than by code inspection alone; `make
+     sanitize` (ASan+UBSan) green against this exact live traffic.
+   - **1e-5+ — remaining.** h2c; response trailers; WebSocket-over-h2
+     (extended CONNECT); and generalizing 1e-1/1e-2/1e-4's still-
+     protocol-specific dispatch functions into the master prompt's actual
+     unified HTTP/1↔HTTP/2 request-model abstraction (Section 3.1) that
+     routing/proxy code can stay fully agnostic against, now that a
+     static, a proxy, and a built-in-endpoint path all exist to
+     generalize from.
 
 Each sub-phase's own checkpoint report will name its new tests, confirm
 `make`/`make test`/`make sanitize` are green, and give the size/behavior
