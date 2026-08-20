@@ -1021,3 +1021,123 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# WebSocket (1d): a plain-stdlib (no extra dependency, unlike a real
+# WebSocket client library) raw-socket backend and client -- the backend
+# computes a real Sec-WebSocket-Accept from the actual request's key and
+# then echoes whatever raw bytes arrive after the handshake, so this
+# verifies both that the handshake relay is byte-exact in each direction
+# (a wrong Accept value would mean magnus corrupted or recomputed
+# something it must only relay) and that the post-handshake connection is
+# a correct raw bidirectional pipe, including a payload well over one
+# relay buffer's worth (MAGNUS_PROXY_BUFFER, 16 KiB) to exercise the
+# multi-chunk path, not just a single small echo.
+port_ws=$((port + 35))
+upstream_ws=$((port + 36))
+python3 -c "
+import socket, hashlib, base64
+
+GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', $upstream_ws))
+srv.listen(5)
+while True:
+    conn, _ = srv.accept()
+    data = b''
+    while b'\r\n\r\n' not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    header_text = data.split(b'\r\n\r\n', 1)[0].decode()
+    key = ''
+    for line in header_text.split('\r\n')[1:]:
+        if line.lower().startswith('sec-websocket-key:'):
+            key = line.split(':', 1)[1].strip()
+    accept = base64.b64encode(
+        hashlib.sha1((key + GUID).encode()).digest()).decode()
+    conn.sendall((
+        'HTTP/1.1 101 Switching Protocols\r\n'
+        'Upgrade: websocket\r\n'
+        'Connection: Upgrade\r\n'
+        'Sec-WebSocket-Accept: ' + accept + '\r\n'
+        '\r\n'
+    ).encode())
+    while True:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        conn.sendall(chunk)
+    conn.close()
+" >/dev/null 2>&1 &
+backend_pid=$!
+sleep 1
+ws_config="$web_root/ws.conf"
+cat > "$ws_config" <<EOF
+port = $port_ws
+root = $web_root
+upstream = 127.0.0.1:$upstream_ws:1
+EOF
+"$binary" --config "$ws_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_ws/healthz" >/dev/null && break
+  sleep 1
+done
+
+python3 -c "
+import socket, base64, os, hashlib
+
+GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+key = base64.b64encode(os.urandom(16)).decode()
+req = (
+    'GET /proxy/echo HTTP/1.1\r\n'
+    'Host: example\r\n'
+    'Upgrade: websocket\r\n'
+    'Connection: Upgrade\r\n'
+    'Sec-WebSocket-Key: ' + key + '\r\n'
+    'Sec-WebSocket-Version: 13\r\n'
+    '\r\n'
+)
+s = socket.create_connection(('127.0.0.1', $port_ws), timeout=5)
+s.sendall(req.encode())
+s.settimeout(5)
+resp = b''
+while b'\r\n\r\n' not in resp:
+    resp += s.recv(4096)
+header_text = resp.split(b'\r\n\r\n', 1)[0]
+assert header_text.startswith(b'HTTP/1.1 101'), header_text
+expected_accept = base64.b64encode(
+    hashlib.sha1((key + GUID).encode()).digest()).decode()
+assert ('Sec-WebSocket-Accept: ' + expected_accept).encode() in header_text, (
+    'Sec-WebSocket-Accept mismatch -- handshake was not relayed byte-exact')
+
+def echo_check(payload, chunk_size):
+    s.sendall(payload)
+    received = b''
+    while len(received) < len(payload):
+        chunk = s.recv(chunk_size)
+        if not chunk:
+            raise AssertionError('connection closed early')
+        received += chunk
+    assert received == payload, 'echo mismatch for %d-byte payload' % len(payload)
+
+echo_check(os.urandom(1000), 4096)
+echo_check(os.urandom(50000), 65536)  # over one MAGNUS_PROXY_BUFFER (16 KiB)
+s.close()
+print('ws ok')
+"
+
+# Non-WebSocket traffic through the very same magnus instance -- proxying
+# a WebSocket upgrade must not disturb ordinary proxied requests.
+printf '%s\n' 'still ordinary' >"$web_root/still-ordinary.txt"
+test "$(curl --fail --silent "http://127.0.0.1:$port_ws/still-ordinary.txt")" \
+  = 'still ordinary'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=

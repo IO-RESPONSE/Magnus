@@ -6,7 +6,7 @@ LDLIBS ?= -lssl -lcrypto -lpthread
 
 SOURCES := src/magnus.c src/magnus_config.c src/magnus_dns.c src/magnus_http.c \
            src/magnus_phase.c src/magnus_policy.c src/magnus_proxy.c \
-           src/magnus_route.c
+           src/magnus_route.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -60,15 +60,18 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 		src/magnus_route.c src/magnus_http.c $(LDFLAGS) -o $@
 
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
-		build/test-route build/test-dns build/fuzz-http build/fuzz-route
+		build/test-route build/test-dns build/test-ws build/fuzz-http \
+		build/fuzz-route build/fuzz-ws
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
 	./build/test-config
 	./build/test-route
 	./build/test-dns
+	./build/test-ws
 	./build/fuzz-http
 	./build/fuzz-route
+	./build/fuzz-ws
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -110,6 +113,14 @@ build/fuzz-route: tests/fuzz-route.c src/magnus_route.c src/magnus_route.h \
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-route.c src/magnus_route.c \
 		src/magnus_http.c -o $@
+
+build/test-ws: tests/test-ws.c src/magnus_ws.c src/magnus_ws.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-ws.c src/magnus_ws.c -o $@
+
+build/fuzz-ws: tests/fuzz-ws.c src/magnus_ws.c src/magnus_ws.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-ws.c src/magnus_ws.c -o $@
 
 clean:
 	rm -rf build

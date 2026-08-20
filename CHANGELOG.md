@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.5.0
+
+### Added
+
+- **WebSocket proxying** (roadmap Phase 1d). `/proxy/*` (or any matched
+  `action=proxy` route) now recognizes an RFC 6455 upgrade attempt
+  (`Upgrade: websocket`, a `Connection` header containing "upgrade", and
+  a non-empty `Sec-WebSocket-Key`) and relays it to the upstream instead
+  of rejecting it or handling it as an ordinary request: the handshake's
+  `Upgrade`/`Connection`/`Sec-WebSocket-Key`/`-Version`/`-Protocol`/
+  `-Extensions` headers are forwarded verbatim (magnus does not
+  negotiate or interpret a subprotocol or extension itself -- see
+  below), and if the upstream answers `101 Switching Protocols`, that
+  response is relayed back byte-exact and the connection pair becomes a
+  raw bidirectional pipe for as long as it stays open. Any other status
+  for the same attempt is just an ordinary proxied response -- magnus
+  never promises the client an upgrade, only relays the attempt.
+- The relay itself is bounded-chunk byte shoveling with proper
+  backpressure in both directions (mirroring the pattern already used
+  for ordinary proxied response bodies), not per-frame reassembly: since
+  the proxy never interprets WebSocket frame *content*, correctness and
+  memory-safety come from the same bounded streaming already proven for
+  HTTP bodies, regardless of what the relayed bytes mean at the framing
+  layer. This also means an extension like permessage-deflate "just
+  works" through the proxy without magnus needing to understand it --
+  the bytes are never decoded here at all.
+- New module `magnus_ws.c`/`.h`: an RFC 6455 frame-*header* parser
+  (opcode, fin, mask bit, minimal-encoding-checked 7/16/64-bit payload
+  length, masking-direction validation, control-frame constraints),
+  independently unit-tested and fuzzed (`tests/fuzz-ws.c`, 200k
+  iterations in `make test`, 4M+ verified separately across two seeds
+  under ASan+UBSan). Deliberately **not** wired into the live relay path
+  in this release -- the relay does not need it for correctness or
+  safety (see above) -- but built and verified now as real groundwork
+  for live per-frame policy (size limits, masking-direction enforcement)
+  as a future increment, per "a new binary parser is new attack surface"
+  in docs/development-roadmap.md's 1d entry.
+- A WebSocket-upgraded connection is never returned to the 1.2.0
+  connection pool (it is not a reusable HTTP/1.1 keep-alive connection
+  once upgraded) and is exempt from every Content-Length-based framing
+  decision that ordinary proxied responses go through, since none of it
+  applies to a 101 response.
+
+Verified end-to-end against a real, independent WebSocket client library
+(Python's `websockets` package, not this project's own code exercising
+itself): 5 sequential text-message round trips, a 1 KiB binary message,
+and a 50 KB message that crosses multiple relay-buffer chunks
+(`MAGNUS_PROXY_BUFFER`, 16 KiB) all echoed correctly through the proxy,
+including with 3 concurrent WebSocket connections and an ordinary
+(non-WebSocket) proxied request against the same magnus instance staying
+unaffected throughout. New coverage in `tests/test-core.sh` uses a
+minimal stdlib-only (no added test dependency) raw-socket handshake and
+echo check instead, verifying the relayed `Sec-WebSocket-Accept` is
+byte-exact (proof the handshake was not corrupted or recomputed) and
+that a >16 KiB payload echoes correctly. Along the way, found and fixed a
+real bug during this verification: the *existing* header-sanitizing
+function tokenizes its input buffer in place (replacing `\r`/`\n` with
+NUL as part of `strtok_r`), and the new WebSocket code was reading from
+that now-corrupted buffer to build the verbatim 101 relay -- root-caused
+by a raw-socket handshake dump showing literal NUL bytes where `\r`
+should have been, fixed by giving the sanitizer its own scratch copy.
+`make clean && make test` and `make sanitize` both green. Image
+rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.4.0
 
 ### Added

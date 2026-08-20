@@ -5,6 +5,7 @@
 #include "magnus_dns.h"
 #include "magnus_proxy.h"
 #include "magnus_route.h"
+#include "magnus_ws.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -20,6 +21,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/random.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
@@ -28,7 +30,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
-#define MAGNUS_VERSION "1.4.0"
+#define MAGNUS_VERSION "1.5.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -78,7 +80,13 @@ typedef struct {
     bool proxy_connected;
     bool proxy_headers_sent;
     bool proxy_eof;
-    char proxy_request[512];
+    /* Sized for the worst case a WebSocket handshake relay can produce
+     * (forward_path up to 255 bytes, Sec-WebSocket-Protocol/-Extensions
+     * up to 191 bytes each per magnus_http_header_t's own field size,
+     * plus fixed overhead) -- 512 was enough for the plain-request format
+     * alone but is not always enough once those headers are forwarded
+     * verbatim. */
+    char proxy_request[1280];
     size_t proxy_request_length;
     size_t proxy_request_sent;
     /* How much of `body` has been relayed to the upstream so far, once
@@ -107,6 +115,20 @@ typedef struct {
      * MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION share and should be closed
      * rather than pooled again. */
     unsigned proxy_upstream_requests_served;
+    /* WebSocket (1d): proxy_ws_requested is set as soon as the client's
+     * request is recognized as an upgrade attempt, before the upstream
+     * has answered -- magnus_proxy_receive_headers() only actually
+     * engages relay mode (proxy_ws_active) if the upstream comes back
+     * with 101; any other status is just a normal (if unusual) proxied
+     * response, handled exactly like one. Once proxy_ws_active, this
+     * connection pair is a raw bidirectional byte pipe: ws_buffer carries
+     * client->upstream bytes (mirroring proxy_buffer's existing
+     * upstream->client role) -- see magnus_ws_pump_direction(). */
+    bool proxy_ws_requested;
+    bool proxy_ws_active;
+    char *ws_buffer;
+    size_t ws_buffer_length;
+    size_t ws_buffer_sent;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -495,6 +517,8 @@ static int magnus_update_interest(int epoll_fd,
                                   uint32_t events);
 static ssize_t magnus_socket_write(magnus_connection_t *connection,
                                    const void *buffer, size_t length);
+static ssize_t magnus_socket_read(magnus_connection_t *connection,
+                                  void *buffer, size_t length);
 static void magnus_prepare_response(magnus_connection_t *connection,
                                     unsigned status, const char *reason,
                                     const char *content_type, const char *body,
@@ -502,10 +526,13 @@ static void magnus_prepare_response(magnus_connection_t *connection,
                                     magnus_request_t *request);
 static char *magnus_find_header_end(char *buffer, size_t length);
 static int magnus_process_input(int epoll_fd, magnus_connection_t *connection);
+static int magnus_ws_update_interest(int epoll_fd, magnus_connection_t *connection);
+static int magnus_ws_service(int epoll_fd, magnus_connection_t *connection);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
                                        const magnus_request_t *request,
+                                       const magnus_http_request_t *parsed,
                                        const char *forward_path,
                                        const char *client_affinity_key,
                                        bool client_wants_close);
@@ -576,6 +603,7 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->file_buffer);
     free(connection->proxy_buffer);
     free(connection->proxy_header_out);
+    free(connection->ws_buffer);
     /* Safety net: normally already freed by magnus_free_body_if_unowned()
      * or once fully relayed in magnus_handle_upstream(), but a connection
      * can close mid-body (client abort, retry budget exhausted before any
@@ -748,6 +776,7 @@ magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
     connection->proxy_has_response_length = false;
     connection->proxy_response_length = 0;
     connection->proxy_response_received = 0;
+    connection->proxy_ws_active = false;
     connection->proxy_upstream_requests_served = requests_served;
     connection->proxy_endpoint_index = endpoint_index;
     connection->proxy_connect_started = time(NULL);
@@ -869,6 +898,7 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                             const magnus_request_t *request,
+                            const magnus_http_request_t *parsed,
                             const char *forward_path,
                             const char *client_affinity_cookie,
                             bool client_wants_close)
@@ -876,6 +906,79 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
     int written;
     size_t preferred_index;
     bool sticky;
+    bool is_websocket;
+
+    /* RFC 6455 6.1: a client upgrade request needs all of Upgrade:
+     * websocket, a Connection token containing "upgrade" (a
+     * comma-separated list, not necessarily exactly that value -- e.g.
+     * "keep-alive, Upgrade" is common), and a non-empty Sec-WebSocket-Key.
+     * GET is not re-checked here since is_proxy_route's caller
+     * (magnus_dispatch_request()) already only reaches this function for
+     * GET/HEAD or an is_proxy_route request, and a WebSocket handshake is
+     * always a GET in practice; nothing downstream depends on rejecting a
+     * technically-off-spec non-GET upgrade attempt more strictly than
+     * that. */
+    {
+        const char *upgrade = magnus_http_header_find(parsed, "upgrade");
+        const char *conn = magnus_http_header_find(parsed, "connection");
+        const char *key = magnus_http_header_find(parsed, "sec-websocket-key");
+        is_websocket = upgrade != NULL && strcasecmp(upgrade, "websocket") == 0
+            && conn != NULL && strcasestr(conn, "upgrade") != NULL
+            && key != NULL && key[0] != '\0';
+    }
+    connection->proxy_ws_requested = is_websocket;
+
+    if (is_websocket) {
+        const char *version = magnus_http_header_find(parsed, "sec-websocket-version");
+        const char *protocol = magnus_http_header_find(parsed, "sec-websocket-protocol");
+        const char *extensions = magnus_http_header_find(parsed, "sec-websocket-extensions");
+        const char *key = magnus_http_header_find(parsed, "sec-websocket-key");
+        char protocol_line[256] = "";
+        char extensions_line[256] = "";
+        /* Forwarded transparently, not interpreted: this proxy relays the
+         * upgraded connection as a raw byte pipe (see
+         * magnus_ws_pump_direction()), so it has no need to understand
+         * -- or role in negotiating -- a subprotocol or an extension like
+         * permessage-deflate. Whatever the client offered, the upstream
+         * decides. */
+        if (protocol != NULL)
+            snprintf(protocol_line, sizeof(protocol_line),
+                    "Sec-WebSocket-Protocol: %s\r\n", protocol);
+        if (extensions != NULL)
+            snprintf(extensions_line, sizeof(extensions_line),
+                    "Sec-WebSocket-Extensions: %s\r\n", extensions);
+        written = snprintf(connection->proxy_request,
+                           sizeof(connection->proxy_request),
+                           "%s %s HTTP/1.1\r\nHost: magnus-upstream\r\n"
+                           "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                           "Sec-WebSocket-Key: %s\r\n"
+                           "Sec-WebSocket-Version: %s\r\n"
+                           "%s%sX-Magnus-Request-Id: %s\r\n\r\n",
+                           request->method, forward_path, key,
+                           version != NULL ? version : "13",
+                           protocol_line, extensions_line,
+                           request->request_id);
+        if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
+            return -1;
+        connection->proxy_request_length = (size_t) written;
+        connection->proxy_client_wants_close = false; /* N/A once upgraded */
+        memcpy(connection->proxy_request_id, request->request_id,
+              sizeof(connection->proxy_request_id));
+        connection->proxy_attempt = 0;
+        connection->proxy_issue_affinity_cookie = false;
+        for (;;) {
+            int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
+                                                 NULL);
+            if (endpoint < 0) return -1;
+            connection->proxy_attempt++;
+            if (magnus_proxy_connect_endpoint(epoll_fd, connection,
+                                              (size_t) endpoint) == 0)
+                return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
+            magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                                  magnus_now_ms());
+            if (connection->proxy_attempt >= MAGNUS_PROXY_MAX_ATTEMPTS) return -1;
+        }
+    }
 
     /* connection->body/body_length carry whatever request body was
      * buffered before dispatch reached here (empty for GET/HEAD and any
@@ -1086,6 +1189,18 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
     connection->proxy_buffer_length = 0;
     connection->proxy_buffer_sent = 0;
 
+    /* The 101 response (and any WebSocket frame bytes that arrived
+     * attached to the same read as its headers) has now been fully
+     * relayed to the client -- hand off to the raw bidirectional pump
+     * instead of any of the ordinary "is this proxied response complete"
+     * reasoning below, none of which applies once upgraded. Both
+     * buffers are empty at this point (the drain loops above only ever
+     * reach here once they have fully sent whatever they held), so
+     * magnus_ws_update_interest() will correctly arm both fds for
+     * reading. */
+    if (connection->proxy_ws_active)
+        return magnus_ws_update_interest(epoll_fd, connection);
+
     {
         bool complete_by_length = connection->proxy_has_response_length
             && connection->proxy_response_received
@@ -1145,6 +1260,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     size_t header_length;
     size_t leftover;
     char header_copy[MAGNUS_PROXY_HEADER_LIMIT + 1];
+    char sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
     int sanitized_length;
@@ -1202,7 +1318,14 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
                                            "Bad Gateway");
     memcpy(header_copy, connection->proxy_buffer, header_length);
     header_copy[header_length] = '\0';
-    sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
+    /* magnus_proxy_sanitize_response_headers() tokenizes its `raw` buffer
+     * in place (replacing the \r/\n delimiters it splits on with NUL as
+     * part of strtok_r) -- it needs its own scratch copy so header_copy
+     * itself stays byte-for-byte intact for the WebSocket 101 case below,
+     * which relays it verbatim rather than using sanitize's output at
+     * all. */
+    memcpy(sanitize_scratch, header_copy, header_length + 1);
+    sanitized_length = magnus_proxy_sanitize_response_headers(sanitize_scratch,
         header_length, sanitized, sizeof(sanitized),
         connection->proxy_issue_affinity_cookie
             ? connection->proxy_affinity_key : NULL,
@@ -1210,6 +1333,50 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     if (sanitized_length < 0)
         return magnus_proxy_connect_failed(epoll_fd, connection, 502,
                                            "Bad Gateway");
+
+    /* A WebSocket upgrade attempt that the upstream actually confirmed
+     * (101): relay every header as-is, not the sanitized/hop-by-hop-
+     * stripped block above -- Connection: Upgrade, Upgrade: websocket,
+     * and Sec-WebSocket-Accept are exactly what the client needs to see
+     * to know the upgrade succeeded, and normal hop-by-hop filtering
+     * would strip the first two. header_copy is already a complete,
+     * well-formed "status line + headers + blank line" block (that is
+     * what header_length spans), so it can be relayed verbatim with no
+     * further parsing. Any other status for a requested-but-not-granted
+     * upgrade (a plain 200, a 404, whatever the upstream decided) falls
+     * through to the normal sanitized path below exactly like any other
+     * proxied response -- magnus_dispatch_request() never promised the
+     * client an upgrade, only relayed the attempt. */
+    if (connection->proxy_ws_requested && info.status == 101) {
+        connection->proxy_header_out = malloc(header_length);
+        if (connection->proxy_header_out == NULL)
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
+        memcpy(connection->proxy_header_out, header_copy, header_length);
+        connection->proxy_header_out_length = header_length;
+        connection->proxy_header_out_sent = 0;
+        connection->proxy_buffer_length = leftover;
+        connection->proxy_buffer_sent = 0;
+        connection->proxy_headers_received = true;
+        connection->close_after_write = false;
+        connection->proxy_upstream_poolable = false;
+        connection->proxy_has_response_length = false;
+        connection->proxy_response_length = 0;
+        connection->proxy_response_received = 0;
+        connection->proxy_ws_active = true;
+        magnus_cluster_result(&magnus_cluster, connection->proxy_endpoint_index,
+                              true, magnus_now_ms());
+        magnus_requests_total++;
+        {
+            double latency_ms = (double) (magnus_now_ms()
+                                          - connection->request_started_ms);
+            magnus_record_latency(latency_ms);
+            magnus_access_log(connection->proxy_request_id,
+                              connection->proxy_log_method,
+                              connection->proxy_log_target, 101, latency_ms);
+        }
+        return magnus_proxy_flush(epoll_fd, connection);
+    }
 
     connection->proxy_header_out = malloc((size_t) sanitized_length);
     if (connection->proxy_header_out == NULL)
@@ -1259,10 +1426,137 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     return magnus_proxy_flush(epoll_fd, connection);
 }
 
+/* Sets both fds' epoll interest from the current state of both relay
+ * buffers -- the one function that actually decides what to watch for,
+ * called after every attempt to move bytes in magnus_ws_service() below.
+ * Each direction reads into whichever of the two buffers is "its own"
+ * (ws_buffer for client->upstream, mirroring proxy_buffer's pre-existing
+ * upstream->client role) and writes out of the other pump's buffer, so a
+ * fd's interest is: EPOLLIN once its own outbound buffer is empty (ready
+ * to accept more), EPOLLOUT whenever the *other* direction's buffer still
+ * has unsent bytes destined for it. Always includes EPOLLRDHUP so a
+ * clean shutdown from either peer is still noticed while only one of
+ * EPOLLIN/EPOLLOUT (or neither) is otherwise being watched for. */
+static int
+magnus_ws_update_interest(int epoll_fd, magnus_connection_t *connection)
+{
+    uint32_t client_events = EPOLLRDHUP;
+    uint32_t upstream_events = EPOLLRDHUP;
+    struct epoll_event client_event, upstream_event;
+
+    if (connection->ws_buffer_length == connection->ws_buffer_sent)
+        client_events |= EPOLLIN;
+    else
+        upstream_events |= EPOLLOUT;
+    if (connection->proxy_buffer_length == connection->proxy_buffer_sent)
+        upstream_events |= EPOLLIN;
+    else
+        client_events |= EPOLLOUT;
+
+    client_event = (struct epoll_event) { .events = client_events,
+                                          .data.fd = connection->fd };
+    upstream_event = (struct epoll_event) { .events = upstream_events,
+                                            .data.fd = connection->upstream_fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &client_event) < 0)
+        return -1;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->upstream_fd,
+                 &upstream_event) < 0)
+        return -1;
+    return 0;
+}
+
+/* Moves bytes for one direction of the relay as far as they will go
+ * without blocking: drains whatever is already buffered first (the
+ * backpressure case -- the destination could not take it all last time),
+ * then keeps alternating read/write while data keeps flowing. Mirrors the
+ * read-then-write, EAGAIN/EINTR-handling shape already used for ordinary
+ * proxied response bodies (see magnus_proxy_flush() and the body-read
+ * loop in magnus_handle_upstream()) -- this is that same pattern applied
+ * to a raw pipe with no HTTP framing on top of it, not a new one.
+ * `from_client` selects the direction: true reads connection->fd and
+ * writes connection->upstream_fd (through ws_buffer); false is the
+ * reverse (through proxy_buffer, already allocated from the handshake).
+ * Returns -1 if either peer closed or a hard I/O error occurred (the
+ * whole relay pair is torn down on any such error, same as an ordinary
+ * proxied connection breaking mid-response), 0 otherwise -- including
+ * when it stopped only because it would have blocked, which is the
+ * common case and not a problem the caller needs to react to beyond
+ * calling magnus_ws_update_interest() once both directions have been
+ * tried. */
+static int
+magnus_ws_pump_direction(magnus_connection_t *connection, bool from_client)
+{
+    char *buffer = from_client ? connection->ws_buffer : connection->proxy_buffer;
+    size_t *length = from_client ? &connection->ws_buffer_length
+                                  : &connection->proxy_buffer_length;
+    size_t *sent = from_client ? &connection->ws_buffer_sent
+                                : &connection->proxy_buffer_sent;
+
+    for (;;) {
+        while (*sent < *length) {
+            ssize_t written = from_client
+                ? send(connection->upstream_fd, buffer + *sent,
+                      *length - *sent, MSG_NOSIGNAL)
+                : magnus_socket_write(connection, buffer + *sent,
+                                     *length - *sent);
+            if (written > 0) {
+                *sent += (size_t) written;
+                connection->last_active = time(NULL);
+                connection->proxy_last_activity = connection->last_active;
+                continue;
+            }
+            if (written < 0 && errno == EINTR) continue;
+            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            return -1;
+        }
+        *length = 0;
+        *sent = 0;
+        {
+            ssize_t received = from_client
+                ? magnus_socket_read(connection, buffer, MAGNUS_PROXY_BUFFER)
+                : recv(connection->upstream_fd, buffer, MAGNUS_PROXY_BUFFER, 0);
+            if (received > 0) {
+                *length = (size_t) received;
+                connection->last_active = time(NULL);
+                connection->proxy_last_activity = connection->last_active;
+                continue;
+            }
+            if (received == 0) return -1;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+    }
+}
+
+/* Entry point for any epoll event on either fd of a WebSocket-upgraded
+ * connection pair once magnus_proxy_ws_active is set: always attempts
+ * both directions regardless of which specific fd's event fired (a
+ * would-block on the direction that was not actually ready simply
+ * returns immediately), then recomputes both fds' interest once from
+ * the result. Lazily allocates ws_buffer on first use -- proxy_buffer
+ * already exists from the handshake, but nothing needed the
+ * client->upstream direction's buffer before now. */
+static int
+magnus_ws_service(int epoll_fd, magnus_connection_t *connection)
+{
+    if (connection->ws_buffer == NULL) {
+        connection->ws_buffer = malloc(MAGNUS_PROXY_BUFFER);
+        if (connection->ws_buffer == NULL) return -1;
+    }
+    if (magnus_ws_pump_direction(connection, true) < 0) return -1;
+    if (magnus_ws_pump_direction(connection, false) < 0) return -1;
+    return magnus_ws_update_interest(epoll_fd, connection);
+}
+
 static int
 magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
                        uint32_t flags)
 {
+    if (connection->proxy_ws_active) {
+        if ((flags & (EPOLLERR | EPOLLHUP)) != 0) return -1;
+        return magnus_ws_service(epoll_fd, connection);
+    }
     struct epoll_event event;
     if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
         if (connection->proxy_response_started)
@@ -1751,7 +2045,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "not found\n", head_only, close_connection,
                                 &request);
     } else if (is_proxy_route) {
-        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request,
+        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request, parsed,
                                         proxy_forward_path,
                                         parsed->affinity_key,
                                         close_connection) == 0) {
@@ -2937,7 +3231,10 @@ main(int argc, char **argv)
                 || (connection = magnus_connections[fd]) == NULL) {
                 continue;
             }
-            if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+            if (connection->proxy_ws_active) {
+                result = (flags & (EPOLLERR | EPOLLHUP)) != 0
+                    ? -1 : magnus_ws_service(epoll_fd, connection);
+            } else if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
                 result = -1;
             } else if (!connection->tls_ready) {
                 result = magnus_tls_handshake(epoll_fd, connection);

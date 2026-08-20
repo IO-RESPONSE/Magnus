@@ -167,14 +167,24 @@ checkpoint from the prior sub-phase being green.
    first genuinely concurrent code -- the worker thread never touches
    anything outside its own module, so that is also the only place a
    race could exist, and TSan confirms none does.
-4. **1d — WebSocket.** HTTP Upgrade handshake, RFC 6455 frame parsing
-   (text/binary/ping/pong/close/fragmentation, client-frame unmasking,
-   large-frame handling), and proxying the upgraded connection as a raw
-   bidirectional byte pipe once the handshake completes. Bounded scope
-   compared to HTTP/2 — no multiplexing, no compression extension in v1 —
-   but a new binary parser is new attack surface, so it gets the same
-   fuzz-harness treatment `tests/fuzz-http.c` already gives the HTTP/1
-   parser before this sub-phase is called done.
+4. **1d — WebSocket. Shipped in 1.5.0.** Handshake relay (Upgrade/
+   Connection/Sec-WebSocket-* headers forwarded verbatim, a 101 response
+   relayed byte-exact) plus a raw bidirectional byte-pipe relay once
+   upgraded — turned out not to need live per-frame parsing at all for
+   correctness or memory-safety, since the relay never interprets frame
+   *content*: the same bounded-chunk streaming already proven for
+   ordinary proxied bodies is sufficient regardless of what the bytes
+   mean at the framing layer. The RFC 6455 frame-*header* parser this
+   entry originally asked for was still built and fuzzed
+   (`magnus_ws.c`/`.h`, `tests/fuzz-ws.c`) as real groundwork for live
+   per-frame policy (size limits, masking-direction enforcement) — just
+   deliberately not wired into the relay path yet, since it is not load-
+   bearing for what shipped. Verified against a real, independent
+   WebSocket client library (Python's `websockets`), not just this
+   project's own code — which is how a real bug got caught: the
+   pre-existing response-header sanitizer tokenizes its buffer in place,
+   and the new code was building the verbatim 101 relay from that
+   now-corrupted buffer (see CHANGELOG.md 1.5.0).
 5. **1e — HTTP/2.** Deliberately last and expected to be the largest single
    piece of work in Phase 1: ALPN negotiation, h2c upgrade, HPACK
    (header compression — see Section 5, hand-rolling this is where CVEs

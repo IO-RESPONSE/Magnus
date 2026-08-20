@@ -33,6 +33,10 @@ independently by IORESPONSE.
   resolved asynchronously on a dedicated background thread (this
   codebase's first thread) so the event loop never blocks; fixed-interval
   refresh, keeps the last-known-good address on a failed refresh
+- WebSocket proxying: `/proxy/*` (or a matched `action=proxy` route)
+  relays an RFC 6455 upgrade handshake and, once the upstream confirms it
+  with 101, becomes a raw bidirectional byte pipe for the life of the
+  connection
 - Multi-endpoint cluster routing (weighted round-robin), wired to live
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP
