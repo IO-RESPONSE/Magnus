@@ -3,6 +3,7 @@
 #include "magnus_http.h"
 #include "magnus_policy.h"
 #include "magnus_dns.h"
+#include "magnus_h2.h"
 #include "magnus_proxy.h"
 #include "magnus_route.h"
 #include "magnus_ws.h"
@@ -29,8 +30,9 @@
 #include <unistd.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.5.0"
+#define MAGNUS_VERSION "1.6.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -57,6 +59,17 @@
  * actual TTL -- see magnus_dns.h's design note on why this module cannot
  * see a real TTL at all without hand-rolling DNS wire-format parsing. */
 #define MAGNUS_DNS_REFRESH_SECONDS 30
+/* Cap on concurrent streams per HTTP/2 connection (roadmap 1e-1): plenty
+ * for a browser's fan-out of a single page's static assets, small enough
+ * that a hostile client opening streams as fast as possible cannot grow
+ * this connection's own bookkeeping (the h2_streams list) without bound
+ * -- nghttp2 itself enforces the limit once advertised via SETTINGS. */
+#define MAGNUS_H2_MAX_CONCURRENT_STREAMS 128
+
+/* Forward-declared so magnus_connection_t can hold a pointer to it;
+ * fully defined alongside the rest of the HTTP/2 (1e-1) implementation,
+ * near magnus_h2_session_create() below. */
+struct magnus_h2_stream;
 
 typedef struct {
     int fd;
@@ -129,6 +142,32 @@ typedef struct {
     char *ws_buffer;
     size_t ws_buffer_length;
     size_t ws_buffer_sent;
+    /* HTTP/2 (1e-1): set once ALPN negotiates "h2" in
+     * magnus_tls_handshake(), right alongside tls_ready. From that point
+     * this connection is driven exclusively by magnus_h2_service() (see
+     * the main dispatch loop's early branch, mirroring proxy_ws_active's
+     * own early branch for an upgraded WebSocket connection) -- static
+     * file serving is the only thing 1e-1 dispatches to; a later
+     * sub-phase adds proxy/route dispatch over h2. h2_streams is the
+     * head of a small intrusive linked list of every stream still open
+     * on this connection, kept only so magnus_close_connection() can
+     * walk and free them: nghttp2_session_del() does not itself invoke
+     * the stream-close callback for streams still open when the session
+     * is torn down, and each stream may be holding an open static-file
+     * fd. h2_output/_length/_sent hold whatever serialized bytes
+     * nghttp2_session_mem_send2() has already produced but a partial,
+     * would-block socket write could not get rid of yet -- unlike
+     * proxy_buffer/ws_buffer's own relay buffers, nghttp2 only
+     * guarantees a mem_send2() chunk's pointer stays valid until the
+     * *next* mem_send2/mem_recv2 call, so any unsent remainder has to be
+     * copied out here before this connection is allowed to ask nghttp2
+     * for anything else. */
+    bool h2_active;
+    nghttp2_session *h2_session;
+    struct magnus_h2_stream *h2_streams;
+    char *h2_output;
+    size_t h2_output_length;
+    size_t h2_output_sent;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -528,6 +567,9 @@ static char *magnus_find_header_end(char *buffer, size_t length);
 static int magnus_process_input(int epoll_fd, magnus_connection_t *connection);
 static int magnus_ws_update_interest(int epoll_fd, magnus_connection_t *connection);
 static int magnus_ws_service(int epoll_fd, magnus_connection_t *connection);
+static int magnus_h2_session_create(magnus_connection_t *connection);
+static int magnus_h2_service(int epoll_fd, magnus_connection_t *connection);
+static void magnus_h2_close(magnus_connection_t *connection);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
@@ -604,6 +646,7 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->proxy_buffer);
     free(connection->proxy_header_out);
     free(connection->ws_buffer);
+    magnus_h2_close(connection);
     /* Safety net: normally already freed by magnus_free_body_if_unowned()
      * or once fully relayed in magnus_handle_upstream(), but a connection
      * can close mid-body (client abort, retry budget exhausted before any
@@ -1711,7 +1754,14 @@ magnus_tls_handshake(int epoll_fd, magnus_connection_t *connection)
     int result = SSL_accept(connection->tls);
     int ssl_error;
     if (result == 1) {
+        const unsigned char *alpn = NULL;
+        unsigned int alpn_length = 0;
         connection->tls_ready = true;
+        SSL_get0_alpn_selected(connection->tls, &alpn, &alpn_length);
+        if (alpn != NULL && alpn_length == 2 && alpn[0] == 'h' && alpn[1] == '2') {
+            if (magnus_h2_session_create(connection) != 0) return -1;
+            return magnus_h2_service(epoll_fd, connection);
+        }
         return magnus_update_interest(epoll_fd, connection, EPOLLIN | EPOLLRDHUP);
     }
     ssl_error = SSL_get_error(connection->tls, result);
@@ -1817,6 +1867,432 @@ magnus_update_interest(int epoll_fd, magnus_connection_t *connection,
 {
     struct epoll_event event = { .events = events, .data.fd = connection->fd };
     return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &event);
+}
+
+/* ---- HTTP/2 (roadmap Phase 1e-1): ALPN-negotiated "h2", nghttp2-driven
+ * session, static-file responses only -- no proxy/route dispatch over h2
+ * yet, and no h2c (cleartext upgrade). See magnus_h2.c/.h for the
+ * standalone, independently-tested ALPN selection callback; everything
+ * below is the actual session/stream wiring, which lives here because
+ * nghttp2's callback model needs direct access to this file's
+ * static-file-serving (magnus_open_static/magnus_content_type) and
+ * socket-I/O (magnus_socket_read/write) internals. */
+
+/* One nghttp2 stream's worth of request/response state. Deliberately
+ * minimal -- 1e-1 only ever serves a static file per stream, so all a
+ * stream needs to remember is which one and how far it has gotten. An
+ * intrusive doubly-linked list (next/prev) threads every stream still
+ * open on a connection onto that connection's h2_streams head, purely so
+ * magnus_close_connection() can walk and free them; nghttp2_session_del()
+ * does not itself invoke the stream-close callback for streams still
+ * open when a session is torn down, and a stream may be holding an open
+ * file_fd. */
+struct magnus_h2_stream {
+    struct magnus_h2_stream *next;
+    struct magnus_h2_stream *prev;
+    magnus_connection_t *connection;
+    int32_t stream_id;
+    char method[8];
+    char path[256];
+    /* True if the client's :method or :path pseudo-header value would
+     * not fit the fixed buffer above -- rather than truncating and
+     * silently resolving the wrong (shorter) path, such a request is
+     * answered with 405/414 and never reaches magnus_open_static() at
+     * all. */
+    bool method_overflow;
+    bool path_overflow;
+    bool head_only;
+    /* Set the moment magnus_h2_dispatch() runs, so a second END_STREAM-
+     * bearing frame on the same stream (defensively -- HTTP/2 framing
+     * should never actually produce one) cannot dispatch it twice. */
+    bool dispatched;
+    int file_fd;
+    off_t file_offset;
+    off_t file_length;
+};
+
+static struct magnus_h2_stream *
+magnus_h2_stream_new(magnus_connection_t *connection, int32_t stream_id)
+{
+    struct magnus_h2_stream *stream = calloc(1, sizeof(*stream));
+    if (stream == NULL) return NULL;
+    stream->connection = connection;
+    stream->stream_id = stream_id;
+    stream->file_fd = -1;
+    stream->next = connection->h2_streams;
+    stream->prev = NULL;
+    if (connection->h2_streams != NULL) connection->h2_streams->prev = stream;
+    connection->h2_streams = stream;
+    return stream;
+}
+
+static void
+magnus_h2_stream_free(struct magnus_h2_stream *stream)
+{
+    magnus_connection_t *connection = stream->connection;
+    if (stream->prev != NULL) stream->prev->next = stream->next;
+    else connection->h2_streams = stream->next;
+    if (stream->next != NULL) stream->next->prev = stream->prev;
+    if (stream->file_fd >= 0) close(stream->file_fd);
+    free(stream);
+}
+
+static nghttp2_nv
+magnus_h2_nv(const char *name, const char *value)
+{
+    /* nghttp2_nv's fields are non-const uint8_t* because the same struct
+     * doubles as an "I'll hand you memory to keep, don't copy it" slot
+     * (the NGHTTP2_NV_FLAG_NO_COPY_* flags, unused here) -- with those
+     * flags absent (NGHTTP2_NV_FLAG_NONE below), nghttp2_submit_response2
+     * copies both strings into its own storage before returning, so this
+     * cast never lets nghttp2 hold on to memory it does not own. */
+    return (nghttp2_nv) {
+        .name = (uint8_t *) name, .value = (uint8_t *) value,
+        .namelen = strlen(name), .valuelen = strlen(value),
+        .flags = NGHTTP2_NV_FLAG_NONE,
+    };
+}
+
+static void
+magnus_h2_submit_status(nghttp2_session *session, int32_t stream_id,
+                        const char *status)
+{
+    nghttp2_nv headers[2] = {
+        magnus_h2_nv(":status", status),
+        magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION),
+    };
+    (void) nghttp2_submit_response2(session, stream_id, headers, 2, NULL);
+}
+
+static nghttp2_ssize
+magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
+                    size_t length, uint32_t *data_flags,
+                    nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    off_t remaining = stream->file_length - stream->file_offset;
+    ssize_t got;
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    if (remaining <= 0) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+    if ((off_t) length > remaining) length = (size_t) remaining;
+    got = pread(stream->file_fd, buf, length, stream->file_offset);
+    if (got < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    stream->file_offset += got;
+    if (got == 0 || stream->file_offset >= stream->file_length)
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return got;
+}
+
+/* Serves stream->path as a static file, exactly like the HTTP/1.1 GET
+ * path (magnus_open_static() + magnus_content_type(), same helpers) --
+ * reused rather than reimplemented so both protocols agree on path
+ * resolution/traversal safety by construction. Called once per stream,
+ * the moment its request headers (and any body -- ignored, since a
+ * static GET/HEAD is never expected to carry one) are fully received. */
+static void
+magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *stream)
+{
+    nghttp2_session *session = connection->h2_session;
+    struct stat metadata;
+    int fd;
+    bool method_ok;
+    char content_length[32];
+    nghttp2_nv headers[4];
+
+    stream->dispatched = true;
+    method_ok = !stream->method_overflow
+        && (strcmp(stream->method, "GET") == 0
+            || strcmp(stream->method, "HEAD") == 0);
+    if (!method_ok) {
+        magnus_h2_submit_status(session, stream->stream_id, "405");
+        return;
+    }
+    if (stream->path_overflow) {
+        magnus_h2_submit_status(session, stream->stream_id, "414");
+        return;
+    }
+    fd = magnus_open_static(stream->path, &metadata);
+    if (fd < 0) {
+        magnus_h2_submit_status(session, stream->stream_id, "404");
+        return;
+    }
+    stream->head_only = strcmp(stream->method, "HEAD") == 0;
+    stream->file_offset = 0;
+    stream->file_length = metadata.st_size;
+    snprintf(content_length, sizeof(content_length), "%lld",
+            (long long) metadata.st_size);
+    headers[0] = magnus_h2_nv(":status", "200");
+    headers[1] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
+    headers[2] = magnus_h2_nv("content-type", magnus_content_type(stream->path));
+    headers[3] = magnus_h2_nv("content-length", content_length);
+    if (stream->head_only) {
+        close(fd);
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
+                                        NULL);
+        return;
+    }
+    stream->file_fd = fd;
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_read_file,
+        };
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers, 4,
+                                        &data_provider);
+    }
+}
+
+static int
+magnus_h2_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
+                           void *user_data)
+{
+    magnus_connection_t *connection = user_data;
+    struct magnus_h2_stream *stream;
+    if (frame->hd.type != NGHTTP2_HEADERS
+        || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+        return 0;
+    stream = magnus_h2_stream_new(connection, frame->hd.stream_id);
+    if (stream == NULL) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (nghttp2_session_set_stream_user_data(session, frame->hd.stream_id,
+                                             stream) != 0) {
+        magnus_h2_stream_free(stream);
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return 0;
+}
+
+static int
+magnus_h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
+                    const uint8_t *name, size_t namelen, const uint8_t *value,
+                    size_t valuelen, uint8_t flags, void *user_data)
+{
+    struct magnus_h2_stream *stream;
+    (void) flags;
+    (void) user_data;
+    if (frame->hd.type != NGHTTP2_HEADERS
+        || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+        return 0;
+    stream = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+    if (stream == NULL) return 0;
+    if (namelen == 7 && memcmp(name, ":method", 7) == 0) {
+        if (valuelen >= sizeof(stream->method)) {
+            stream->method_overflow = true;
+            return 0;
+        }
+        memcpy(stream->method, value, valuelen);
+        stream->method[valuelen] = '\0';
+    } else if (namelen == 5 && memcmp(name, ":path", 5) == 0) {
+        if (valuelen >= sizeof(stream->path)) {
+            stream->path_overflow = true;
+            return 0;
+        }
+        memcpy(stream->path, value, valuelen);
+        stream->path[valuelen] = '\0';
+    }
+    return 0;
+}
+
+static int
+magnus_h2_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
+                        void *user_data)
+{
+    magnus_connection_t *connection = user_data;
+    struct magnus_h2_stream *stream;
+    if ((frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA)
+        || (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0)
+        return 0;
+    if (frame->hd.type == NGHTTP2_HEADERS
+        && frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+        return 0;
+    stream = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+    if (stream == NULL || stream->dispatched) return 0;
+    magnus_h2_dispatch(connection, stream);
+    return 0;
+}
+
+static int
+magnus_h2_on_stream_close(nghttp2_session *session, int32_t stream_id,
+                          uint32_t error_code, void *user_data)
+{
+    struct magnus_h2_stream *stream
+        = nghttp2_session_get_stream_user_data(session, stream_id);
+    (void) error_code;
+    (void) user_data;
+    if (stream != NULL) magnus_h2_stream_free(stream);
+    return 0;
+}
+
+static int
+magnus_h2_session_create(magnus_connection_t *connection)
+{
+    nghttp2_session_callbacks *callbacks;
+    nghttp2_settings_entry settings[1] = {
+        { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+          MAGNUS_H2_MAX_CONCURRENT_STREAMS },
+    };
+    int result;
+
+    if (nghttp2_session_callbacks_new(&callbacks) != 0) return -1;
+    nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks,
+        magnus_h2_on_begin_headers);
+    nghttp2_session_callbacks_set_on_header_callback(callbacks,
+        magnus_h2_on_header);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks,
+        magnus_h2_on_frame_recv);
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
+        magnus_h2_on_stream_close);
+
+    result = nghttp2_session_server_new(&connection->h2_session, callbacks,
+                                        connection);
+    nghttp2_session_callbacks_del(callbacks);
+    if (result != 0) return -1;
+
+    if (nghttp2_submit_settings(connection->h2_session, NGHTTP2_FLAG_NONE,
+                                settings, 1) != 0) {
+        nghttp2_session_del(connection->h2_session);
+        connection->h2_session = NULL;
+        return -1;
+    }
+    connection->h2_active = true;
+    return 0;
+}
+
+/* Called from magnus_close_connection() unconditionally (a no-op if h2
+ * was never negotiated on this connection, since every field it touches
+ * is NULL in that case). */
+static void
+magnus_h2_close(magnus_connection_t *connection)
+{
+    while (connection->h2_streams != NULL)
+        magnus_h2_stream_free(connection->h2_streams);
+    if (connection->h2_session != NULL) {
+        nghttp2_session_del(connection->h2_session);
+        connection->h2_session = NULL;
+    }
+    free(connection->h2_output);
+    connection->h2_output = NULL;
+    connection->h2_output_length = 0;
+    connection->h2_output_sent = 0;
+}
+
+/* Flushes whatever was left over from a previous magnus_h2_drain_send()
+ * call that could not be written in one go. Never asks nghttp2 for more
+ * (see magnus_h2_drain_send()'s own comment on why) -- just drains this
+ * buffer as far as the socket allows. */
+static int
+magnus_h2_flush_output(magnus_connection_t *connection)
+{
+    while (connection->h2_output != NULL
+           && connection->h2_output_sent < connection->h2_output_length) {
+        ssize_t sent = magnus_socket_write(connection,
+            connection->h2_output + connection->h2_output_sent,
+            connection->h2_output_length - connection->h2_output_sent);
+        if (sent > 0) {
+            connection->h2_output_sent += (size_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    if (connection->h2_output != NULL) {
+        free(connection->h2_output);
+        connection->h2_output = NULL;
+        connection->h2_output_length = 0;
+        connection->h2_output_sent = 0;
+    }
+    return 0;
+}
+
+/* Pulls as much serialized output as nghttp2 currently has queued
+ * (SETTINGS/HEADERS/DATA/etc. for anything submitted so far -- including
+ * frames nghttp2 generates on its own, like automatic PING/WINDOW_UPDATE
+ * acks) and writes it out. nghttp2_session_mem_send2() only guarantees
+ * the pointer it returns stays valid until the *next* mem_send2 or
+ * mem_recv2 call, so a partial (would-block) write's remainder is copied
+ * into connection->h2_output here rather than retried against the same
+ * pointer later -- once that happens this function must not be called
+ * again until magnus_h2_flush_output() has fully drained it. */
+static int
+magnus_h2_drain_send(magnus_connection_t *connection)
+{
+    nghttp2_session *session = connection->h2_session;
+    for (;;) {
+        const uint8_t *data = NULL;
+        nghttp2_ssize length = nghttp2_session_mem_send2(session, &data);
+        ssize_t sent;
+        if (length < 0) return -1;
+        if (length == 0) return 0;
+        sent = magnus_socket_write(connection, data, (size_t) length);
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) sent = 0;
+        else if (sent < 0) return -1;
+        if ((size_t) sent == (size_t) length) {
+            connection->last_active = time(NULL);
+            continue;
+        }
+        connection->h2_output = malloc((size_t) length - (size_t) sent);
+        if (connection->h2_output == NULL) return -1;
+        memcpy(connection->h2_output, data + sent,
+              (size_t) length - (size_t) sent);
+        connection->h2_output_length = (size_t) length - (size_t) sent;
+        connection->h2_output_sent = 0;
+        return 0;
+    }
+}
+
+static int
+magnus_h2_update_interest(int epoll_fd, magnus_connection_t *connection)
+{
+    uint32_t events = EPOLLRDHUP;
+    int want_read = nghttp2_session_want_read(connection->h2_session);
+    int want_write = nghttp2_session_want_write(connection->h2_session);
+    if (!want_read && !want_write && connection->h2_output == NULL) return -1;
+    if (want_read) events |= EPOLLIN;
+    if (want_write || connection->h2_output != NULL) events |= EPOLLOUT;
+    return magnus_update_interest(epoll_fd, connection, events);
+}
+
+/* Entry point for any epoll event on an h2_active connection's fd, and
+ * also called once, directly, right after magnus_h2_session_create()
+ * succeeds -- that first call is what actually gets the server's initial
+ * SETTINGS frame (queued by nghttp2_submit_settings() at session
+ * creation) onto the wire, since nothing has been read from the client
+ * yet at that point to otherwise trigger a send. */
+static int
+magnus_h2_service(int epoll_fd, magnus_connection_t *connection)
+{
+    unsigned char recv_buffer[MAGNUS_PROXY_BUFFER];
+
+    if (magnus_h2_flush_output(connection) < 0) return -1;
+    if (connection->h2_output == NULL && magnus_h2_drain_send(connection) < 0)
+        return -1;
+    if (connection->h2_output != NULL)
+        return magnus_h2_update_interest(epoll_fd, connection);
+
+    for (;;) {
+        ssize_t received = magnus_socket_read(connection, recv_buffer,
+                                              sizeof(recv_buffer));
+        if (received > 0) {
+            nghttp2_ssize consumed = nghttp2_session_mem_recv2(
+                connection->h2_session, recv_buffer, (size_t) received);
+            if (consumed < 0) return -1;
+            connection->last_active = time(NULL);
+            if (magnus_h2_drain_send(connection) < 0) return -1;
+            if (connection->h2_output != NULL) break;
+            continue;
+        }
+        if (received == 0) return -1;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        return -1;
+    }
+    return magnus_h2_update_interest(epoll_fd, connection);
 }
 
 static char *
@@ -2781,6 +3257,7 @@ magnus_apply_config(const magnus_config_t *config)
             return -1;
         }
         SSL_CTX_set_options(new_tls_context, SSL_OP_NO_COMPRESSION);
+        magnus_h2_configure_alpn(new_tls_context);
     }
     magnus_cluster_init(&new_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS);
@@ -3046,6 +3523,7 @@ magnus_parse_options(int argc, char **argv)
                 exit(2);
             }
             SSL_CTX_set_options(magnus_tls_context, SSL_OP_NO_COMPRESSION);
+            magnus_h2_configure_alpn(magnus_tls_context);
         }
         return port;
     }
@@ -3234,6 +3712,9 @@ main(int argc, char **argv)
             if (connection->proxy_ws_active) {
                 result = (flags & (EPOLLERR | EPOLLHUP)) != 0
                     ? -1 : magnus_ws_service(epoll_fd, connection);
+            } else if (connection->h2_active) {
+                result = (flags & (EPOLLERR | EPOLLHUP)) != 0
+                    ? -1 : magnus_h2_service(epoll_fd, connection);
             } else if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
                 result = -1;
             } else if (!connection->tls_ready) {

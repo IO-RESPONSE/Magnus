@@ -2,11 +2,11 @@ CC ?= cc
 CFLAGS ?= -O2 -pipe -std=c17 -Wall -Wextra -Werror -Wpedantic
 CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
-LDLIBS ?= -lssl -lcrypto -lpthread
+LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2
 
-SOURCES := src/magnus.c src/magnus_config.c src/magnus_dns.c src/magnus_http.c \
-           src/magnus_phase.c src/magnus_policy.c src/magnus_proxy.c \
-           src/magnus_route.c src/magnus_ws.c
+SOURCES := src/magnus.c src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
+           src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
+           src/magnus_proxy.c src/magnus_route.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -60,8 +60,8 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 		src/magnus_route.c src/magnus_http.c $(LDFLAGS) -o $@
 
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
-		build/test-route build/test-dns build/test-ws build/fuzz-http \
-		build/fuzz-route build/fuzz-ws
+		build/test-route build/test-dns build/test-ws build/test-h2 \
+		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
@@ -69,9 +69,11 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-route
 	./build/test-dns
 	./build/test-ws
+	./build/test-h2
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
+	./build/fuzz-h2
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -121,6 +123,16 @@ build/test-ws: tests/test-ws.c src/magnus_ws.c src/magnus_ws.h
 build/fuzz-ws: tests/fuzz-ws.c src/magnus_ws.c src/magnus_ws.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-ws.c src/magnus_ws.c -o $@
+
+build/test-h2: tests/test-h2.c src/magnus_h2.c src/magnus_h2.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-h2.c src/magnus_h2.c \
+		-lssl -lcrypto -o $@
+
+build/fuzz-h2: tests/fuzz-h2.c src/magnus_h2.c src/magnus_h2.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-h2.c src/magnus_h2.c \
+		-lssl -lcrypto -o $@
 
 clean:
 	rm -rf build

@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.6.0
+
+### Added
+
+- **HTTP/2, static files only** (roadmap Phase 1e-1). TLS connections now
+  negotiate ALPN, offering exactly `"h2"`; a client that agrees gets a
+  real nghttp2-driven HTTP/2 session (HPACK, stream multiplexing,
+  SETTINGS/PING/WINDOW_UPDATE all handled by nghttp2 itself, not
+  hand-rolled parsing) instead of HTTP/1.1 -- a client that never offers
+  `"h2"` is unaffected, since ALPN is additive, not a mode switch on the
+  listener. Each stream dispatches to the same static-file-serving
+  helpers (`magnus_open_static()`/`magnus_content_type()`) the existing
+  HTTP/1.1 GET path already uses, so both protocols agree on path
+  resolution and traversal safety by construction, and large files
+  stream out via a `pread()`-based nghttp2 data provider rather than
+  being buffered whole. GET/HEAD only; no request body support (not
+  meaningful for a static-file response); no h2c (cleartext upgrade --
+  ALPN-negotiated TLS only); no proxy/route dispatch over h2 yet (a
+  future 1e increment -- see docs/development-roadmap.md).
+- New module `magnus_h2.c`/`.h`: the ALPN protocol-selection callback,
+  kept small and standalone (no dependency on the rest of magnus.c) so
+  it is independently unit-tested (`tests/test-h2.c`) and fuzzed
+  (`tests/fuzz-h2.c`, 200k iterations in `make test`, 4M+ verified
+  separately across two seeds) exactly like every other new
+  attacker-facing parser this project has added. Deliberately **not**
+  using `SSL_select_next_proto()` -- that function's contract for a
+  malformed/empty client protocol list was itself the subject of a real
+  CVE (CVE-2024-5535); a direct, bounds-checked scan of the RFC 7301
+  length-prefixed client list for the one candidate protocol this
+  project offers sidesteps that history entirely. The actual nghttp2
+  session/stream wiring (request dispatch, the data-source read
+  callback, the send/recv pump) lives directly in `magnus.c`, not
+  `magnus_h2.c`, since nghttp2's callback model needs the same direct
+  access to this file's static-file and socket-I/O internals that the
+  1b/1d route-matching and WebSocket-relay wiring already needed.
+- An h2-negotiated connection's outbound nghttp2-serialized bytes get
+  copied out to a per-connection scratch buffer whenever a socket write
+  can't take everything in one non-blocking call, since
+  `nghttp2_session_mem_send2()` only guarantees its returned pointer
+  stays valid until the *next* nghttp2 call -- unlike this project's
+  other relay buffers (WebSocket, proxy body), which own their own
+  memory throughout.
+
+Verified end-to-end against real, independent HTTP/2 tooling (curl
+`--http2`, `openssl s_client -alpn h2`), not just this project's own
+code: ALPN actually lands on `h2` (curl reports HTTP version 2), a small
+file and a ~66 KB file (spanning several `pread()`-chunked data-provider
+callbacks) both come back byte-exact, HEAD returns no body with the
+correct Content-Length, a missing file 404s, a client that never offers
+`h2` at all still gets ordinary HTTP/1.1, an unsupported method 405s, an
+oversized `:path` 414s, 50 concurrent requests leave no leaked fds behind,
+and several requests genuinely multiplexed over one connection all come
+back correct. `make clean && make test` and `make sanitize` both green
+(the sanitized build itself served the same live curl/openssl traffic
+above without either sanitizer tripping). Image rebuilt (now installs
+`libnghttp2-dev` at build time and ships `libnghttp2.so.14` alongside the
+existing OpenSSL/zlib/zstd runtime libraries), `./scripts/test-image.sh`
+passes.
+
 ## 1.5.0
 
 ### Added

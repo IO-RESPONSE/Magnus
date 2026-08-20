@@ -1141,3 +1141,80 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# HTTP/2 (1e-1): ALPN-negotiated "h2", static files only -- curl is real,
+# independent tooling here exactly like the `websockets` PyPI client was
+# for 1d, not code that shares any implementation with magnus itself.
+# Exercises: ALPN actually lands on h2 (curl reports http_version 2, not
+# 1.1), a small file, a file well over one MAGNUS_PROXY_BUFFER-worth
+# (exercises the pread()-chunked data-provider path across several
+# read-callback invocations, not just a single one), byte-exact bodies,
+# HEAD (no body, correct Content-Length still), 404 for a missing file, a
+# client that never offers h2 at all still gets ordinary HTTP/1.1 (ALPN is
+# additive, not a mode switch on the listener), and that concurrent
+# streams multiplexed over one connection all come back correct --
+# proving real stream-id bookkeeping, not just "one request at a time
+# happens to work".
+port_h2=$((port + 37))
+h2_web_root="$web_root/h2"
+mkdir -p "$h2_web_root"
+printf '%s\n' 'magnus h2 static file' >"$h2_web_root/hello.txt"
+head -c 50000 /dev/urandom | base64 >"$h2_web_root/large.txt"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/h2-server.key" -out "$web_root/h2-server.crt" \
+  >/dev/null 2>&1
+"$binary" --port "$port_h2" --root "$h2_web_root" \
+  --tls-cert "$web_root/h2-server.crt" --tls-key "$web_root/h2-server.key" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2 --insecure --fail --silent \
+    "https://127.0.0.1:$port_h2/healthz" >/dev/null && break
+  sleep 1
+done
+
+version=$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_version}' "https://127.0.0.1:$port_h2/hello.txt")
+test "$version" = '2'
+test "$(curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2/hello.txt")" = 'magnus h2 static file'
+diff <(curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2/large.txt") "$h2_web_root/large.txt"
+
+head_status=$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' --head "https://127.0.0.1:$port_h2/hello.txt")
+test "$head_status" = '200'
+head_length=$(curl --http2 --insecure --silent --head \
+  "https://127.0.0.1:$port_h2/hello.txt" | tr -d '\r' \
+  | sed -n 's/^content-length: //ip')
+test "$head_length" = '22'
+
+not_found=$(curl --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}' "https://127.0.0.1:$port_h2/missing.txt")
+test "$not_found" = '404'
+
+# ALPN is additive, not a mode switch: a client that never offers h2 at
+# all is served ordinary HTTP/1.1 exactly as before this phase existed.
+version_h1=$(curl --http1.1 --insecure --silent --output /dev/null \
+  --write-out '%{http_version}' "https://127.0.0.1:$port_h2/hello.txt")
+test "$version_h1" = '1.1'
+
+# Real multiplexing: several requests over one h2 connection, all
+# correct -- not just one request happening to round-trip. curl only
+# honors --output/--write-out for the *first* URL of a multi-URL command
+# line unless each subsequent URL is separated with --next, so that is
+# used here rather than three bare URLs (which would otherwise dump the
+# 2nd/3rd bodies to stdout ahead of their %{http_code} lines).
+mapfile -t multi_status < <(curl --http2 --insecure --silent \
+  --output /dev/null --write-out '%{http_code}\n' \
+  "https://127.0.0.1:$port_h2/hello.txt" \
+  --next --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}\n' "https://127.0.0.1:$port_h2/large.txt" \
+  --next --http2 --insecure --silent --output /dev/null \
+  --write-out '%{http_code}\n' "https://127.0.0.1:$port_h2/hello.txt")
+test "${#multi_status[@]}" = 3
+for status in "${multi_status[@]}"; do test "$status" = '200'; done
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=

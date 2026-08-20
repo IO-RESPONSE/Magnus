@@ -4,7 +4,8 @@ ARG BASE_IMAGE=ioresponse/glibc71-base:poc
 
 FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates libssl-dev \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates \
+        libssl-dev libnghttp2-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Makefile ./
@@ -16,7 +17,8 @@ RUN make clean all \
     && cp -L /usr/lib/x86_64-linux-gnu/libssl.so.3 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /out/lib64/ \
-    && cp -L /usr/lib/x86_64-linux-gnu/libzstd.so.1 /out/lib64/
+    && cp -L /usr/lib/x86_64-linux-gnu/libzstd.so.1 /out/lib64/ \
+    && cp -L /usr/lib/x86_64-linux-gnu/libnghttp2.so.14 /out/lib64/
 
 FROM ${BASE_IMAGE}
 COPY --from=builder /out/ /

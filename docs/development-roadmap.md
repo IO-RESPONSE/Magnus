@@ -185,24 +185,53 @@ checkpoint from the prior sub-phase being green.
    pre-existing response-header sanitizer tokenizes its buffer in place,
    and the new code was building the verbatim 101 relay from that
    now-corrupted buffer (see CHANGELOG.md 1.5.0).
-5. **1e — HTTP/2.** Deliberately last and expected to be the largest single
-   piece of work in Phase 1: ALPN negotiation, h2c upgrade, HPACK
-   (header compression — see Section 5, hand-rolling this is where CVEs
-   in other servers have historically come from), stream multiplexing,
-   flow control, and the GOAWAY/RST_STREAM/PING/SETTINGS frame set. The
-   design step for 1e must produce the "common internal request model"
-   the master prompt asks for (Section 3.1) — i.e. confirm HTTP/1.1 and
-   HTTP/2 requests both resolve to the same `magnus_request_t`-shaped
-   object before routing/proxy code needs to care which protocol version
-   is in play — *before* any frame-parsing code is written, since
-   retrofitting that abstraction after the fact is how monolithic,
-   protocol-specific forks of the dispatch path happen (the thing Section
-   23 forbids).
+5. **1e — HTTP/2.** Expected to be the largest single piece of work in
+   Phase 1, and sub-scoped rather than attempted whole (per Section 27's
+   own instruction to proceed one bounded phase at a time) into:
+   - **1e-1 — ALPN + nghttp2 integration, static files only. Shipped in
+     1.6.0.** TLS ALPN negotiation offering exactly `"h2"` (a small,
+     standalone, independently fuzzed module — `magnus_h2.c`/`.h`,
+     `tests/test-h2.c`, `tests/fuzz-h2.c` — deliberately not using
+     `SSL_select_next_proto()`, whose edge-case contract was itself the
+     subject of CVE-2024-5535; a direct bounded scan for the one
+     candidate protocol sidesteps that history entirely), then a real
+     nghttp2-driven session per h2-negotiated connection: HPACK, stream
+     multiplexing, and SETTINGS/PING/WINDOW_UPDATE handling all come from
+     nghttp2 itself rather than hand-rolled parsing (Section 5's own
+     CVE-history warning against that). Each stream dispatches to the
+     same `magnus_open_static()`/`magnus_content_type()` helpers the
+     HTTP/1.1 GET path already uses, so both protocols agree on path
+     resolution/traversal safety by construction — this is the first,
+     narrowest slice of the master prompt's "common internal request
+     model" (Section 3.1) rather than the full abstraction, which
+     proxy/route dispatch over h2 (1e-2+) will still need to generalize.
+     GET/HEAD only; no request body support (none is meaningful for a
+     static-file response); no h2c (cleartext upgrade — ALPN-negotiated
+     TLS only). Verified against real, independent HTTP/2 tooling (curl
+     `--http2`, `openssl s_client -alpn h2`) — including ALPN actually
+     landing on h2, HTTP/1.1 fallback for a client that never offers h2,
+     byte-exact bodies for both a small file and one spanning multiple
+     `pread()`-chunked data-provider callbacks, HEAD, 404, and several
+     requests genuinely multiplexed over one connection — not just unit
+     tests against this project's own code, matching the rigor every
+     protocol-level feature this project has shipped has used.
+   - **1e-2+ — remaining.** Proxy/route dispatch over h2 (an h2 request
+     resolving through `magnus_routes[]` to a proxied upstream, not just
+     a static file); true h2-to-h1 upstream translation (most upstreams
+     still speak HTTP/1.1); h2c; GOAWAY/RST_STREAM handling and
+     Rapid-Reset-class abuse hardening (Section 306-308's own note: this
+     class of hardening is meaningless before an h2 stack exists at all,
+     so it belongs to 1e's own checkpoint, not a deferred blanket
+     "security phase"); and only then generalizing the static-file-only
+     dispatch above into the master prompt's actual common
+     HTTP/1↔HTTP/2 request model (Section 3.1) that routing/proxy code
+     can stay agnostic against.
 
 Each sub-phase's own checkpoint report will name its new tests, confirm
 `make`/`make test`/`make sanitize` are green, and give the size/behavior
 delta — matching the format every milestone in this project has used so
-far. Phase 1 as a whole is not reported "done" until all five are.
+far. Phase 1 as a whole is not reported "done" until all five sub-phases
+(1a–1e, with 1e itself covering every 1e-N increment above) are.
 
 ## 3. Phases 2–6 (unchanged in intent from the master prompt, summarized)
 
