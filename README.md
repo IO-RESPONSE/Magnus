@@ -60,6 +60,14 @@ independently by IORESPONSE.
   traffic; active (periodic probe) and passive (live-traffic) health share
   one circuit-breaker state; cookie-based session affinity; per-client-IP
   ingress rate limiting
+- Real IP resolution behind a trusted reverse proxy: PROXY protocol v1/v2
+  (detected before TLS handshake or h2c preface, for either entry point)
+  and RFC 7239 `Forwarded`/`X-Forwarded-For` (right-most-untrusted-hop,
+  `Forwarded` taking precedence), gated entirely on a `trusted_proxies`
+  CIDR allowlist (`trusted_proxies=`/`--trusted-proxies`, default off);
+  the resolved address feeds `source_cidr` route matching, rate limiting,
+  and access logging alike, always trusted against the connection's real
+  direct TCP peer so a spoofed hop can never forge trust for the next
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked
@@ -87,8 +95,8 @@ and `docs/ROADMAP.md`.
 
 - `magnus`: the standalone HTTP/event data plane. Configured by flags
   (`--port`, `--root`, `--tls-cert`/`--tls-key`, `--upstream`,
-  `--rate-limit`) or by `--config <file>`, the only mode SIGHUP reload can
-  target.
+  `--rate-limit`, `--trusted-proxies`) or by `--config <file>`, the only
+  mode SIGHUP reload can target.
 - `magnusd`: supervises one `magnus` child -- validates config before ever
   applying it, reloads it via SIGHUP, and rolls back to the last-known-good
   config (respawning the child if it did not survive) on a failed reload

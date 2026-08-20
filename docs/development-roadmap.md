@@ -429,10 +429,7 @@ connection-pool and common-request-model decisions).
   check expansion, Real IP.** gRPC rides on the Phase 1e HTTP/2 stack
   (streaming, trailers, deadline propagation) — cannot start before 1e is
   done. Cache and compression are independent of each other and of gRPC,
-  so may run as parallel sub-phases. Real IP (X-Forwarded-For/Forwarded/
-  PROXY protocol trust) is small and self-contained; doing it early despite
-  being listed in Phase 2 is worth reconsidering since ACL/rate-limit
-  correctness downstream depends on it.
+  so may run as parallel sub-phases.
   - **Compression 2a — static-file gzip. Shipped in 1.11.0.** HTTP/1.1 and
     HTTP/2 negotiate gzip through a bounded `Accept-Encoding` token scan for
     compressible MIME types. Files from 256 bytes through 8 MiB are buffered
@@ -442,6 +439,14 @@ connection-pool and common-request-model decisions).
     Accept-Encoding` prevents a future cache from mixing representations.
     Proxied-response compression, Brotli/zstd, and streaming/chunked
     compression for files above 8 MiB remain separate future increments.
+  - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
+    Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
+    allowlist (default off); resolution feeds `source_cidr` route
+    matching, rate limiting, and access logging alike, always trusting
+    only the connection's true direct TCP peer. Was pulled ahead of the
+    rest of Phase 2 exactly for the reason flagged above: ACL/rate-limit
+    correctness downstream depends on knowing the real client address
+    first.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

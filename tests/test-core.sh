@@ -1788,3 +1788,108 @@ curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
+
+# Real IP (roadmap 2b): PROXY protocol v1/v2 and Forwarded/X-Forwarded-For
+# resolution, gated on trusted_proxies -- exercised via config-file mode
+# (proving the config key, not just the CLI flag equivalent) with the
+# resolved address fed into a source_cidr route so this proves the
+# resolution actually reaches routing, not just access-log cosmetics.
+port_realip=$((port + 49))
+realip_root="$web_root/realip"
+mkdir -p "$realip_root"
+printf '%s\n' 'realip ok' >"$realip_root/hello.txt"
+realip_config="$web_root/realip.conf"
+cat > "$realip_config" <<EOF
+port = $port_realip
+root = $realip_root
+trusted_proxies = 127.0.0.1/32
+route = source_cidr=9.9.9.0/24; action=deny
+EOF
+"$binary" --config "$realip_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_realip/healthz" >/dev/null && break
+  sleep 1
+done
+
+# X-Forwarded-For from a trusted peer resolves and reaches routing: a
+# denied source_cidr becomes reachable through the header, proving this is
+# real request-time resolution, not just an access-log cosmetic.
+xff_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H 'X-Forwarded-For: 9.9.9.9' "http://127.0.0.1:$port_realip/hello.txt")
+test "$xff_status" = '403'
+test "$(curl --fail --silent -H 'X-Forwarded-For: 1.2.3.4' \
+  "http://127.0.0.1:$port_realip/hello.txt")" = 'realip ok'
+
+# Forwarded takes precedence over X-Forwarded-For when both are present.
+forwarded_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -H 'Forwarded: for=9.9.9.9' -H 'X-Forwarded-For: 1.2.3.4' \
+  "http://127.0.0.1:$port_realip/hello.txt")
+test "$forwarded_status" = '403'
+
+python3 - "$port_realip" <<'PYEOF'
+import socket
+import struct
+import sys
+
+port = int(sys.argv[1])
+
+def expect(status_code, *sends):
+    s = socket.create_connection(("127.0.0.1", port))
+    for chunk in sends:
+        s.sendall(chunk)
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            more = s.recv(4096)
+            if not more:
+                break
+            data += more
+    finally:
+        s.close()
+    line = data.split(b"\r\n", 1)[0]
+    assert status_code.encode() in line, "expected %s, got %r" % (status_code, line)
+
+# PROXY v1 TCP4: resolved source 9.9.9.9 matches the deny route.
+expect("403", b"PROXY TCP4 9.9.9.9 1.1.1.1 11111 " + str(port).encode() + b"\r\n",
+       b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+# PROXY v1 TCP4: an address outside the deny route's CIDR still works.
+expect("200", b"PROXY TCP4 1.2.3.4 1.1.1.1 11111 " + str(port).encode() + b"\r\n",
+       b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+# PROXY v2 binary, AF_INET: same resolved-address enforcement.
+sig = bytes([0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A])
+addr_block = (socket.inet_aton("9.9.9.9") + socket.inet_aton("1.1.1.1")
+              + struct.pack("!H", 22222) + struct.pack("!H", port))
+header = sig + bytes([0x21, 0x11]) + struct.pack("!H", len(addr_block)) + addr_block
+expect("403", header,
+       b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+# A connection that never speaks PROXY protocol at all is unaffected --
+# NOT_PROXY falls through to ordinary HTTP/1.1 processing of the exact
+# same bytes.
+expect("200", b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+# A malformed preamble from a trusted peer is fatal: the connection is
+# reset rather than misinterpreted as an HTTP request.
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(b"PROXY GARBAGE_NOT_VALID\r\n")
+try:
+    data = s.recv(4096)
+    assert data == b"", "expected connection reset/EOF, got %r" % data
+except ConnectionResetError:
+    pass
+finally:
+    s.close()
+
+print("realip: proxy-protocol ok")
+PYEOF
+
+# The server must still be alive and serving normally after all of the
+# above, including the malformed-preamble abuse case.
+test "$(curl --fail --silent "http://127.0.0.1:$port_realip/hello.txt")" = 'realip ok'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=

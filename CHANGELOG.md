@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.12.0
+
+### Added
+
+- **Real IP resolution (roadmap 2b): PROXY protocol v1/v2 and RFC 7239
+  `Forwarded`/`X-Forwarded-For`, gated entirely on a new `trusted_proxies`
+  CIDR allowlist (config-file key and `--trusted-proxies` CLI flag,
+  comma-separated).** Disabled by default -- with no `trusted_proxies`
+  configured, every connection is completely unaffected, byte-for-byte.
+  Trust is always decided against the connection's true, direct TCP peer
+  (never against an already-resolved address), so a resolved value from
+  one hop can never be replayed to forge trust for the next.
+- Accept-time PROXY protocol detection (both the v1 text and v2 binary
+  preamble) runs before TLS handshake and before h2c prior-knowledge
+  preface detection alike -- a proxy speaking PROXY protocol prepends its
+  preamble in plaintext ahead of the actual payload (a TLS ClientHello
+  just as much as plain HTTP), so it is read via a raw, MSG_PEEK-based
+  `recv()` on the client fd directly, never through OpenSSL, and only for
+  a connection whose raw peer address already matched `trusted_proxies` at
+  accept time -- making the check a zero-cost no-op for every other
+  connection.
+- Per-request `Forwarded`/`X-Forwarded-For` resolution (right-most-
+  untrusted-hop semantics; `Forwarded` takes precedence when both are
+  present) feeds the exact same `client_address` used for `source_cidr`
+  route matching, rate limiting, and access logging (`client_ip=` field).
+  HTTP/1.1 resolves once per request directly into the connection's own
+  address (safe: one request in flight at a time); HTTP/2 resolves into a
+  new per-stream `effective_client_address` instead, since one connection
+  can multiplex many concurrent streams that must never race each other's
+  resolved address.
+- `magnus_access_log()`'s signature now takes the client address directly
+  (`struct in_addr`, `inet_ntop`'d once inside) rather than each of its
+  six call sites separately formatting the same string.
+- New `tests/test-realip.c`/`tests/fuzz-realip.c` (200k iterations in
+  `make test`, 4M+ verified separately across two seeds) cover CIDR
+  matching, XFF/Forwarded resolution (including the spoofing-defense case
+  of an untrusted hop's claimed address being ignored), and both PROXY
+  protocol versions (valid, incomplete, and malformed preambles).
+
+Verified end to end with hand-crafted raw-socket PROXY v1/v2 preambles
+(including one prepended immediately before a real TLS ClientHello, and
+another before an h2c prior-knowledge preface, on the very same listener)
+plus real `curl` requests carrying `X-Forwarded-For`/`Forwarded` from a
+trusted peer, resolving into `source_cidr` route matching (a route
+otherwise unreachable becomes deniable once the header resolves into its
+CIDR) and the access log alike. Confirmed an untrusted peer's headers are
+never honored, a malformed preamble from a trusted peer resets the
+connection without affecting any other connection, and a connection that
+never speaks PROXY protocol at all falls through to ordinary HTTP
+processing unaffected. New permanent regression coverage added to
+`tests/test-core.sh`. `make clean && make test` and `make sanitize`
+(ASan+UBSan) both green. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.11.0
 
 ### Added

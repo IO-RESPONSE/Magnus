@@ -36,7 +36,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.11.0"
+#define MAGNUS_VERSION "1.12.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -821,15 +821,17 @@ magnus_access_log_flush(void)
 }
 
 static void
-magnus_access_log(const char *request_id, const char *client_ip,
+magnus_access_log(const char *request_id, struct in_addr client_address,
                   const char *method, const char *target, unsigned status,
                   double latency_ms)
 {
     int written;
+    char client_ip[INET_ADDRSTRLEN];
     if (!magnus_access_log_enabled) return;
     magnus_access_log_seen++;
     if (magnus_access_log_sample > 1
         && (magnus_access_log_seen % magnus_access_log_sample) != 0) return;
+    inet_ntop(AF_INET, &client_address, client_ip, sizeof(client_ip));
     written = snprintf(magnus_access_log_buffer + magnus_access_log_length,
         sizeof(magnus_access_log_buffer) - magnus_access_log_length,
         "access request_id=%s method=%s target=%s status=%u "
@@ -1262,12 +1264,11 @@ magnus_proxy_fail(int epoll_fd, magnus_connection_t *connection,
                                           : "bad gateway\n",
                             false, true, &request);
     {
-        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
-        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(request.request_id, client_ip, connection->proxy_log_method,
+        magnus_access_log(request.request_id, connection->client_address,
+                          connection->proxy_log_method,
                           connection->proxy_log_target, status, latency_ms);
     }
     return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
@@ -1551,12 +1552,11 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
                               true, magnus_now_ms());
         magnus_requests_total++;
         {
-            char client_ip[INET_ADDRSTRLEN];
             double latency_ms = (double) (magnus_now_ms()
                                           - connection->request_started_ms);
-            inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
             magnus_record_latency(latency_ms);
-            magnus_access_log(connection->proxy_request_id, client_ip,
+            magnus_access_log(connection->proxy_request_id,
+                              connection->client_address,
                               connection->proxy_log_method,
                               connection->proxy_log_target, 101, latency_ms);
         }
@@ -1600,12 +1600,11 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     if (info.status >= 500) magnus_responses_5xx++;
     else if (info.status >= 400) magnus_responses_4xx++;
     {
-        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
-        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(connection->proxy_request_id, client_ip,
+        magnus_access_log(connection->proxy_request_id,
+                          connection->client_address,
                           connection->proxy_log_method,
                           connection->proxy_log_target, info.status,
                           latency_ms);
@@ -2118,6 +2117,18 @@ struct magnus_h2_stream {
     bool method_overflow;
     bool path_overflow;
     bool head_only;
+    /* Real IP (roadmap 2b): this stream's own resolved client address,
+     * used for route source-CIDR matching, rate limiting, and access
+     * logging in place of connection->client_address. h2 multiplexes many
+     * concurrent streams over one connection, so a Forwarded/
+     * X-Forwarded-For value is never safe to resolve into the
+     * connection-level client_address the way HTTP/1.1 does at the top of
+     * magnus_dispatch_request() -- two streams racing that mutation could
+     * see (or log) each other's resolved address. Set once, at the top of
+     * magnus_h2_dispatch(), from connection->client_address by default
+     * (see magnus_h2_stream_new()) and overwritten only if this stream's
+     * own headers resolve a trusted, more specific value. */
+    struct in_addr effective_client_address;
     /* Set the moment magnus_h2_dispatch() runs, so a second END_STREAM-
      * bearing frame on the same stream (defensively -- HTTP/2 framing
      * should never actually produce one) cannot dispatch it twice. */
@@ -2215,6 +2226,13 @@ magnus_h2_stream_new(magnus_connection_t *connection, int32_t stream_id)
     stream->file_fd = -1;
     stream->upstream_fd = -1;
     stream->started_ms = magnus_now_ms();
+    /* Defaults to the connection's own client_address (itself possibly
+     * already PROXY-protocol-resolved at accept time) until/unless
+     * magnus_h2_dispatch() resolves a per-request Forwarded/X-Forwarded-For
+     * value for this specific stream -- see effective_client_address's own
+     * comment on the struct field for why this cannot just be
+     * connection->client_address mutated in place the way HTTP/1.1 does. */
+    stream->effective_client_address = connection->client_address;
     stream->next = connection->h2_streams;
     stream->prev = NULL;
     if (connection->h2_streams != NULL) connection->h2_streams->prev = stream;
@@ -2433,6 +2451,24 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         return;
     }
 
+    /* Real IP (roadmap 2b): resolved once, here, into this stream's own
+     * effective_client_address -- never connection->client_address, which
+     * a concurrently dispatching sibling stream on the same connection
+     * could be reading at the same instant. Trust is always decided
+     * against connection->raw_peer_address (the true, direct TCP peer),
+     * never against client_address itself, so a resolved value from one
+     * hop can never be replayed to forge trust for the next. */
+    if (magnus_trusted_proxy_count > 0
+        && magnus_realip_is_trusted(magnus_trusted_proxies,
+                                    magnus_trusted_proxy_count,
+                                    connection->raw_peer_address)) {
+        struct in_addr resolved;
+        if (magnus_realip_resolve_headers(&stream->parsed, magnus_trusted_proxies,
+                                          magnus_trusted_proxy_count, &resolved)) {
+            stream->effective_client_address = resolved;
+        }
+    }
+
     literal_proxy_prefix = magnus_upstream_enabled
         && strncmp(stream->parsed.target, "/proxy", 6) == 0
         && (stream->parsed.target[6] == '/' || stream->parsed.target[6] == '\0');
@@ -2442,7 +2478,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
 
     for (size_t r = 0; r < magnus_route_count; r++) {
         if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
-                                  connection->client_address))
+                                  stream->effective_client_address))
             continue;
         if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
             is_proxy_route = true;
@@ -2461,7 +2497,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     is_healthz_path = strcmp(stream->parsed.target, "/healthz") == 0;
     is_metrics_path = strcmp(stream->parsed.target, "/metrics") == 0;
     if (!is_healthz_path && !is_metrics_path
-        && !magnus_rate_check(connection->client_address, time(NULL))) {
+        && !magnus_rate_check(stream->effective_client_address, time(NULL))) {
         magnus_rate_limited_total++;
         magnus_h2_submit_status(session, stream->stream_id, "429");
         return;
@@ -2942,10 +2978,9 @@ magnus_h2_proxy_fail(magnus_connection_t *connection,
     if (status_code >= 500) magnus_responses_5xx++;
     else if (status_code >= 400) magnus_responses_4xx++;
     {
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(stream->request_id, client_ip, stream->log_method,
+        magnus_access_log(stream->request_id, stream->effective_client_address,
+                          stream->log_method,
                           stream->log_target, status_code, latency_ms);
     }
 }
@@ -3443,11 +3478,10 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
     if (info.status >= 500) magnus_responses_5xx++;
     else if (info.status >= 400) magnus_responses_4xx++;
     {
-        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
-        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(stream->request_id, client_ip, stream->log_method,
+        magnus_access_log(stream->request_id, stream->effective_client_address,
+                          stream->log_method,
                           stream->log_target, info.status, latency_ms);
     }
     magnus_h2_proxy_maybe_complete(stream);
@@ -3748,6 +3782,24 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     memcpy(request.method, parsed->method, sizeof(request.method));
     memcpy(request.path, parsed->target, sizeof(request.path));
 
+    /* Real IP (roadmap 2b): resolved once per request, here, into
+     * connection->client_address itself -- safe for HTTP/1.1 (unlike h2)
+     * because a connection only ever has one request in flight at a time,
+     * so nothing else can observe a half-updated value. Trust is always
+     * decided against connection->raw_peer_address (the true, direct TCP
+     * peer), never against client_address, so a resolved value from one
+     * hop can never be replayed to forge trust for the next. */
+    if (!connection->admin_only && magnus_trusted_proxy_count > 0
+        && magnus_realip_is_trusted(magnus_trusted_proxies,
+                                    magnus_trusted_proxy_count,
+                                    connection->raw_peer_address)) {
+        struct in_addr resolved;
+        if (magnus_realip_resolve_headers(parsed, magnus_trusted_proxies,
+                                          magnus_trusted_proxy_count, &resolved)) {
+            connection->client_address = resolved;
+        }
+    }
+
     literal_proxy_prefix = magnus_upstream_enabled && !connection->admin_only
         && strncmp(request.path, "/proxy", 6) == 0
         && (request.path[6] == '/' || request.path[6] == '\0');
@@ -3871,12 +3923,11 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     }
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_LOG, &request);
     {
-        char client_ip[INET_ADDRSTRLEN];
         double latency_ms = (double) (magnus_now_ms()
                                       - connection->request_started_ms);
-        inet_ntop(AF_INET, &connection->client_address, client_ip, sizeof(client_ip));
         magnus_record_latency(latency_ms);
-        magnus_access_log(request.request_id, client_ip, request.method, request.path,
+        magnus_access_log(request.request_id, connection->client_address,
+                          request.method, request.path,
                           request.status, latency_ms);
     }
     return 0;
@@ -4050,6 +4101,108 @@ magnus_h2c_check_preface(int epoll_fd, magnus_connection_t *connection)
     connection->input_length = 0;
     if (magnus_h2_push(epoll_fd, connection) < 0) return -1;
     return 2;
+}
+
+/* Largest possible PROXY protocol preamble: v1's text line is capped at
+ * 107 bytes by spec; v2's binary header is a fixed 16-byte prefix plus up
+ * to 1024 bytes of address block (the cap magnus_proxy_proto_parse()
+ * itself enforces, returning MAGNUS_PROXY_PROTO_ERROR past it) -- so 1040
+ * bytes is always enough to see one complete preamble of either kind in a
+ * single MSG_PEEK. */
+#define MAGNUS_PROXY_PROTO_PEEK_MAX 1040
+
+/* Real IP (roadmap 2b): checked at most once per connection, before either
+ * TLS handshake or h2c prior-knowledge preface detection -- a proxy
+ * speaking the PROXY protocol prepends its preamble in plaintext ahead of
+ * the actual payload (a TLS ClientHello just as much as plain HTTP), so
+ * this has to run first regardless of connection->tls, and it talks to
+ * connection->fd directly with plain recv() rather than through
+ * magnus_socket_read()/SSL for exactly that reason -- OpenSSL has not
+ * touched this fd yet at this point (SSL_accept() is only ever called once
+ * tls_ready is checked, further down the dispatch loop), so a raw peek
+ * here cannot desynchronize a TLS handshake that comes after it.
+ *
+ * Only ever reached for a connection whose raw_peer_address matched
+ * magnus_trusted_proxies at accept time (see magnus_accept_connections):
+ * every other connection already has proxy_proto_done set to true from
+ * the moment it was accepted and never calls this at all, making the
+ * feature a zero-cost no-op for every untrusted peer or when no
+ * trusted_proxies are configured at all.
+ *
+ * Uses MSG_PEEK until a full preamble is confirmed one way or another, so
+ * an incomplete preamble costs nothing but being asked again against the
+ * same (plus whatever newly arrived) bytes on the next EPOLLIN, with no
+ * extra accumulation buffer of its own. Returns 0 to let the caller
+ * continue handling this event -- either more bytes are still needed, or
+ * the preamble is now fully resolved (consumed if it was one; left
+ * untouched on the wire if it was not) and the caller should proceed
+ * exactly as if this check did not exist -- or -1 on a fatal, malformed
+ * preamble from a supposedly trusted peer. */
+static int
+magnus_proxy_proto_check(magnus_connection_t *connection)
+{
+    char peek_buffer[MAGNUS_PROXY_PROTO_PEEK_MAX];
+    ssize_t peeked;
+    size_t consumed = 0;
+    struct in_addr src_ip = {0};
+    magnus_proxy_proto_result_t proto_result;
+
+    peeked = recv(connection->fd, peek_buffer, sizeof(peek_buffer), MSG_PEEK);
+    if (peeked < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return 0;
+        return -1;
+    }
+    if (peeked == 0) {
+        /* Peer closed before sending anything at all -- let the ordinary
+         * TLS handshake or magnus_handle_read() path observe the same EOF
+         * and close the connection exactly as it always has. */
+        connection->proxy_proto_done = true;
+        return 0;
+    }
+
+    proto_result = magnus_proxy_proto_parse(peek_buffer, (size_t) peeked,
+                                            &consumed, &src_ip);
+    if (proto_result == MAGNUS_PROXY_PROTO_INCOMPLETE) {
+        /* A hostile trusted peer trickling bytes forever is still bounded
+         * by the same header_deadline/idle-timeout sweep as any other slow
+         * client -- nothing extra needed here. */
+        return 0;
+    }
+    if (proto_result == MAGNUS_PROXY_PROTO_ERROR) {
+        return -1;
+    }
+    connection->proxy_proto_done = true;
+    if (proto_result == MAGNUS_PROXY_PROTO_NOT_PROXY) {
+        /* Not a PROXY preamble -- nothing was consumed (MSG_PEEK never
+         * touches the socket's read position), so the caller falls
+         * through to ordinary TLS/HTTP processing of these exact same
+         * bytes as if this check had never run. */
+        return 0;
+    }
+    /* MAGNUS_PROXY_PROTO_OK: drain exactly the preamble's bytes now that
+     * their count is known -- MSG_PEEK left them sitting on the socket. */
+    {
+        char discard[256];
+        size_t remaining = consumed;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+            ssize_t drained = recv(connection->fd, discard, chunk, 0);
+            if (drained <= 0) return -1;
+            remaining -= (size_t) drained;
+        }
+    }
+    /* TCP4 (v1) / AF_INET PROXY (v2) resolve a real source address; v1
+     * UNKNOWN/TCP6 and v2 LOCAL/UNSPEC/AF_INET6/AF_UNIX are all valid
+     * preambles that intentionally carry none (see magnus_proxy_proto_parse's
+     * own contract) -- raw_peer_address remains the correct, already-set
+     * client_address in every one of those cases, so only overwrite it when
+     * an address actually came back. */
+    if (src_ip.s_addr != 0) {
+        connection->client_address = src_ip;
+        connection->realip_from_proxy_proto = true;
+    }
+    return 0;
 }
 
 /* Parses the request line/headers already accumulated in connection->input
@@ -4490,7 +4643,24 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
          * ending up on 0, breaking static file lookups. */
         connection->upstream_fd = -1;
         connection->client_address = peer_address.sin_addr;
+        connection->raw_peer_address = peer_address.sin_addr;
         connection->admin_only = admin;
+        /* Real IP (roadmap 2b): the PROXY-protocol peek in
+         * magnus_proxy_proto_check() only ever runs for a connection from
+         * a configured, trusted proxy -- trust is always decided against
+         * this connection's true, direct TCP peer (raw_peer_address),
+         * never against client_address, since client_address is exactly
+         * what a later header/preamble resolution overwrites and trusting
+         * it here would let one hop's spoofed value forge trust for the
+         * next. Deciding it once, right here at accept time, makes every
+         * other connection (untrusted peer, or the feature simply unused)
+         * a zero-cost no-op: proxy_proto_done is already true before the
+         * dispatch loop ever sees this connection. Never applies to the
+         * admin listener, which has no IPv4 peer address at all. */
+        connection->proxy_proto_done = admin
+            || !magnus_realip_is_trusted(magnus_trusted_proxies,
+                                         magnus_trusted_proxy_count,
+                                         connection->raw_peer_address);
         /* No TLS on the admin channel: it is a local Unix socket, already
          * confidential and access-controlled by filesystem permissions,
          * and keeping it TLS-free keeps the isolation story simple (one
@@ -4866,6 +5036,9 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_dns_apply_upstreams(config->upstreams, config->upstream_count);
     memcpy(magnus_routes, config->routes, sizeof(magnus_routes));
     magnus_route_count = config->route_count;
+    memcpy(magnus_trusted_proxies, config->trusted_proxies,
+          sizeof(magnus_trusted_proxies));
+    magnus_trusted_proxy_count = config->trusted_proxy_count;
     magnus_rate_limit_enabled = config->has_rate_limit;
     if (config->has_rate_limit) {
         magnus_rate_limit_rps = config->rate_limit_rps;
@@ -5071,6 +5244,39 @@ magnus_parse_options(int argc, char **argv)
                 exit(2);
             }
             magnus_route_count++;
+        } else if (strcmp(argv[index], "--trusted-proxies") == 0) {
+            /* Comma-separated CIDR list; mirrors the config-file
+             * 'trusted_proxies' key (magnus_config.c) so plain-flag mode
+             * and --config mode behave identically. */
+            char spec[512];
+            char *saveptr = NULL;
+            char *token;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) {
+                fprintf(stderr, "magnus: --trusted-proxies: list too long\n");
+                exit(2);
+            }
+            strcpy(spec, argv[index + 1]);
+            for (token = strtok_r(spec, ",", &saveptr); token != NULL;
+                 token = strtok_r(NULL, ",", &saveptr)) {
+                char *cidr_text = token;
+                struct in_addr network;
+                unsigned prefix_length;
+                if (*cidr_text == '\0') continue;
+                if (magnus_trusted_proxy_count == MAGNUS_CONFIG_MAX_TRUSTED_PROXIES) {
+                    fprintf(stderr, "magnus: --trusted-proxies: too many "
+                                    "entries (max %d)\n",
+                                    MAGNUS_CONFIG_MAX_TRUSTED_PROXIES);
+                    exit(2);
+                }
+                if (!magnus_route_parse_cidr(cidr_text, &network, &prefix_length)) {
+                    fprintf(stderr, "magnus: --trusted-proxies: invalid "
+                                    "CIDR '%s'\n", cidr_text);
+                    exit(2);
+                }
+                magnus_trusted_proxies[magnus_trusted_proxy_count].network = network;
+                magnus_trusted_proxies[magnus_trusted_proxy_count].prefix_length = prefix_length;
+                magnus_trusted_proxy_count++;
+            }
         } else {
             break;
         }
@@ -5310,6 +5516,9 @@ main(int argc, char **argv)
                     ? -1 : magnus_h2_service(epoll_fd, connection);
             } else if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
                 result = -1;
+            } else if (!connection->proxy_proto_done) {
+                result = ((flags & EPOLLIN) != 0)
+                    ? magnus_proxy_proto_check(connection) : 0;
             } else if (!connection->tls_ready) {
                 result = magnus_tls_handshake(epoll_fd, connection);
             } else if ((flags & EPOLLIN) != 0) {
