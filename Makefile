@@ -4,9 +4,10 @@ CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
 LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2
 
-SOURCES := src/magnus.c src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
-           src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
-           src/magnus_proxy.c src/magnus_route.c src/magnus_ws.c
+SOURCES := src/magnus.c src/magnus_base64.c src/magnus_config.c src/magnus_dns.c \
+           src/magnus_h2.c src/magnus_http.c src/magnus_phase.c \
+           src/magnus_policy.c src/magnus_proxy.c src/magnus_route.c \
+           src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -61,7 +62,8 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
-		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2
+		build/test-base64 build/fuzz-http build/fuzz-route build/fuzz-ws \
+		build/fuzz-h2 build/fuzz-base64
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
@@ -70,10 +72,12 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-dns
 	./build/test-ws
 	./build/test-h2
+	./build/test-base64
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
 	./build/fuzz-h2
+	./build/fuzz-base64
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -133,6 +137,14 @@ build/fuzz-h2: tests/fuzz-h2.c src/magnus_h2.c src/magnus_h2.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-h2.c src/magnus_h2.c \
 		-lssl -lcrypto -o $@
+
+build/test-base64: tests/test-base64.c src/magnus_base64.c src/magnus_base64.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-base64.c src/magnus_base64.c -o $@
+
+build/fuzz-base64: tests/fuzz-base64.c src/magnus_base64.c src/magnus_base64.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-base64.c src/magnus_base64.c -o $@
 
 clean:
 	rm -rf build

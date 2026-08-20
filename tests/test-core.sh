@@ -1644,3 +1644,92 @@ test "$(curl --http2 --insecure --silent --output /dev/null \
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
+
+# h2c: cleartext HTTP/2 (1e-5), plain listener only -- the existing
+# TLS+ALPN h2 path above is completely separate. Both RFC 9113 3.2/3.4
+# entry points, via curl's own real support for each: prior knowledge
+# (--http2-prior-knowledge, no HTTP/1.1 exchange at all) and Upgrade:
+# h2c (--http2 against a plain http:// URL, which curl negotiates via
+# the Upgrade header itself -- real independent verification that
+# magnus's 101 response and the immediately-following h2 session are
+# both actually well-formed, not just self-consistent with this
+# project's own code). Reuses the exact same static/proxy/healthz/
+# rate-limit dispatch already proven for TLS+ALPN h2 above, so this
+# block only needs to prove the two *entry points* work, plus a handful
+# of the most load-bearing behaviors end to end (a route match, HEAD,
+# 404, ordinary HTTP/1.1 unaffected on the very same plain listener).
+port_h2c=$((port + 46))
+upstream_h2c=$((port + 47))
+h2c_root="$web_root/h2c"
+mkdir -p "$h2c_root"
+printf '%s\n' 'h2c ok' >"$h2c_root/hello.txt"
+python3 -c "
+import http.server
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def do_GET(self):
+        payload = b'h2c proxied'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1', $upstream_h2c), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+sleep 1
+h2c_config="$web_root/h2c.conf"
+cat > "$h2c_config" <<EOF
+port = $port_h2c
+root = $h2c_root
+upstream = 127.0.0.1:$upstream_h2c:1
+route = path_prefix=/api; action=proxy
+EOF
+"$binary" --config "$h2c_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_h2c/healthz" >/dev/null && break
+  sleep 1
+done
+
+# Prior knowledge: no HTTP/1.1 exchange at all.
+version_pk=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_version}' "http://127.0.0.1:$port_h2c/hello.txt")
+test "$version_pk" = '2'
+test "$(curl --http2-prior-knowledge --fail --silent \
+  "http://127.0.0.1:$port_h2c/hello.txt")" = 'h2c ok'
+
+# Upgrade: h2c -- curl itself negotiates the 101 handshake; a real
+# HTTP/2 response must follow on the very same connection.
+version_up=$(curl --http2 --silent --output /dev/null \
+  --write-out '%{http_version}' "http://127.0.0.1:$port_h2c/hello.txt")
+test "$version_up" = '2'
+test "$(curl --http2 --fail --silent \
+  "http://127.0.0.1:$port_h2c/hello.txt")" = 'h2c ok'
+
+head_status=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_code}' --head "http://127.0.0.1:$port_h2c/hello.txt")
+test "$head_status" = '200'
+not_found=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_code}' "http://127.0.0.1:$port_h2c/missing.txt")
+test "$not_found" = '404'
+
+# Proxy dispatch (1e-2) reachable over both h2c entry points.
+test "$(curl --http2-prior-knowledge --fail --silent \
+  "http://127.0.0.1:$port_h2c/api/foo")" = 'h2c proxied'
+test "$(curl --http2 --fail --silent \
+  "http://127.0.0.1:$port_h2c/api/foo")" = 'h2c proxied'
+
+# ALPN is unaffected: an ordinary HTTP/1.1 client on the very same plain
+# listener works exactly as before h2c existed.
+version_h1=$(curl --http1.1 --silent --output /dev/null \
+  --write-out '%{http_version}' "http://127.0.0.1:$port_h2c/hello.txt")
+test "$version_h1" = '1.1'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=

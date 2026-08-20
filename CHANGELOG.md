@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.10.0
+
+### Added
+
+- **h2c: cleartext HTTP/2** (roadmap Phase 1e-5), plain (non-TLS) listener
+  only -- the existing TLS+ALPN h2 path (1e-1) is completely separate and
+  unaffected. Both RFC 9113 entry points:
+  - *Prior knowledge* (3.4): a connection's very first bytes are checked
+    against the 24-byte h2 client preface before ever attempting
+    HTTP/1.1 parsing on them, at most once per connection.
+  - *Upgrade: h2c* (3.2): an ordinary HTTP/1.1 request with the right
+    `Connection`/`Upgrade`/`HTTP2-Settings` headers gets a
+    `101 Switching Protocols`, and the same request becomes h2 stream 1
+    via nghttp2's own upgrade support -- scoped to a request with no
+    body for this increment (the common real-world case).
+  Both entry points reuse every h2 feature already shipped unmodified:
+  static files, proxy dispatch, Rapid-Reset hardening,
+  `/healthz`/`/metrics`/rate limiting (sharing the same rate-limit state
+  HTTP/1.1 and TLS+ALPN h2 already share) -- h2c only changes how a
+  connection becomes h2, not anything about how it is dispatched
+  afterward.
+- New module `magnus_base64.c`/`.h`: a small, standalone base64url
+  (RFC 4648 §5) decoder for the HTTP2-Settings header value --
+  independently unit-tested and fuzzed (`tests/fuzz-base64.c`, 200k
+  iterations in `make test`, 4M+ verified separately across two seeds),
+  matching this project's standing rule that any new parser of untrusted
+  bytes gets its own fuzz harness.
+
+Verified against real, independent HTTP/2 tooling (curl's own native
+`--http2-prior-knowledge` and `--http2`-against-a-plain-`http://`-URL
+support): both entry points return real h2 responses for a static file, a
+proxy route, `/healthz`, and HEAD/404; the rate limiter's shared state and
+the proxy path both work identically to the TLS+ALPN case; an ordinary
+HTTP/1.1 client on the very same plain listener is completely unaffected.
+`make clean && make test` and `make sanitize` both green, including
+~24 connections cycling both entry points against the sanitized build
+with no fd or memory leaks. Image rebuilt, `./scripts/test-image.sh`
+passes.
+
 ## 1.9.0
 
 ### Added

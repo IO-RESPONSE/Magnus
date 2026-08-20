@@ -1,4 +1,5 @@
 #include "magnus_phase.h"
+#include "magnus_base64.h"
 #include "magnus_config.h"
 #include "magnus_http.h"
 #include "magnus_policy.h"
@@ -33,7 +34,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.9.0"
+#define MAGNUS_VERSION "1.10.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -85,6 +86,33 @@
  * rather than after doing meaningful damage. */
 #define MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND 100
 #define MAGNUS_H2_MAX_RESETS_PER_SECOND 50
+
+/* h2c (roadmap 1e-5): cleartext HTTP/2, plain (non-TLS) listener only --
+ * the existing TLS+ALPN h2 path (1e-1) is completely separate and
+ * unaffected. Two entry points, both defined by RFC 9113 3.2/3.4:
+ *   - "prior knowledge": the client just sends the connection preface as
+ *     the very first bytes on a plain connection, with no HTTP/1.1
+ *     exchange at all. MAGNUS_H2C_PREFACE is exactly what
+ *     nghttp2_session_server_new() already expects and validates as the
+ *     first bytes of any h2 session (the same 24 bytes a TLS+ALPN
+ *     connection's first mem_recv2() call implicitly checks) -- prior
+ *     knowledge only needs magnus to *notice* early enough not to hand
+ *     these bytes to the HTTP/1.1 parser first, not to hand-parse the
+ *     preface itself.
+ *   - "Upgrade: h2c": an ordinary HTTP/1.1 request carries
+ *     `Connection: Upgrade, HTTP2-Settings`, `Upgrade: h2c`, and an
+ *     `HTTP2-Settings: <base64url>` header; if magnus accepts, it answers
+ *     `101 Switching Protocols` and the *same* request is then treated
+ *     as h2 stream 1 (nghttp2_session_upgrade2() exists specifically for
+ *     this). Scoped to a request with no body for this increment -- see
+ *     magnus_h2c_upgrade_eligible()'s own comment for why. */
+#define MAGNUS_H2C_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+#define MAGNUS_H2C_PREFACE_LEN 24
+/* Generous for any realistic HTTP2-Settings value (each SETTINGS
+ * parameter is 6 bytes; this fits 32 of them) while bounding the
+ * base64url decode below to a small, fixed-size stack buffer regardless
+ * of how long a hostile client's header value actually is. */
+#define MAGNUS_H2C_SETTINGS_MAX 192
 
 /* Forward-declared so magnus_connection_t can hold a pointer to it;
  * fully defined alongside the rest of the HTTP/2 (1e-1) implementation,
@@ -208,6 +236,31 @@ typedef struct {
     time_t h2_abuse_window_start;
     unsigned h2_streams_opened_this_second;
     unsigned h2_resets_received_this_second;
+    /* h2c (1e-5): true the moment this plain (non-TLS) connection's
+     * first bytes have been checked against MAGNUS_H2C_PREFACE (whether
+     * that confirmed prior-knowledge h2c, ruled it out, or the check
+     * failed outright) -- set exactly once per connection, at most, so
+     * every read after the very first never re-runs it. Meaningless (and
+     * never checked) for a TLS or admin-socket connection, both of which
+     * skip the check entirely. */
+    bool checked_h2c_preface;
+    /* True once an Upgrade: h2c request's 101 response has been queued
+     * into connection->output but not yet fully flushed -- consumed by
+     * magnus_handle_write() the moment output finishes draining, which
+     * is where this connection actually switches into h2 mode (see
+     * magnus_h2c_activate()). Between magnus_h2c_begin_upgrade() setting
+     * this and magnus_h2c_activate() clearing it, connection->pending_parsed
+     * and h2c_settings/_length hold the state that transition needs --
+     * reusing pending_parsed's existing field rather than a third
+     * full-size magnus_http_request_t, safe because a connection is
+     * never simultaneously reading_body (the other pending_parsed use)
+     * and h2c_pending: an Upgrade: h2c request carrying a body is simply
+     * not accepted for upgrade at all (see
+     * magnus_h2c_upgrade_eligible()'s own comment on that scope
+     * boundary). */
+    bool h2c_pending;
+    unsigned char h2c_settings[MAGNUS_H2C_SETTINGS_MAX];
+    size_t h2c_settings_length;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -3703,6 +3756,176 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     return 0;
 }
 
+/* ---- h2c (roadmap Phase 1e-5): cleartext HTTP/2, plain listener only.
+ * See MAGNUS_H2C_PREFACE's own top-of-file comment for the two entry
+ * points (prior knowledge, Upgrade: h2c) this section implements. */
+
+/* True if `parsed` is a well-formed Upgrade: h2c request this connection
+ * should actually accept -- decodes the HTTP2-Settings header into
+ * `settings_out` (at least MAGNUS_H2C_SETTINGS_MAX bytes) as a side
+ * effect of returning true, since the caller needs it immediately
+ * afterward and re-finding/re-decoding the same header a second time
+ * would be redundant. Deliberately declines (returns false, indistinguishable
+ * from "not an upgrade request at all" -- the request is simply handled
+ * as ordinary HTTP/1.1) whenever the request carries a body: RFC 9113
+ * 3.2 permits an Upgrade: h2c request to have one (it becomes the first
+ * DATA on stream 1), but that needs the body-buffering machinery
+ * (magnus_begin_body()/magnus_continue_body()) to finish *before* the
+ * upgrade can proceed, which this increment does not wire up -- the
+ * overwhelmingly common real-world case (a GET priming a connection for
+ * h2) has no body at all, so this is a narrow, explicit scope boundary,
+ * not a silent gap. h2c is never offered on a TLS connection (it is
+ * exclusively the plain-listener entry point; TLS already has ALPN,
+ * 1e-1) or the admin channel (matching every other h2 code path's own
+ * `admin_only` exclusion -- see magnus_h2_dispatch()'s comment on why). */
+static bool
+magnus_h2c_upgrade_eligible(magnus_connection_t *connection,
+                            const magnus_http_request_t *parsed,
+                            unsigned char *settings_out,
+                            size_t *settings_length)
+{
+    const char *connection_header;
+    const char *upgrade_header;
+    const char *settings_header;
+    int decoded;
+
+    if (connection->tls != NULL || connection->admin_only) return false;
+    if (parsed->has_content_length && parsed->content_length > 0) return false;
+
+    upgrade_header = magnus_http_header_find(parsed, "upgrade");
+    if (upgrade_header == NULL || strcasecmp(upgrade_header, "h2c") != 0)
+        return false;
+    connection_header = magnus_http_header_find(parsed, "connection");
+    if (connection_header == NULL
+        || strcasestr(connection_header, "upgrade") == NULL)
+        return false;
+    settings_header = magnus_http_header_find(parsed, "http2-settings");
+    if (settings_header == NULL || settings_header[0] == '\0') return false;
+
+    decoded = magnus_base64url_decode(settings_header, strlen(settings_header),
+                                      settings_out, MAGNUS_H2C_SETTINGS_MAX);
+    if (decoded < 0) return false;
+    *settings_length = (size_t) decoded;
+    return true;
+}
+
+/* Queues the `101 Switching Protocols` response and stashes everything
+ * magnus_h2c_activate() will need once it has actually gone out --
+ * queues, not sends: connection->output is drained the same way any
+ * other synchronous response is, through the ordinary
+ * magnus_handle_write() path, so the 101 status line is guaranteed to
+ * reach the client before this connection ever starts emitting real h2
+ * bytes after it, even if the write has to span more than one
+ * non-blocking attempt. Infallible by construction (a fixed-size literal
+ * response, no interpolated values, trivially within
+ * MAGNUS_OUTPUT_LIMIT) -- unlike every other response builder in this
+ * file, so it does not need magnus_process_request()'s caller chain to
+ * plumb a fatal-error return value through the `1 = proxy in flight, 0 =
+ * handled synchronously` contract those callers already share. */
+static void
+magnus_h2c_begin_upgrade(magnus_connection_t *connection,
+                         const magnus_http_request_t *parsed,
+                         const unsigned char *settings_payload,
+                         size_t settings_length)
+{
+    static const char response[] =
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+        "Upgrade: h2c\r\n\r\n";
+    memcpy(connection->output, response, sizeof(response) - 1);
+    connection->output_length = sizeof(response) - 1;
+    connection->output_sent = 0;
+    connection->close_after_write = false;
+    connection->pending_parsed = *parsed;
+    memcpy(connection->h2c_settings, settings_payload, settings_length);
+    connection->h2c_settings_length = settings_length;
+    connection->h2c_pending = true;
+}
+
+/* Called from magnus_handle_write() the moment the 101 response has
+ * fully flushed: creates the h2 session, hands nghttp2 the client's
+ * already-decoded HTTP2-Settings via nghttp2_session_upgrade2() (which
+ * treats it as if a SETTINGS frame had just been received, and opens
+ * stream 1 in half-closed-remote state -- the client is not going to
+ * send anything more on it, since everything it had to say already
+ * arrived as the original HTTP/1.1 request), attaches a
+ * magnus_h2_stream to that stream, copies the already-parsed original
+ * request into it directly (both use the exact same
+ * magnus_http_request_t shape -- no re-derivation needed), and
+ * dispatches it immediately, exactly as if its END_STREAM had just been
+ * observed (nothing will ever trigger that callback for a stream that
+ * was never really delivered as HEADERS frames in the first place). Any
+ * bytes already sitting in connection->input past the original request
+ * are the client's own optimistic h2 frames -- RFC 9113 3.2 explicitly
+ * allows sending them without waiting for the 101 -- fed in immediately
+ * afterward. */
+static int
+magnus_h2c_activate(int epoll_fd, magnus_connection_t *connection)
+{
+    struct magnus_h2_stream *stream;
+    bool head_request;
+
+    connection->h2c_pending = false;
+    if (magnus_h2_session_create(connection) != 0) return -1;
+    head_request = strcmp(connection->pending_parsed.method, "HEAD") == 0;
+    if (nghttp2_session_upgrade2(connection->h2_session, connection->h2c_settings,
+                                 connection->h2c_settings_length,
+                                 head_request ? 1 : 0, NULL) != 0)
+        return -1;
+    stream = magnus_h2_stream_new(connection, 1);
+    if (stream == NULL) return -1;
+    if (nghttp2_session_set_stream_user_data(connection->h2_session, 1,
+                                             stream) != 0) {
+        magnus_h2_stream_free(stream);
+        return -1;
+    }
+    stream->parsed = connection->pending_parsed;
+    magnus_h2_dispatch(connection, stream);
+
+    if (connection->input_length > 0) {
+        nghttp2_ssize consumed = nghttp2_session_mem_recv2(connection->h2_session,
+            (const uint8_t *) connection->input, connection->input_length);
+        if (consumed < 0) return -1;
+        connection->input_length = 0;
+    }
+    return magnus_h2_push(epoll_fd, connection);
+}
+
+/* Called from magnus_handle_read() on a plain (non-TLS, non-admin)
+ * connection's every read until it resolves one way or the other (see
+ * checked_h2c_preface's own comment): compares whatever has accumulated
+ * in connection->input so far against MAGNUS_H2C_PREFACE. Returns 0 if
+ * it is still a matching prefix (more bytes needed before the decision
+ * can be made -- do not attempt HTTP/1.1 parsing yet), 1 if it has
+ * definitively diverged (this is an ordinary HTTP/1.1 connection;
+ * checked_h2c_preface is now permanently true and the caller should
+ * proceed exactly as if this check did not exist), 2 if it was a
+ * confirmed full match and the connection is now h2_active with its
+ * epoll interest already armed (via magnus_h2_push()) -- the caller has
+ * nothing further to do for this read -- or -1 if any of that setup
+ * failed (fatal; the caller must close the connection, same as every
+ * other -1 in this file). */
+static int
+magnus_h2c_check_preface(int epoll_fd, magnus_connection_t *connection)
+{
+    size_t compare_length = connection->input_length < MAGNUS_H2C_PREFACE_LEN
+        ? connection->input_length : MAGNUS_H2C_PREFACE_LEN;
+    if (memcmp(connection->input, MAGNUS_H2C_PREFACE, compare_length) != 0) {
+        connection->checked_h2c_preface = true;
+        return 1;
+    }
+    if (connection->input_length < MAGNUS_H2C_PREFACE_LEN) return 0;
+    connection->checked_h2c_preface = true;
+    if (magnus_h2_session_create(connection) != 0) return -1;
+    {
+        nghttp2_ssize consumed = nghttp2_session_mem_recv2(connection->h2_session,
+            (const uint8_t *) connection->input, connection->input_length);
+        if (consumed < 0) return -1;
+    }
+    connection->input_length = 0;
+    if (magnus_h2_push(epoll_fd, connection) < 0) return -1;
+    return 2;
+}
+
 /* Parses the request line/headers already accumulated in connection->input
  * (exactly request_length bytes, no body) and dispatches it. Only ever
  * reached for a request that magnus_process_input() has already determined
@@ -3725,6 +3948,16 @@ magnus_process_request(int epoll_fd, magnus_connection_t *connection,
         magnus_prepare_response(connection, status, reason, "text/plain",
                                 "bad request\n", false, true, &request);
         return 0;
+    }
+    {
+        unsigned char settings_payload[MAGNUS_H2C_SETTINGS_MAX];
+        size_t settings_length;
+        if (magnus_h2c_upgrade_eligible(connection, &parsed, settings_payload,
+                                        &settings_length)) {
+            magnus_h2c_begin_upgrade(connection, &parsed, settings_payload,
+                                     settings_length);
+            return 0;
+        }
     }
     return magnus_dispatch_request(epoll_fd, connection, &parsed);
 }
@@ -3915,6 +4148,23 @@ magnus_handle_read(int epoll_fd, magnus_connection_t *connection)
         if (received > 0) {
             connection->input_length += (size_t) received;
             connection->last_active = time(NULL);
+            /* h2c prior knowledge (1e-5): checked at most once per
+             * connection, before ever attempting HTTP/1.1 parsing on it
+             * -- see magnus_h2c_check_preface()'s own comment. Must run
+             * before magnus_find_header_end() below: a partial preface
+             * like "PRI * HTTP/2.0\r\n\r\n" (18 of its 24 bytes) would
+             * otherwise look like a complete, if bizarre, HTTP/1.1
+             * header block to that check. */
+            if (connection->tls == NULL && !connection->admin_only
+                && !connection->checked_h2c_preface) {
+                int decision = magnus_h2c_check_preface(epoll_fd, connection);
+                if (decision == 2) return 0;
+                if (decision == -1) return -1;
+                if (decision == 0) continue;
+                /* decision == 1: definitively not h2c -- fall through to
+                 * ordinary HTTP/1.1 processing of what has accumulated,
+                 * exactly as if this check did not exist. */
+            }
             if (magnus_find_header_end(connection->input,
                                        connection->input_length) != NULL) {
                 return magnus_process_input(epoll_fd, connection);
@@ -4007,6 +4257,14 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
     }
     connection->output_length = 0;
     connection->output_sent = 0;
+    /* h2c (1e-5): the 101 Switching Protocols response
+     * magnus_h2c_begin_upgrade() queued has now fully reached the
+     * client -- switch this connection into h2 mode before falling
+     * through to any of the ordinary HTTP/1.1 "what's next" logic below,
+     * none of which applies to it anymore. */
+    if (connection->h2c_pending) {
+        return magnus_h2c_activate(epoll_fd, connection);
+    }
     if (connection->input_length > 0
         && magnus_find_header_end(connection->input,
                                   connection->input_length) != NULL) {

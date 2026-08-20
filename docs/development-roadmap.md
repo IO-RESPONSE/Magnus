@@ -354,8 +354,58 @@ checkpoint from the prior sub-phase being green.
      too while the h2-side bucket is still exhausted, proving the shared-
      state claim end to end rather than by code inspection alone; `make
      sanitize` (ASan+UBSan) green against this exact live traffic.
-   - **1e-5+ — remaining.** h2c; response trailers; WebSocket-over-h2
-     (extended CONNECT); and generalizing 1e-1/1e-2/1e-4's still-
+   - **1e-5 — h2c (cleartext HTTP/2). Shipped in 1.10.0.** Both RFC 9113
+     entry points, plain (non-TLS) listener only -- the TLS+ALPN h2 path
+     (1e-1) is completely separate and unaffected. *Prior knowledge*
+     (3.4): a connection's very first bytes are compared against the
+     24-byte client preface before ever attempting HTTP/1.1 parsing on
+     them (`magnus_h2c_check_preface()`, checked at most once per
+     connection); nghttp2 itself validates/consumes the preface as part
+     of its own ordinary `nghttp2_session_mem_recv2()` processing --
+     magnus's own job is only to notice early enough not to hand those
+     bytes to the HTTP/1.1 parser first, not to hand-parse the preface
+     itself. *Upgrade: h2c* (3.2): an ordinary HTTP/1.1 request carrying
+     `Connection: Upgrade, HTTP2-Settings` / `Upgrade: h2c` /
+     `HTTP2-Settings: <base64url>` gets a `101 Switching Protocols`
+     (queued through the same `connection->output` buffer, and therefore
+     the same non-blocking multi-attempt drain, every ordinary response
+     already uses -- the 101 is guaranteed to reach the client before any
+     h2 byte that follows it), and the *same* request becomes h2 stream 1
+     via `nghttp2_session_upgrade2()` -- the already-parsed
+     `magnus_http_request_t` is copied directly into the new stream's
+     state (both use the identical struct shape) rather than
+     re-derived, and dispatched immediately, exactly as if its
+     END_STREAM had just been observed. Scoped to a request with no body
+     for this increment (a body would need the H1 body-buffering
+     machinery to finish *before* the upgrade could proceed, which this
+     increment does not wire up -- the overwhelmingly common real-world
+     case, priming a connection for h2, has none). New module
+     `magnus_base64.c`/`.h`: a small, standalone base64url (RFC 4648 §5)
+     decoder for the HTTP2-Settings header value -- independently
+     unit-tested and fuzzed (`tests/fuzz-base64.c`, 200k iterations in
+     `make test`, 4M+ verified separately across two seeds), matching
+     this project's standing rule that any new parser of untrusted bytes
+     gets its own fuzz harness rather than being inlined into the
+     dispatch path that calls it. Both entry points reuse every h2
+     feature already shipped unmodified -- static files (1e-1), proxy
+     dispatch (1e-2), Rapid-Reset hardening (1e-3, the same per-connection
+     caps apply regardless of how the h2 session was reached),
+     `/healthz`/`/metrics`/rate limiting (1e-4, sharing the exact same
+     rate-limit state HTTP/1.1 and TLS+ALPN h2 traffic already share) --
+     since h2c only changes *how a connection becomes h2*, not anything
+     about how an h2-active connection is subsequently dispatched.
+     Verified against real, independent HTTP/2 tooling (curl's own native
+     `--http2-prior-knowledge` and `--http2`-against-a-plain-`http://`-URL
+     support, not this project's own code exercising itself): both entry
+     points return real h2 responses (curl reports HTTP version 2) for a
+     static file, a proxy route, `/healthz`, and HEAD/404; the rate
+     limiter's shared state and the proxy path both work identically to
+     the TLS+ALPN case; an ordinary HTTP/1.1 client on the very same
+     plain listener is completely unaffected; `make sanitize`
+     (ASan+UBSan) green against this exact live traffic across ~24
+     connections cycling both entry points with no fd or memory leaks.
+   - **1e-6+ — remaining.** Response trailers; WebSocket-over-h2 (extended
+     CONNECT); and generalizing 1e-1/1e-2/1e-4/1e-5's still-
      protocol-specific dispatch functions into the master prompt's actual
      unified HTTP/1↔HTTP/2 request-model abstraction (Section 3.1) that
      routing/proxy code can stay fully agnostic against, now that a
