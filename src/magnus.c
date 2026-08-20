@@ -35,7 +35,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.10.0"
+#define MAGNUS_VERSION "1.11.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -692,6 +692,12 @@ static void magnus_h2_submit_text(magnus_connection_t *connection,
                                   struct magnus_h2_stream *stream,
                                   const char *status, const char *content_type,
                                   const char *body, bool head_only);
+static nghttp2_ssize magnus_h2_read_io_buffer(nghttp2_session *session,
+                                              int32_t stream_id, uint8_t *buf,
+                                              size_t length,
+                                              uint32_t *data_flags,
+                                              nghttp2_data_source *source,
+                                              void *user_data);
 static void magnus_build_metrics(char *out, size_t out_capacity);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
@@ -2287,27 +2293,6 @@ magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
     return got;
 }
 
-static nghttp2_ssize
-magnus_h2_read_static_buffer(nghttp2_session *session, int32_t stream_id,
-                             uint8_t *buf, size_t length,
-                             uint32_t *data_flags,
-                             nghttp2_data_source *source, void *user_data)
-{
-    struct magnus_h2_stream *stream = source->ptr;
-    size_t remaining = stream->io_length - stream->io_sent;
-    (void) session;
-    (void) stream_id;
-    (void) user_data;
-    if (length > remaining) length = remaining;
-    if (length > 0) {
-        memcpy(buf, stream->io_buffer + stream->io_sent, length);
-        stream->io_sent += length;
-    }
-    if (stream->io_sent == stream->io_length)
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    return (nghttp2_ssize) length;
-}
-
 /* Serves stream->parsed.target as a static file, exactly like the
  * HTTP/1.1 GET path (magnus_open_static() + magnus_content_type(), same
  * helpers) -- reused rather than reimplemented so both protocols agree
@@ -2360,17 +2345,27 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
         return;
     }
     if (use_gzip) {
+        /* The whole compressed body is already sitting in memory --
+         * exactly the same shape magnus_h2_submit_text() (1e-4,
+         * /healthz//metrics) already reuses magnus_h2_read_io_buffer()
+         * for, right down to needing response_complete set up front so
+         * the callback knows it is safe to report EOF once the buffer
+         * drains rather than ever deferring. Reused here rather than
+         * given a near-identical sibling callback, for the same reason
+         * every other h2 dispatch path in this file reuses an existing
+         * helper instead of reimplementing it. */
         close(fd);
         stream->io_buffer = (char *) compressed;
         stream->io_length = compressed_length;
         stream->io_sent = 0;
+        stream->response_complete = true;
     } else {
         stream->file_fd = fd;
     }
     {
         nghttp2_data_provider2 data_provider = {
             .source = { .ptr = stream },
-            .read_callback = use_gzip ? magnus_h2_read_static_buffer
+            .read_callback = use_gzip ? magnus_h2_read_io_buffer
                                       : magnus_h2_read_file,
         };
         (void) nghttp2_submit_response2(session, stream->stream_id, headers,

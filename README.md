@@ -77,7 +77,7 @@ independently by IORESPONSE.
 - Verified clean under ASan+UBSan across the full test suite (`make
   sanitize`), and against a 4M-iteration mutation fuzz run of the HTTP
   parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
-- Container image: 9,312,399 bytes (~8.88 MiB), non-root, read-only rootfs
+- Container image: 9,313,789 bytes (~8.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

@@ -433,8 +433,7 @@ connection-pool and common-request-model decisions).
   PROXY protocol trust) is small and self-contained; doing it early despite
   being listed in Phase 2 is worth reconsidering since ACL/rate-limit
   correctness downstream depends on it.
-  - **Compression 2a — static-file gzip. Implemented for review on
-    `feature/response-compression`.** HTTP/1.1 and
+  - **Compression 2a — static-file gzip. Shipped in 1.11.0.** HTTP/1.1 and
     HTTP/2 negotiate gzip through a bounded `Accept-Encoding` token scan for
     compressible MIME types. Files from 256 bytes through 8 MiB are buffered
     and compressed completely, allowing an exact compressed Content-Length;
