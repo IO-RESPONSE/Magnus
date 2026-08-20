@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.8.0
+
+### Added
+
+- **HTTP/2 Rapid-Reset-class abuse hardening + graceful GOAWAY on
+  shutdown** (roadmap Phase 1e-3). A per-connection, one-second sliding
+  window now caps how many new request streams a connection may open
+  (100/s) and how many `RST_STREAM` frames the client may send on it
+  (50/s) -- the latter targeting the Rapid Reset (CVE-2023-44487) shape
+  directly: open a stream, immediately reset it, repeat as fast as
+  possible. Either cap being exceeded terminates the connection
+  immediately, using the same mechanism nghttp2 already uses internally
+  for its own PING/SETTINGS-ack-flood and CONTINUATION-flood protections
+  (both already covered for free before this release, since any negative
+  return from `nghttp2_session_mem_recv2()` was already treated as fatal
+  -- only Rapid-Reset-style `RST_STREAM` abuse and raw new-stream floods
+  had no cap of their own). Legitimate traffic is completely unaffected;
+  the caps are per-connection, not a global circuit-breaker.
+- Graceful shutdown now sends every still-open h2 connection a real
+  GOAWAY frame before the existing hard-close loop tears everything down
+  on `SIGTERM`, instead of an abrupt drop.
+
+Verified against a real, independent HTTP/2 client (Python's `h2`/
+`hyperframe` packages, manually; a raw stdlib-only hand-rolled client --
+matching 1d WebSocket's own precedent of not adding a pip dependency to
+the test suite -- for the permanent `tests/test-core.sh` regression
+coverage): a legitimate client's ordinary traffic is unaffected by
+either cap; a simulated Rapid Reset attack and a simulated raw
+new-stream flood are each cut off within a few hundred attempts of a
+thousand attempted; a real GOAWAY frame is confirmed to arrive before
+the connection closes on `SIGTERM`; both caps confirmed per-connection.
+`make clean && make test` and `make sanitize` both green, including
+repeated attack cycles back-to-back against the sanitized build with no
+fd or memory leaks. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.7.0
 
 ### Added

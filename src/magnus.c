@@ -33,7 +33,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.7.0"
+#define MAGNUS_VERSION "1.8.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -66,6 +66,19 @@
  * this connection's own bookkeeping (the h2_streams list) without bound
  * -- nghttp2 itself enforces the limit once advertised via SETTINGS. */
 #define MAGNUS_H2_MAX_CONCURRENT_STREAMS 128
+/* Rapid-Reset-class abuse hardening (roadmap 1e-3, CVE-2023-44487's
+ * attack shape: open a stream, immediately RST_STREAM it, repeat as
+ * fast as possible -- cheap for the attacker, expensive for the server
+ * if each open triggers real dispatch work). Both caps are per
+ * connection, per second: generous enough that no legitimate client
+ * (even a browser's full-page fan-out, or a legitimate client cancelling
+ * a handful of in-flight requests, e.g. a fast page navigation away)
+ * ever comes close, tight enough that an attacker cycling through
+ * MAGNUS_H2_MAX_CONCURRENT_STREAMS-many streams far faster than any real
+ * response could ever be produced gets cut off almost immediately
+ * rather than after doing meaningful damage. */
+#define MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND 100
+#define MAGNUS_H2_MAX_RESETS_PER_SECOND 50
 
 /* Forward-declared so magnus_connection_t can hold a pointer to it;
  * fully defined alongside the rest of the HTTP/2 (1e-1) implementation,
@@ -169,6 +182,26 @@ typedef struct {
     char *h2_output;
     size_t h2_output_length;
     size_t h2_output_sent;
+    /* Rapid-Reset-class abuse hardening (roadmap 1e-3): a lazily-reset
+     * one-second sliding window (refreshed the moment either counter is
+     * next touched, not swept separately) counting how many new request
+     * streams this connection has opened, and how many RST_STREAM
+     * frames the *client* has sent on it, within the current second.
+     * Either exceeding its cap (magnus_h2_on_begin_headers()/
+     * magnus_h2_on_frame_recv() -- see MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND/
+     * MAGNUS_H2_MAX_RESETS_PER_SECOND) terminates the connection
+     * immediately by returning NGHTTP2_ERR_CALLBACK_FAILURE from the
+     * offending callback, exactly the mechanism nghttp2 itself already
+     * uses internally for its own PING/SETTINGS-ack-flood and
+     * CONTINUATION-flood protections (NGHTTP2_ERR_FLOODED /
+     * NGHTTP2_ERR_TOO_MANY_CONTINUATIONS, both already fatal via the
+     * existing `consumed < 0` check in magnus_h2_service() -- this is
+     * the same treatment extended to a class of abuse nghttp2 has no
+     * built-in cap for, since a rate genuinely legitimate for it is
+     * application-specific.) */
+    time_t h2_abuse_window_start;
+    unsigned h2_streams_opened_this_second;
+    unsigned h2_resets_received_this_second;
     char *proxy_buffer;
     size_t proxy_buffer_length;
     size_t proxy_buffer_sent;
@@ -2246,6 +2279,21 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     magnus_h2_dispatch_static(connection, stream);
 }
 
+/* Rolls `connection`'s Rapid-Reset-hardening window over to the current
+ * second if it has changed since it was last touched -- called from
+ * both magnus_h2_on_begin_headers() and magnus_h2_on_frame_recv()'s
+ * RST_STREAM branch right before incrementing whichever counter applies,
+ * so the two counters always share one window regardless of which kind
+ * of event happens to advance it first. */
+static void
+magnus_h2_abuse_window_refresh(magnus_connection_t *connection, time_t now)
+{
+    if (now == connection->h2_abuse_window_start) return;
+    connection->h2_abuse_window_start = now;
+    connection->h2_streams_opened_this_second = 0;
+    connection->h2_resets_received_this_second = 0;
+}
+
 static int
 magnus_h2_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
                            void *user_data)
@@ -2255,6 +2303,11 @@ magnus_h2_on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame,
     if (frame->hd.type != NGHTTP2_HEADERS
         || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
         return 0;
+    magnus_h2_abuse_window_refresh(connection, time(NULL));
+    connection->h2_streams_opened_this_second++;
+    if (connection->h2_streams_opened_this_second
+        > MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND)
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
     stream = magnus_h2_stream_new(connection, frame->hd.stream_id);
     if (stream == NULL) return NGHTTP2_ERR_CALLBACK_FAILURE;
     if (nghttp2_session_set_stream_user_data(session, frame->hd.stream_id,
@@ -2384,12 +2437,36 @@ magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
     return 0;
 }
 
+/* Frame types other than HEADERS/DATA/RST_STREAM (GOAWAY, PING,
+ * SETTINGS, WINDOW_UPDATE, PRIORITY, ...) all fall through this
+ * function's checks and are simply ignored -- not overlooked, but
+ * deliberately safe to ignore: nghttp2 already applies each one's
+ * protocol-level consequences (adjusting flow-control windows, refusing
+ * new streams past a received GOAWAY's declared last-stream-id, acking
+ * PINGs, ...) before this callback ever runs, and none of them need any
+ * further reaction from magnus itself at this stage of the roadmap. */
 static int
 magnus_h2_on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
                         void *user_data)
 {
     magnus_connection_t *connection = user_data;
     struct magnus_h2_stream *stream;
+
+    if (frame->hd.type == NGHTTP2_RST_STREAM) {
+        /* The client resetting a stream it opened -- the Rapid Reset
+         * (CVE-2023-44487) signature when it happens at volume. See
+         * MAGNUS_H2_MAX_RESETS_PER_SECOND's own comment for why the cap
+         * is enforced here rather than via any nghttp2-builtin
+         * protection (nghttp2's own flood detection covers PING/SETTINGS
+         * acks and CONTINUATION floods, not this). */
+        magnus_h2_abuse_window_refresh(connection, time(NULL));
+        connection->h2_resets_received_this_second++;
+        if (connection->h2_resets_received_this_second
+            > MAGNUS_H2_MAX_RESETS_PER_SECOND)
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
     if ((frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA)
         || (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0)
         return 0;
@@ -4741,6 +4818,30 @@ main(int argc, char **argv)
             magnus_access_log_flush();
             last_sweep = now;
         }
+    }
+
+    /* Graceful GOAWAY (roadmap 1e-3): every still-open h2 connection gets
+     * one best-effort GOAWAY (NGHTTP2_NO_ERROR, this session's own
+     * last-processed stream id) before the hard close loop below tears
+     * everything down regardless -- a clean signal for a well-behaved
+     * client, at essentially no cost, rather than the abrupt
+     * RST/connection-drop it would otherwise see. Deliberately not the
+     * full two-GOAWAY graceful-shutdown dance RFC 9113 6.8 describes for
+     * avoiding a race with in-flight new streams: that dance is meant to
+     * span a full RTT before the real shutdown, and magnus's own
+     * shutdown proceeds immediately after this loop regardless, so
+     * there is no window for it to matter in. magnus_h2_push() is
+     * attempted once, best-effort -- if the client fd would block, the
+     * GOAWAY simply does not make it out in time, exactly as if the
+     * process had been killed a moment earlier; this is a courtesy, not
+     * a guarantee. */
+    for (int fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
+        magnus_connection_t *connection = magnus_connections[fd];
+        if (connection == NULL || !connection->h2_active) continue;
+        (void) nghttp2_submit_goaway(connection->h2_session, NGHTTP2_FLAG_NONE,
+            nghttp2_session_get_last_proc_stream_id(connection->h2_session),
+            NGHTTP2_NO_ERROR, NULL, 0);
+        (void) magnus_h2_push(epoll_fd, connection);
     }
 
     for (int fd = 0; fd < MAGNUS_MAX_FDS; fd++) {

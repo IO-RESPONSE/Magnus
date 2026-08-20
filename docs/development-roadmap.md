@@ -270,8 +270,52 @@ checkpoint from the prior sub-phase being green.
      matches on; verified clean under `make sanitize` (ASan+UBSan)
      against this exact live traffic, including the concurrent and
      oversized-body cases.
-   - **1e-3+ — remaining.** h2c; GOAWAY/RST_STREAM handling and
-     Rapid-Reset-class abuse hardening; per-client-IP rate limiting and
+   - **1e-3 — GOAWAY/RST_STREAM handling + Rapid-Reset-class abuse
+     hardening. Shipped in 1.8.0.** A per-connection, lazily-reset
+     one-second window now caps both how many new request streams a
+     connection may open (`MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND`, 100)
+     and how many `RST_STREAM` frames the *client* may send on it
+     (`MAGNUS_H2_MAX_RESETS_PER_SECOND`, 50) — the latter directly
+     targeting the Rapid Reset (CVE-2023-44487) shape: open a stream,
+     immediately reset it, repeat as fast as possible, cheap for the
+     attacker and potentially expensive for the server if each open
+     triggered real dispatch work. Either cap being exceeded terminates
+     the connection immediately by returning
+     `NGHTTP2_ERR_CALLBACK_FAILURE` from the offending nghttp2 callback —
+     the same mechanism nghttp2 already uses internally for its own
+     PING/SETTINGS-ack-flood and CONTINUATION-flood protections
+     (`NGHTTP2_ERR_FLOODED` / `NGHTTP2_ERR_TOO_MANY_CONTINUATIONS`, both
+     already fatal via magnus's existing `consumed < 0` check on every
+     `nghttp2_session_mem_recv2()` call — so those two abuse classes were
+     already covered for free before this sub-phase existed; only
+     Rapid-Reset-style `RST_STREAM` abuse and raw new-stream-open floods
+     had no cap of their own, since a rate genuinely legitimate for them
+     is application-specific, not something a general-purpose library can
+     assume). Separately, graceful shutdown now sends every still-open h2
+     connection a real GOAWAY frame (`NGHTTP2_NO_ERROR`, this session's
+     own last-processed stream id) before the existing hard-close loop
+     tears everything down on `SIGTERM` — a single best-effort frame, not
+     RFC 9113 6.8's full two-GOAWAY dance (which is meant to span a full
+     RTT to avoid a race with in-flight new streams; magnus's own
+     shutdown proceeds immediately afterward regardless, so there is no
+     window for that dance to matter in). Verified against a real,
+     independent HTTP/2 client (`h2`/`hyperframe`, manually — a raw,
+     stdlib-only hand-rolled client for the permanent
+     `tests/test-core.sh` regression coverage instead, matching 1d's own
+     precedent of not adding a pip dependency to the test suite itself):
+     a legitimate client's ordinary traffic is completely unaffected by
+     either cap; a simulated Rapid Reset attack (open+immediate-reset in
+     a tight loop) and a simulated raw new-stream flood are each cut off
+     within a few hundred attempts, well short of the thousand attempted
+     — proving both caps actually fire under real, wire-level attack
+     traffic, not just unit tests against this project's own code; a
+     real GOAWAY frame (type `0x7`) is confirmed to arrive before the
+     connection closes on `SIGTERM`; both caps are confirmed
+     per-connection, not a global circuit-breaker an attacker could ride
+     to deny service to every other client; all of the above re-verified
+     clean under `make sanitize` (ASan+UBSan), including repeated attack
+     cycles back-to-back with no fd or memory leaks.
+   - **1e-4+ — remaining.** h2c; per-client-IP rate limiting and
      `/healthz`/`/metrics` for the h2 path; response trailers;
      WebSocket-over-h2 (extended CONNECT); and generalizing 1e-1/1e-2's
      still-protocol-specific dispatch functions into the master prompt's

@@ -1359,3 +1359,220 @@ server_pid=
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
+
+# Rapid-Reset-class abuse hardening (1e-3): a raw, stdlib-only (no h2/
+# hyperframe pip dependency, matching the 1d WebSocket test's own
+# stdlib-first precedent -- curl has no way to emit a bare RST_STREAM or
+# skip HPACK, which is exactly what this needs to control directly) h2
+# client that hand-encodes just enough of the wire format (the fixed
+# connection preface, an empty initial SETTINGS frame, and HPACK's
+# plain "literal header field without indexing -- new name"
+# representation for a handful of short pseudo-headers, no Huffman or
+# dynamic-table indexing needed) to drive real HEADERS/RST_STREAM frames
+# at magnus directly. Exercises: a legitimate handful of sequential
+# requests is never affected by either cap; a client that opens a
+# stream and immediately RST_STREAMs it in a tight loop (the Rapid Reset
+# / CVE-2023-44487 shape) gets its connection cut off well before
+# reaching MAGNUS_H2_MAX_RESETS_PER_SECOND-many, let alone the full
+# attempted count; a client that just opens streams as fast as possible
+# (no resets at all) is independently capped by
+# MAGNUS_H2_MAX_NEW_STREAMS_PER_SECOND the same way.
+port_h2abuse=$((port + 43))
+h2abuse_root="$web_root/h2abuse"
+mkdir -p "$h2abuse_root"
+printf '%s\n' 'h2abuse ok' >"$h2abuse_root/index.html"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/h2abuse-server.key" -out "$web_root/h2abuse-server.crt" \
+  >/dev/null 2>&1
+"$binary" --port "$port_h2abuse" --root "$h2abuse_root" \
+  --tls-cert "$web_root/h2abuse-server.crt" --tls-key "$web_root/h2abuse-server.key" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2 --insecure --fail --silent \
+    "https://127.0.0.1:$port_h2abuse/healthz" >/dev/null && break
+  sleep 1
+done
+
+python3 -c "
+import socket, ssl, sys
+
+HOST = '127.0.0.1'
+PORT = $port_h2abuse
+PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+
+def hpack_string(s):
+    assert len(s) < 127
+    return bytes([len(s)]) + s
+
+def hpack_literal_new_name(name, value):
+    return b'\x00' + hpack_string(name) + hpack_string(value)
+
+def build_headers_block(pairs):
+    return b''.join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+def frame(frame_type, flags, stream_id, payload=b''):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+        frame_type, flags]) + stream_id.to_bytes(4, 'big')
+    return header + payload
+
+PAIRS = [(b':method', b'GET'), (b':path', b'/index.html'),
+    (b':scheme', b'https'), (b':authority', b'localhost')]
+
+def headers_frame(stream_id, end_stream):
+    flags = 0x04 | (0x01 if end_stream else 0)
+    return frame(0x1, flags, stream_id, build_headers_block(PAIRS))
+
+def rst_stream_frame(stream_id):
+    return frame(0x3, 0, stream_id, (8).to_bytes(4, 'big'))  # CANCEL
+
+def connect():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(['h2'])
+    raw = socket.create_connection((HOST, PORT), timeout=5)
+    tls = ctx.wrap_socket(raw, server_hostname='localhost')
+    assert tls.selected_alpn_protocol() == 'h2'
+    tls.sendall(PREFACE + frame(0x4, 0, 0, b''))  # preface + empty SETTINGS
+    return tls
+
+def probe_alive(tls):
+    tls.settimeout(1)
+    try:
+        return tls.recv(4096) != b''
+    except OSError:
+        return False
+
+def run(mode, count):
+    tls = connect()
+    stream_id = 1
+    sent = 0
+    died = False
+    for _ in range(count):
+        try:
+            if mode == 'reset':
+                tls.sendall(headers_frame(stream_id, False))
+                tls.sendall(rst_stream_frame(stream_id))
+            else:
+                tls.sendall(headers_frame(stream_id, True))
+            sent += 1
+            stream_id += 2
+        except OSError:
+            died = True
+            break
+    if not died:
+        died = not probe_alive(tls)
+    tls.close()
+    return died, sent
+
+# Legitimate: 10 sequential ordinary requests, each waited out fully --
+# neither cap has any effect on traffic this ordinary.
+tls = connect()
+stream_id = 1
+completed = 0
+for _ in range(10):
+    tls.sendall(headers_frame(stream_id, True))
+    tls.settimeout(3)
+    try:
+        data = tls.recv(65536)
+        if data:
+            completed += 1
+    except OSError:
+        pass
+    stream_id += 2
+tls.close()
+assert completed == 10, 'legitimate traffic affected: %d/10 completed' % completed
+print('legitimate ok: %d/10' % completed)
+
+died, sent = run('reset', 1000)
+assert died, 'rapid-reset attack was not cut off at all'
+assert sent < 1000, 'rapid-reset attack sent all 1000 without being cut off'
+print('rapid-reset cut off after %d resets' % sent)
+
+died, sent = run('flood', 1000)
+assert died, 'new-stream flood was not cut off at all'
+assert sent < 1000, 'new-stream flood sent all 1000 without being cut off'
+print('stream-flood cut off after %d streams' % sent)
+"
+
+# Ordinary h2 traffic through the very same magnus instance, after both
+# attack connections above: proves the caps are per-*connection*, not a
+# global circuit-breaker that an attacker could use to deny service to
+# every other client.
+test "$(curl --http2 --insecure --fail --silent \
+  "https://127.0.0.1:$port_h2abuse/index.html")" = 'h2abuse ok'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Graceful GOAWAY on shutdown (1e-3): a still-open h2 connection gets an
+# actual GOAWAY frame (type 0x7) before the process exits on SIGTERM,
+# not just an abrupt close -- parsed here at the bare frame-header level
+# (3-byte length + 1-byte type + ...), which is all a well-behaved
+# client needs to at least recognize what happened, without needing this
+# test to also decode the GOAWAY payload itself.
+port_h2goaway=$((port + 44))
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/h2goaway-server.key" -out "$web_root/h2goaway-server.crt" \
+  >/dev/null 2>&1
+"$binary" --port "$port_h2goaway" --root "$h2abuse_root" \
+  --tls-cert "$web_root/h2goaway-server.crt" --tls-key "$web_root/h2goaway-server.key" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2 --insecure --fail --silent \
+    "https://127.0.0.1:$port_h2goaway/healthz" >/dev/null && break
+  sleep 1
+done
+
+goaway_out="$web_root/goaway-client.out"
+python3 -c "
+import socket, ssl, time
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(['h2'])
+raw = socket.create_connection(('127.0.0.1', $port_h2goaway), timeout=5)
+tls = ctx.wrap_socket(raw, server_hostname='localhost')
+assert tls.selected_alpn_protocol() == 'h2'
+tls.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + bytes([0,0,0, 0x4,0, 0,0,0,0]))
+print('READY', flush=True)
+
+tls.settimeout(10)
+buf = b''
+goaway_seen = False
+deadline = time.time() + 10
+while time.time() < deadline:
+    try:
+        chunk = tls.recv(4096)
+    except socket.timeout:
+        continue
+    if not chunk:
+        break
+    buf += chunk
+    while len(buf) >= 9:
+        length = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+        frame_type = buf[3]
+        if len(buf) < 9 + length:
+            break
+        if frame_type == 0x7:
+            goaway_seen = True
+        buf = buf[9 + length:]
+    if goaway_seen:
+        break
+print('GOAWAY_SEEN=%s' % goaway_seen)
+" >"$goaway_out" 2>&1 &
+goaway_client_pid=$!
+for attempt in $(seq 1 20); do
+  grep -q READY "$goaway_out" 2>/dev/null && break
+  sleep 0.2
+done
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+wait "$goaway_client_pid"
+grep -q '^GOAWAY_SEEN=True$' "$goaway_out"
