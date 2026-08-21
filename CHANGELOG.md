@@ -1,5 +1,103 @@
 # Changelog
 
+## 1.24.0
+
+### Added
+
+- **PROXY protocol emission (roadmap 3e): the last item on Phase 3's own
+  headline ("L4 TCP/UDP, TLS passthrough, PROXY protocol"), not covered
+  by TCP passthrough (3a), TLS passthrough (3b), or UDP passthrough (3d)
+  -- closes out Phase 3.** The reverse direction from Real IP 2b's own
+  `magnus_proxy_proto_parse()`: magnus is here the *emitter*, not the
+  receiver, prefixing its own outbound connection to a stream backend
+  with a preamble identifying the real (source IP, source port) a plain
+  relayed TCP connection would otherwise never reveal -- every connection
+  would otherwise look, to the backend, like it originates from magnus's
+  own address. Scoped to TCP stream passthrough only for this increment
+  (UDP passthrough's own distinct "per-datagram header" v2 variant is a
+  real complexity/compatibility trade-off, deliberately deferred to a
+  future increment).
+- New `stream_proxy_protocol=off|v1|v2` config key / `--stream-proxy-
+  protocol off|v1|v2` CLI flag. Defaults to `off` -- unconditionally
+  turning this on would break any existing deployment whose backend does
+  not already expect this preamble as its first bytes. Applies uniformly
+  to every stream connection regardless of which cluster it ends up at,
+  the plain `stream_upstream` default cluster or a matched
+  `stream_sni_route` one (3b) -- a deliberate first-increment
+  simplification assuming homogeneous backend expectations across the
+  whole `stream_listen` surface; a per-pattern override is a distinct
+  possible future increment, not silently half-done. Hot-reloadable,
+  like `stream_lb_policy`, since no listening socket is involved.
+- New `magnus_proxy_proto_build()` (`magnus_realip.c`/`.h`, alongside the
+  parse-side `magnus_proxy_proto_parse()` it mirrors): renders either the
+  v1 text format (`PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>
+  \r\n`) or the fixed 28-byte v2 binary layout (12-byte signature +
+  version/command + family/protocol + address-block length + 4+4-byte
+  IPv4 addresses + 2+2-byte big-endian ports), reusing the same
+  `MAGNUS_PROXY_V2_SIG` signature constant the parser already defines
+  rather than duplicating it. `dst` is simply the backend connection's
+  own endpoint -- what magnus itself just `connect()`ed to -- since
+  there is no notion of an "original destination" here, unlike a
+  transparent proxy.
+- The header is built once, synchronously, right when
+  `magnus_stream_connect()`'s own `connect()` resolves (whether that
+  happens immediately or is confirmed later, asynchronously), and
+  flushed to the backend by a new `magnus_stream_flush_proxy_protocol()`
+  before a single byte of actual relay traffic goes out -- gated in both
+  `magnus_stream_service()`'s per-event dispatch (the ordinary pump calls
+  wait for the header to finish flushing first) and
+  `magnus_stream_rearm()`'s own epoll-interest computation (asks for
+  upstream `EPOLLOUT` while any of the header is still unsent).
+- A real, previously-latent gap was found and fixed along the way, not
+  by code review but while designing this feature: `magnus_stream_accept
+  ()`'s own non-SNI branch had **no follow-up call at all** after a
+  successful synchronous `connect()` -- harmless before this increment,
+  since there was nothing to proactively send at accept time, but a real
+  gap now that a header needs to go out as early as possible. Fixed by a
+  new shared `magnus_stream_after_connect()` helper, now called from
+  every `magnus_stream_connect()` call site (`magnus_stream_accept()`'s
+  non-SNI branch and `magnus_stream_peek_decide()`'s own SNI-resolution
+  tail, which previously duplicated the same pump-then-rearm logic
+  inline).
+- `magnus_stream_conn_t` gained `peer_port` (the client's own source
+  port, previously never needed by anything else in this file) and a
+  dedicated `proxy_protocol_header[MAGNUS_PROXY_PROTO_BUILD_MAX]` buffer
+  -- deliberately separate from the existing `c2u.buffer` (which already
+  doubles as the ordinary relay buffer and the SNI-peek buffer from 3b)
+  to avoid a `memmove`-based buffer-shifting complication and let the
+  header flush as a clean, independent "always goes out first" step.
+
+### Verified
+
+Live, under ASan+UBSan, against real backends parsing both wire formats
+directly off the wire (not just trusting magnus's own side): v1 and v2
+each independently confirmed as the literal first bytes on the
+connection, with the correct real client (source IP, source port); `off`
+(the default) confirmed to send no preamble at all, byte-identical to
+pre-3e behavior; and the SNI-routing combo (3b) confirmed end-to-end --
+both the default cluster and an SNI-matched cluster receive the header
+first, followed immediately by the real, unmodified payload (a plain
+non-TLS request in one case, a real TLS ClientHello captured from
+Python's own `ssl` module in the other), byte-for-byte. New unit
+coverage in `tests/test-realip.c`: exact wire-format bytes for both
+versions (including a `MAGNUS_PROXY_PROTOCOL_OFF` no-op check and a
+buffer-too-small defensive check for each), plus a build/parse
+round-trip proving `magnus_proxy_proto_build()` and the pre-existing
+`magnus_proxy_proto_parse()` agree on the wire format. New permanent
+regression coverage in `tests/test-core.sh`. `make clean && make test`
+green (unit, fuzz, `test-core.sh`, `test-control-plane.sh`); two
+`test-core.sh` failures during this cycle (one in the pre-existing cache
+test, one in the pre-existing SNI test, at different points on different
+runs, both entirely unrelated to any stream/PROXY-protocol code path)
+were confirmed environmental, not a regression: the exact failing
+scenarios reproduced standalone passed cleanly and repeatedly, an
+unmodified pre-3e baseline build run under the same conditions passed
+cleanly too, and a subsequent clean retry of the full modified suite
+(including this feature's own new test block) passed with no failures
+at all -- the same established flaky-test class this project has hit
+before, sensitive to unrelated system load rather than to this
+increment's own code. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.23.0
 
 ### Added

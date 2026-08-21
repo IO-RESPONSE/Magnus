@@ -26,6 +26,23 @@
 #define MAGNUS_CONFIG_MAX_SNI_ROUTES 8
 #define MAGNUS_CONFIG_SNI_PATTERN_MAX 128
 
+/* PROXY protocol emission (the "PROXY protocol" line item from Phase 3's
+ * own roadmap headline, not covered by TCP passthrough (3a), TLS
+ * passthrough (3b), or UDP passthrough (3d)): the reverse direction from
+ * magnus_realip.h's own magnus_proxy_proto_parse() -- magnus is here the
+ * *emitter*, not the receiver, telling the L4 stream cluster's own
+ * backend the real client (source IP, source port) it would otherwise
+ * never see (every connection looks like it originates from magnus's
+ * own address). Defined here (not magnus_realip.h, which already
+ * depends on this header for magnus_cidr_t and cannot be depended on in
+ * the other direction) so both this config schema and
+ * magnus_realip.h's own build-side declarations can share one enum. */
+typedef enum {
+    MAGNUS_PROXY_PROTOCOL_OFF = 0,
+    MAGNUS_PROXY_PROTOCOL_V1,
+    MAGNUS_PROXY_PROTOCOL_V2
+} magnus_proxy_protocol_mode_t;
+
 typedef struct {
     struct in_addr network;
     unsigned prefix_length;
@@ -96,6 +113,17 @@ typedef struct {
     size_t stream_upstream_count;
     magnus_config_upstream_t stream_upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
     magnus_lb_policy_t stream_lb_policy;
+    /* PROXY protocol emission -- see magnus_proxy_protocol_mode_t's own
+     * comment. Applies uniformly to every stream connection regardless
+     * of which cluster it ends up at (the plain stream_upstream cluster,
+     * or a matched stream_sni_route one) -- a deliberate first-increment
+     * simplification assuming homogeneous backend expectations across
+     * the whole stream_listen surface; per-pattern override is a
+     * distinct possible future increment, not silently half-done. Off
+     * by default -- unconditionally on would break any existing
+     * deployment whose backend does not already expect this preamble as
+     * its first bytes. Hot-reloadable, like stream_lb_policy above. */
+    magnus_proxy_protocol_mode_t stream_proxy_protocol;
     /* TLS passthrough / SNI routing (roadmap 3b): layered on top of the
      * stream cluster above, never a replacement for it -- a connection
      * whose peeked ClientHello either does not parse, carries no SNI, or
@@ -194,6 +222,7 @@ typedef enum {
  *     stream_upstream must be a literal IPv4 address (not a hostname),
  *     stream_lb_policy is the same enum as lb_policy, stream_listen
  *     requires at least one stream_upstream and vice versa,
+ *     stream_proxy_protocol is 'off'/'v1'/'v2',
  *     stream_sni_route is "<pattern> <ipv4:port[:weight]>" -- pattern is
  *     an exact hostname or a `*.`-prefixed one, endpoint is a literal
  *     IPv4 address same as stream_upstream, and stream_sni_route
@@ -210,7 +239,9 @@ typedef enum {
  *     2, health_check_failure_threshold to 3, health_check_cooldown_seconds
  *     to 5; stream_listen is optional (the L4 passthrough listener does
  *     not exist at all when omitted); stream_lb_policy defaults to
- *     "round_robin" when omitted; stream_sni_route defaults to none (every
+ *     "round_robin" when omitted; stream_proxy_protocol defaults to "off"
+ *     (unconditionally on would break any backend not already expecting
+ *     the preamble); stream_sni_route defaults to none (every
  *     stream connection uses the plain stream_upstream cluster); udp_listen
  *     is optional (the UDP listener does not exist at all when omitted);
  *     udp_lb_policy defaults to "round_robin"; udp_session_idle_seconds

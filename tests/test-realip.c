@@ -221,6 +221,71 @@ main(void)
         assert(res == MAGNUS_PROXY_PROTO_NOT_PROXY);
     }
 
+    /* --- 7. PROXY protocol emission (magnus_proxy_proto_build) --- */
+    {
+        struct in_addr src_ip, dst_ip;
+        unsigned char out[MAGNUS_PROXY_PROTO_BUILD_MAX];
+        size_t length;
+
+        inet_pton(AF_INET, "203.0.113.7", &src_ip);
+        inet_pton(AF_INET, "10.0.0.5", &dst_ip);
+
+        /* OFF: nothing built, regardless of buffer size. */
+        length = magnus_proxy_proto_build(MAGNUS_PROXY_PROTOCOL_OFF, src_ip,
+                                          54321, dst_ip, 443, out, sizeof(out));
+        assert(length == 0);
+
+        /* v1: exact text format, host-order decimal ports. */
+        length = magnus_proxy_proto_build(MAGNUS_PROXY_PROTOCOL_V1, src_ip,
+                                          54321, dst_ip, 443, out, sizeof(out));
+        assert(length > 0);
+        assert(memcmp(out, "PROXY TCP4 203.0.113.7 10.0.0.5 54321 443\r\n",
+                      length) == 0);
+        assert(length == strlen("PROXY TCP4 203.0.113.7 10.0.0.5 54321 443\r\n"));
+
+        /* v1: buffer too small to hold the formatted line is reported as
+         * 0, not a silent truncation. */
+        length = magnus_proxy_proto_build(MAGNUS_PROXY_PROTOCOL_V1, src_ip,
+                                          54321, dst_ip, 443, out, 8);
+        assert(length == 0);
+
+        /* v2: exact 28-byte binary layout, and -- the real correctness
+         * property that matters -- feeding it straight into this same
+         * file's own magnus_proxy_proto_parse() recovers the same source
+         * address, proving the emitter and the (already-shipped,
+         * roadmap 2b) receiver actually agree on the wire format rather
+         * than just looking plausible in isolation. */
+        length = magnus_proxy_proto_build(MAGNUS_PROXY_PROTOCOL_V2, src_ip,
+                                          54321, dst_ip, 443, out, sizeof(out));
+        assert(length == 28);
+        {
+            static const unsigned char expected_prefix[16] = {
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51,
+                0x55, 0x49, 0x54, 0x0A, 0x21, 0x11, 0x00, 0x0C
+            };
+            assert(memcmp(out, expected_prefix, sizeof(expected_prefix)) == 0);
+            assert(memcmp(out + 16, &src_ip, 4) == 0);
+            assert(memcmp(out + 20, &dst_ip, 4) == 0);
+            assert(out[24] == (54321 >> 8) && out[25] == (54321 & 0xFF));
+            assert(out[26] == (443 >> 8) && out[27] == (443 & 0xFF));
+        }
+        {
+            size_t consumed = 0;
+            struct in_addr parsed_src = {0};
+            magnus_proxy_proto_result_t res = magnus_proxy_proto_parse(
+                (const char *) out, length, &consumed, &parsed_src);
+            assert(res == MAGNUS_PROXY_PROTO_OK);
+            assert(consumed == length);
+            assert(parsed_src.s_addr == src_ip.s_addr);
+        }
+
+        /* v2: buffer too small for the fixed 28-byte layout is reported
+         * as 0. */
+        length = magnus_proxy_proto_build(MAGNUS_PROXY_PROTOCOL_V2, src_ip,
+                                          54321, dst_ip, 443, out, 27);
+        assert(length == 0);
+    }
+
     printf("test-realip: ok\n");
     return 0;
 }

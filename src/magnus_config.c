@@ -343,6 +343,21 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+        } else if (strcmp(key, "stream_proxy_protocol") == 0) {
+            if (strcmp(value, "off") == 0) {
+                config->stream_proxy_protocol = MAGNUS_PROXY_PROTOCOL_OFF;
+            } else if (strcmp(value, "v1") == 0) {
+                config->stream_proxy_protocol = MAGNUS_PROXY_PROTOCOL_V1;
+            } else if (strcmp(value, "v2") == 0) {
+                config->stream_proxy_protocol = MAGNUS_PROXY_PROTOCOL_V2;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_proxy_protocol' must be "
+                                        "'off', 'v1', or 'v2', got '%s'",
+                                        value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
         } else if (strcmp(key, "stream_sni_route") == 0) {
             char spec[256];
             char *saveptr = NULL;

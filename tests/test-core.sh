@@ -94,6 +94,14 @@ cleanup() {
     kill -TERM "$backend19_pid" >/dev/null 2>&1 || true
     wait "$backend19_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend20_pid:-}" ]; then
+    kill -TERM "$backend20_pid" >/dev/null 2>&1 || true
+    wait "$backend20_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend21_pid:-}" ]; then
+    kill -TERM "$backend21_pid" >/dev/null 2>&1 || true
+    wait "$backend21_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -3537,6 +3545,241 @@ kill -TERM "$backend17_pid" 2>/dev/null
 wait "$backend17_pid" 2>/dev/null || true
 backend17_pid=
 echo "stream: TLS passthrough / SNI routing ok"
+
+# PROXY protocol emission: the "PROXY protocol" line item from Phase 3's
+# own roadmap headline, not covered by TCP passthrough (3a), TLS
+# passthrough (3b), or UDP passthrough (3d) -- magnus here is the
+# *emitter*, prefixing its own outbound connection to a backend with a
+# preamble identifying the real (source IP, source port) a plain TCP
+# relay would otherwise never reveal. Exercised against both the plain
+# default stream cluster and an SNI-routed one (roadmap 3b combo), for
+# both wire formats.
+proxy_protocol_backend() {
+  # Same exec discipline as labelled_backend above, for the same PID-kill
+  # reason. Parses a PROXY protocol v1 (text) or v2 (binary) preamble off
+  # the front of each connection -- if present -- and reports what it
+  # found as a single "HDR:<mode>:<src_ip>:<src_port>\n" line (or
+  # "HDR:none\n" when no recognizable preamble was present at all, the
+  # off-by-default case), followed by the labelled echo of whatever bytes
+  # came after the preamble -- same "<label>:<payload>" shape
+  # labelled_backend's own plain echo already uses, so a passthrough
+  # payload's byte-exactness is checked the same way.
+  exec python3 -c "
+import socket, threading
+
+V2_SIG = bytes([0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51,
+                0x55, 0x49, 0x54, 0x0A])
+
+def recv_exact(conn, n, buf):
+    while len(buf) < n:
+        chunk = conn.recv(4096)
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+def handle(conn):
+    try:
+        buf = recv_exact(conn, 16, b'')
+        if buf[:6] == b'PROXY ':
+            while b'\r\n' not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+            idx = buf.index(b'\r\n')
+            parts = buf[:idx].decode().split()
+            remainder = buf[idx + 2:]
+            desc = 'v1:%s:%s' % (parts[2], parts[4])
+        elif buf[:12] == V2_SIG:
+            buf = recv_exact(conn, 16, buf)
+            addr_len = (buf[14] << 8) | buf[15]
+            buf = recv_exact(conn, 16 + addr_len, buf)
+            src_addr = socket.inet_ntoa(buf[16:20])
+            src_port = int.from_bytes(buf[24:26], 'big')
+            remainder = buf[16 + addr_len:]
+            desc = 'v2:%s:%s' % (src_addr, src_port)
+        else:
+            remainder = buf
+            desc = 'none'
+        conn.sendall(('HDR:%s\n' % desc).encode())
+        if remainder:
+            conn.sendall(b'$2:' + remainder)
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            conn.sendall(b'$2:' + data)
+    except EOFError:
+        pass
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $1))
+s.listen(50)
+while True:
+    conn, _ = s.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"
+}
+portPpDefault=$((port + 97))
+portPpA=$((port + 98))
+proxy_protocol_backend "$portPpDefault" DEFAULT >/dev/null 2>&1 &
+backend20_pid=$!
+proxy_protocol_backend "$portPpA" A >/dev/null 2>&1 &
+backend21_pid=$!
+for pp_backend_port in "$portPpDefault" "$portPpA"; do
+  for attempt in 1 2 3 4 5; do
+    python3 -c "
+import socket
+s = socket.create_connection(('127.0.0.1', $pp_backend_port), timeout=1)
+s.close()
+" 2>/dev/null && break
+    sleep 1
+  done
+done
+
+port_pp_v1=$((port + 99))
+port_pp_v1_stream=$((port + 100))
+"$binary" --port "$port_pp_v1" --stream-listen "$port_pp_v1_stream" \
+  --stream-upstream "127.0.0.1:$portPpDefault" \
+  --stream-sni-route "site-a.test 127.0.0.1:$portPpA" \
+  --stream-proxy-protocol v1 \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_pp_v1/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket, ssl, threading, time
+
+def capture_clienthello(hostname):
+    captured = {}
+    ready = threading.Event()
+    def server():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        captured['port'] = srv.getsockname()[1]
+        srv.listen(1)
+        ready.set()
+        conn, _ = srv.accept()
+        captured['bytes'] = conn.recv(65536)
+        conn.close()
+        srv.close()
+    t = threading.Thread(target=server)
+    t.start()
+    ready.wait()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection(('127.0.0.1', captured['port']), timeout=3)
+    try:
+        ctx.wrap_socket(raw, server_hostname=hostname)
+    except Exception:
+        pass
+    t.join(timeout=3)
+    return captured['bytes']
+
+def send_and_read(payload):
+    # A single recv() is not guaranteed to capture the backend's two
+    # separate sendall()s (the HDR line, then the labelled echo) in one
+    # call -- poll with a short per-call timeout until the connection
+    # goes quiet, same reasoning as the SNI test's own send_and_read.
+    s = socket.create_connection(('127.0.0.1', $port_pp_v1_stream), timeout=5)
+    s.settimeout(0.5)
+    local_port = s.getsockname()[1]
+    s.sendall(payload)
+    received = b''
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            if received:
+                break
+            continue
+        if not chunk:
+            break
+        received += chunk
+    s.close()
+    return local_port, received
+
+# Plain non-TLS traffic falls back to the default stream_upstream cluster
+# (no stream_sni_route matched a non-TLS payload) -- the preamble must
+# still be the literal first bytes on the wire, ahead of the payload.
+port1, resp1 = send_and_read(b'GET / HTTP/1.1\r\nHost: site-a.test\r\n\r\n')
+expect_hdr1 = ('HDR:v1:127.0.0.1:%d\n' % port1).encode()
+assert resp1.startswith(expect_hdr1), (expect_hdr1, resp1[:60])
+assert resp1[len(expect_hdr1):] == b'DEFAULT:GET / HTTP/1.1\r\nHost: site-a.test\r\n\r\n', resp1
+
+# SNI-matched traffic (roadmap 3b combo): a real captured TLS ClientHello
+# routes to the A cluster, and still gets the PROXY preamble first,
+# followed by the exact ClientHello bytes, unmodified, right after it.
+ch_a = capture_clienthello('site-a.test')
+port2, resp2 = send_and_read(ch_a)
+expect_hdr2 = ('HDR:v1:127.0.0.1:%d\n' % port2).encode()
+assert resp2.startswith(expect_hdr2), (expect_hdr2, resp2[:60])
+assert resp2[len(expect_hdr2):] == b'A:' + ch_a, 'ClientHello not relayed byte-for-byte after PROXY header'
+
+print('stream: PROXY protocol v1 emission (default + SNI-routed clusters, byte-exact) ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+port_pp_v2=$((port + 101))
+port_pp_v2_stream=$((port + 102))
+"$binary" --port "$port_pp_v2" --stream-listen "$port_pp_v2_stream" \
+  --stream-upstream "127.0.0.1:$portPpDefault" \
+  --stream-proxy-protocol v2 \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_pp_v2/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket, time
+
+s = socket.create_connection(('127.0.0.1', $port_pp_v2_stream), timeout=5)
+s.settimeout(0.5)
+local_port = s.getsockname()[1]
+payload = b'v2-emission-byte-exact-payload'
+s.sendall(payload)
+received = b''
+deadline = time.time() + 5
+while time.time() < deadline:
+    try:
+        chunk = s.recv(65536)
+    except socket.timeout:
+        if received:
+            break
+        continue
+    if not chunk:
+        break
+    received += chunk
+s.close()
+expect_hdr = ('HDR:v2:127.0.0.1:%d\n' % local_port).encode()
+assert received.startswith(expect_hdr), (expect_hdr, received[:60])
+assert received[len(expect_hdr):] == b'DEFAULT:' + payload, received
+print('stream: PROXY protocol v2 emission (binary preamble, byte-exact) ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend20_pid" 2>/dev/null
+wait "$backend20_pid" 2>/dev/null || true
+backend20_pid=
+kill -TERM "$backend21_pid" 2>/dev/null
+wait "$backend21_pid" 2>/dev/null || true
+backend21_pid=
+echo "stream: PROXY protocol emission ok"
 
 # UDP passthrough (roadmap 3d): a NAT-style session per (source IP,
 # source port) tuple, no HTTP/TCP machinery involved at all. A tiny

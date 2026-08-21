@@ -813,7 +813,7 @@ connection-pool and common-request-model decisions).
     1.22.0 for the full detail.
   - **UDP passthrough 3d — a fourth, independent listener, NAT-style
     session tracking, no HTTP/TCP machinery involved at all. Shipped in
-    1.23.0 -- closes out Phase 3.** New `udp_listen`/`udp_upstream`/
+    1.23.0.** New `udp_listen`/`udp_upstream`/
     `udp_lb_policy`/`udp_session_idle_seconds`/`udp_max_sessions` config
     keys and matching `--udp-*` CLI flags. Plain `SOCK_DGRAM`, no
     `accept()`/handshake of any kind (UDP has neither) -- one NAT-style
@@ -866,6 +866,52 @@ connection-pool and common-request-model decisions).
     ~1.5s via the ICMP-triggered `ECONNREFUSED` path rather than sitting
     out its full idle timeout. New permanent regression coverage in
     `tests/test-core.sh`. See `CHANGELOG.md` 1.23.0 for the full detail.
+  - **PROXY protocol emission 3e — the last item on this phase's own
+    headline, and the reverse direction from Real IP 2b's own
+    `magnus_proxy_proto_parse()`: magnus here is the *emitter*, not the
+    receiver, prefixing its own outbound connection to a stream backend
+    with a preamble identifying the real (source IP, source port) a
+    plain relayed TCP connection would otherwise never reveal (every
+    connection would otherwise look like it originates from magnus's own
+    address). Shipped in 1.24.0 -- closes out Phase 3.** New
+    `stream_proxy_protocol=off|v1|v2` config key / `--stream-proxy-
+    protocol` CLI flag, defaulting to `off` (unconditionally on would
+    break any existing deployment whose backend does not already expect
+    this preamble as its first bytes). `magnus_proxy_proto_build()`
+    (new, in `magnus_realip.c`/`.h`, alongside the parse-side function it
+    mirrors) renders either the v1 text format (`PROXY TCP4 <src> <dst>
+    <sport> <dport>\r\n`) or the fixed 28-byte v2 binary layout reusing
+    the same `MAGNUS_PROXY_V2_SIG` signature constant the parser already
+    defines. Scoped to TCP stream passthrough only for this increment
+    (deliberately excluding UDP passthrough's own distinct "per-datagram
+    header" v2 variant, a real complexity/compatibility trade-off left
+    for a future increment) and applied uniformly across the whole
+    `stream_listen` surface regardless of which cluster a connection
+    ends up at -- the plain `stream_upstream` default cluster or a
+    matched `stream_sni_route` one (3b) -- a first-increment
+    simplification assuming homogeneous backend expectations; a
+    per-pattern override is a distinct possible future increment, not
+    silently half-done. The header is built once, synchronously, right
+    when `magnus_stream_connect()`'s own `connect()` resolves (whether
+    that happens immediately or later, confirmed asynchronously), and
+    flushed to the backend before a single byte of actual relay traffic
+    -- a real, previously-latent gap was found and fixed along the way:
+    `magnus_stream_accept()`'s own non-SNI branch had no follow-up call
+    at all after a successful connect (harmless before this increment,
+    since there was nothing to proactively send), fixed by a new shared
+    `magnus_stream_after_connect()` helper now called from every
+    connect() call site. Hot-reloadable, like `stream_lb_policy`, since
+    no listening socket is involved. Verified live under ASan+UBSan
+    against real backends parsing both wire formats off the wire: v1 and
+    v2 each independently confirmed as the literal first bytes on the
+    connection, `off` (the default) confirmed to send no preamble at all
+    (unchanged 3a/3b behavior), and the SNI-routing combo (3b) confirmed
+    to still deliver the peeked ClientHello prefix byte-for-byte
+    immediately after the PROXY header. New unit coverage in
+    `tests/test-realip.c` (exact wire-format bytes for both versions,
+    including a build/parse round-trip) and new permanent regression
+    coverage in `tests/test-core.sh`. See `CHANGELOG.md` 1.24.0 for the
+    full detail.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
   (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)

@@ -186,6 +186,20 @@ independently by IORESPONSE.
   gained `magnus_udp_sessions_total`/`_active`,
   `magnus_udp_bytes_total{direction=...}`, and
   `magnus_udp_upstream_active_sessions{endpoint=...}`
+- PROXY protocol emission: prefixes magnus's own outbound connection to a
+  TCP stream backend with a PROXY protocol preamble carrying the real
+  client (source IP, source port), the reverse direction from the
+  Real IP resolution above (`stream_proxy_protocol=off|v1|v2`,
+  `--stream-proxy-protocol`) -- without it, every relayed connection looks
+  to the backend like it originates from magnus's own address. `off` by
+  default; applies uniformly to the whole `stream_listen` surface,
+  regardless of which cluster a connection ends up at (the plain
+  `stream_upstream` cluster or a matched `stream_sni_route` one). Both
+  wire formats supported: v1 text (`PROXY TCP4 <src> <dst> <sport>
+  <dport>\r\n`) and the fixed 28-byte v2 binary layout. Built once per
+  connection and always flushed ahead of any relay traffic -- including a
+  peeked TLS ClientHello prefix (SNI routing above), which still arrives
+  byte-for-byte immediately after the header
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

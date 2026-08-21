@@ -352,3 +352,54 @@ magnus_proxy_proto_parse(const char *buffer, size_t length,
 
     return MAGNUS_PROXY_PROTO_NOT_PROXY;
 }
+
+size_t
+magnus_proxy_proto_build(magnus_proxy_protocol_mode_t mode,
+                         struct in_addr src_addr, uint16_t src_port,
+                         struct in_addr dst_addr, uint16_t dst_port,
+                         unsigned char *out, size_t out_capacity)
+{
+    if (mode == MAGNUS_PROXY_PROTOCOL_V1) {
+        /* "PROXY TCP4 " (11) + up to 15 + " " + up to 15 + " " + up to 5
+         * + " " + up to 5 + "\r\n" (2) = 56 bytes worst case, well under
+         * MAGNUS_PROXY_PROTO_BUILD_MAX. Ports are printed as plain host-
+         * order decimal, exactly what "%u" already expects. */
+        char src_text[INET_ADDRSTRLEN];
+        char dst_text[INET_ADDRSTRLEN];
+        int length;
+        if (inet_ntop(AF_INET, &src_addr, src_text, sizeof(src_text)) == NULL
+            || inet_ntop(AF_INET, &dst_addr, dst_text, sizeof(dst_text)) == NULL)
+            return 0;
+        length = snprintf((char *) out, out_capacity,
+                          "PROXY TCP4 %s %s %u %u\r\n",
+                          src_text, dst_text, src_port, dst_port);
+        if (length <= 0 || (size_t) length >= out_capacity) return 0;
+        return (size_t) length;
+    }
+    if (mode == MAGNUS_PROXY_PROTOCOL_V2) {
+        /* Fixed 28-byte layout for TCP-over-IPv4 (RFC-less, but this is
+         * the widely-implemented HAProxy PROXY protocol v2 spec): the
+         * same 12-byte signature magnus_proxy_proto_parse() above
+         * already recognizes on the receiving side, then version+command
+         * (0x21 = v2, PROXY), address-family+transport (0x11 = AF_INET,
+         * STREAM), a 2-byte big-endian address-block length (12), and
+         * the address block itself (src addr, dst addr, src port, dst
+         * port -- ports in network byte order on the wire, per spec,
+         * hence the explicit htons() here even though this function's
+         * own parameters are host order). */
+        uint16_t src_port_be = htons(src_port);
+        uint16_t dst_port_be = htons(dst_port);
+        if (out_capacity < 28) return 0;
+        memcpy(out, MAGNUS_PROXY_V2_SIG, 12);
+        out[12] = 0x21;
+        out[13] = 0x11;
+        out[14] = 0x00;
+        out[15] = 12;
+        memcpy(out + 16, &src_addr, 4);
+        memcpy(out + 20, &dst_addr, 4);
+        memcpy(out + 24, &src_port_be, 2);
+        memcpy(out + 26, &dst_port_be, 2);
+        return 28;
+    }
+    return 0;
+}

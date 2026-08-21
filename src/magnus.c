@@ -38,7 +38,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.23.0"
+#define MAGNUS_VERSION "1.24.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -495,6 +495,14 @@ static magnus_cluster_t magnus_stream_cluster;
 static bool magnus_stream_enabled;
 static unsigned magnus_stream_port;
 static int magnus_stream_listener = -1;
+/* PROXY protocol emission: applies uniformly to every stream connection
+ * regardless of which cluster it ends up at -- see
+ * magnus_config_t.stream_proxy_protocol's own comment on why this is not
+ * per-cluster in this increment. Not tied to any one magnus_cluster_t,
+ * hence its own global rather than living on magnus_stream_cluster
+ * itself. */
+static magnus_proxy_protocol_mode_t magnus_stream_proxy_protocol_mode =
+    MAGNUS_PROXY_PROTOCOL_OFF;
 
 /* TLS passthrough / SNI routing (roadmap 3b): layered on top of
  * magnus_stream_cluster above, never a replacement for it. Each entry is
@@ -641,11 +649,26 @@ typedef struct {
     bool endpoint_counted;
     /* Captured once at accept4() time -- magnus_cluster_select()'s own
      * ip_hash policy, and a peek-timeout/full-buffer fallback decision,
-     * both need it well after the original accept() call has returned. */
+     * both need it well after the original accept() call has returned.
+     * peer_port is only ever used to build a PROXY protocol preamble
+     * (magnus_stream_connect()) -- nothing else in this file needs the
+     * client's own source port. */
     struct in_addr peer_address;
+    in_port_t peer_port;
     time_t last_active;
     time_t connect_started;
     time_t peek_started;
+    /* PROXY protocol emission: built once by magnus_stream_connect(),
+     * right when the upstream connect() is confirmed (synchronously or
+     * async), and flushed to the backend before a single byte of actual
+     * client<->backend relay traffic -- see
+     * magnus_stream_flush_proxy_protocol()'s own comment.
+     * proxy_protocol_header_length stays 0 (this whole mechanism a
+     * no-op) whenever magnus_stream_proxy_protocol_mode is OFF, the
+     * default. */
+    char proxy_protocol_header[MAGNUS_PROXY_PROTO_BUILD_MAX];
+    size_t proxy_protocol_header_length;
+    size_t proxy_protocol_header_sent;
     magnus_stream_pipe_t c2u;
     magnus_stream_pipe_t u2c;
 } magnus_stream_conn_t;
@@ -8579,8 +8602,9 @@ magnus_stream_pump(magnus_stream_pipe_t *pipe, int source_fd, int dest_fd,
  * looking for more ClientHello bytes) is touched at all. Once connected,
  * EPOLLIN on a side is only asked for while the pipe it feeds has room
  * (i.e. is fully flushed) and its source has not EOF'd; EPOLLOUT is only
- * asked for while there is something buffered to flush toward it, or
- * (upstream_fd only) while the connect() itself is still outstanding. */
+ * asked for while there is something buffered to flush toward it, the
+ * connect() itself is still outstanding, or (PROXY protocol emission) a
+ * built preamble has not finished flushing to the upstream yet. */
 static void
 magnus_stream_rearm(int epoll_fd, magnus_stream_conn_t *conn)
 {
@@ -8602,7 +8626,8 @@ magnus_stream_rearm(int epoll_fd, magnus_stream_conn_t *conn)
     if (!conn->u2c.source_eof && conn->u2c.length == conn->u2c.sent)
         upstream_events |= EPOLLIN;
     if (conn->c2u.length > conn->c2u.sent
-        || conn->stage == MAGNUS_STREAM_CONNECTING)
+        || conn->stage == MAGNUS_STREAM_CONNECTING
+        || conn->proxy_protocol_header_sent < conn->proxy_protocol_header_length)
         upstream_events |= EPOLLOUT;
 
     event = (struct epoll_event) { .events = client_events, .data.fd = conn->fd };
@@ -8692,10 +8717,85 @@ magnus_stream_connect(int epoll_fd, magnus_stream_conn_t *conn,
     magnus_stream_upstream_owner[upstream_fd] = conn;
     conn->stage = connect_result != 0 ? MAGNUS_STREAM_CONNECTING
                                        : MAGNUS_STREAM_RELAYING;
+    /* Built unconditionally here (pure computation, no I/O) regardless of
+     * whether the connect() itself resolved synchronously or not -- `dst`
+     * is this endpoint, exactly what was just connect()ed to, so it is
+     * already fully known now. Actually flushing it to upstream_fd is
+     * left to magnus_stream_after_connect()/magnus_stream_service(),
+     * since it must never precede a still-outstanding connect(). A no-op
+     * (proxy_protocol_header_length stays 0) whenever
+     * magnus_stream_proxy_protocol_mode is MAGNUS_PROXY_PROTOCOL_OFF. */
+    conn->proxy_protocol_header_length = magnus_proxy_proto_build(
+        magnus_stream_proxy_protocol_mode, conn->peer_address,
+        ntohs(conn->peer_port), upstream_address.sin_addr,
+        ntohs(upstream_address.sin_port),
+        (unsigned char *) conn->proxy_protocol_header,
+        sizeof(conn->proxy_protocol_header));
+    conn->proxy_protocol_header_sent = 0;
     if (connect_result == 0) {
         magnus_cluster_result(cluster, selected, true, magnus_now_ms());
     }
     return true;
+}
+
+/* Flushes conn->proxy_protocol_header[proxy_protocol_header_sent..length)
+ * to conn->upstream_fd, looping while each write() succeeds fully -- the
+ * same EAGAIN-vs-fatal distinction magnus_stream_pump() itself makes. A
+ * no-op returning true immediately whenever proxy_protocol_header_length
+ * is 0 (magnus_stream_proxy_protocol_mode is MAGNUS_PROXY_PROTOCOL_OFF,
+ * the default), so every caller can call this unconditionally without
+ * first checking whether PROXY protocol emission is even enabled.
+ * Deliberately writes from a small fixed buffer built once by
+ * magnus_stream_connect(), not conn->c2u.buffer -- see
+ * magnus_stream_conn_t's own comment on why this stays a separate buffer
+ * rather than being prepended into the ordinary relay buffer. */
+static bool
+magnus_stream_flush_proxy_protocol(magnus_stream_conn_t *conn)
+{
+    while (conn->proxy_protocol_header_sent < conn->proxy_protocol_header_length) {
+        ssize_t written = write(conn->upstream_fd,
+            conn->proxy_protocol_header + conn->proxy_protocol_header_sent,
+            conn->proxy_protocol_header_length - conn->proxy_protocol_header_sent);
+        if (written < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            return false;
+        }
+        conn->proxy_protocol_header_sent += (size_t) written;
+    }
+    return true;
+}
+
+/* Shared follow-up for every caller of magnus_stream_connect() once it
+ * returns true, folding together the two things that need to happen as
+ * early as possible when a stream connection resolves synchronously (the
+ * common case for loopback/LAN backends) -- flushing any PROXY protocol
+ * preamble ahead of relay traffic, and pumping whatever ClientHello
+ * prefix magnus_stream_advance_peek() already buffered into conn->c2u --
+ * rather than each call site re-deriving the same ordering by hand. Still
+ * MAGNUS_STREAM_CONNECTING (async connect) is a correct, harmless no-op
+ * here: there is nothing to flush or pump yet, and
+ * magnus_stream_service()'s own MAGNUS_STREAM_CONNECTING-confirmation
+ * branch does the equivalent work once the connect() itself resolves.
+ * Always finishes with magnus_stream_rearm() so epoll interest reflects
+ * whatever state was actually reached. */
+static void
+magnus_stream_after_connect(int epoll_fd, magnus_stream_conn_t *conn)
+{
+    if (conn->stage == MAGNUS_STREAM_RELAYING) {
+        if (!magnus_stream_flush_proxy_protocol(conn)) {
+            magnus_stream_close(epoll_fd, conn);
+            return;
+        }
+        if (conn->proxy_protocol_header_sent == conn->proxy_protocol_header_length
+            && conn->c2u.length > 0) {
+            if (!magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
+                                    &magnus_stream_bytes_c2u_total)) {
+                magnus_stream_close(epoll_fd, conn);
+                return;
+            }
+        }
+    }
+    magnus_stream_rearm(epoll_fd, conn);
 }
 
 /* Finalizes a MAGNUS_STREAM_PEEKING decision: `cluster` is the SNI
@@ -8726,14 +8826,7 @@ magnus_stream_peek_decide(int epoll_fd, magnus_stream_conn_t *conn,
         magnus_stream_close(epoll_fd, conn);
         return;
     }
-    if (conn->stage == MAGNUS_STREAM_RELAYING && conn->c2u.length > 0) {
-        if (!magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
-                                &magnus_stream_bytes_c2u_total)) {
-            magnus_stream_close(epoll_fd, conn);
-            return;
-        }
-    }
-    magnus_stream_rearm(epoll_fd, conn);
+    magnus_stream_after_connect(epoll_fd, conn);
 }
 
 /* Reads more of the client's initial bytes directly into conn->c2u.buffer
@@ -8831,9 +8924,22 @@ magnus_stream_service(int epoll_fd, magnus_stream_conn_t *conn, int fd,
         }
         conn->stage = MAGNUS_STREAM_RELAYING;
     }
-    if ((flags & EPOLLERR) != 0
-        || !magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
-                               &magnus_stream_bytes_c2u_total)
+    if ((flags & EPOLLERR) != 0 || !magnus_stream_flush_proxy_protocol(conn)) {
+        magnus_stream_close(epoll_fd, conn);
+        return;
+    }
+    /* A PROXY protocol header that could not fully flush synchronously
+     * (magnus_stream_after_connect(), or right above) must finish before
+     * a single byte of ordinary relay traffic goes out -- wait for the
+     * next upstream-writable event (magnus_stream_rearm() already asks
+     * for EPOLLOUT while this is true) rather than falling through to the
+     * pumps below. */
+    if (conn->proxy_protocol_header_sent < conn->proxy_protocol_header_length) {
+        magnus_stream_rearm(epoll_fd, conn);
+        return;
+    }
+    if (!magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
+                            &magnus_stream_bytes_c2u_total)
         || !magnus_stream_pump(&conn->u2c, conn->upstream_fd, conn->fd,
                                &magnus_stream_bytes_u2c_total)) {
         magnus_stream_close(epoll_fd, conn);
@@ -8886,6 +8992,7 @@ magnus_stream_accept(int epoll_fd)
         conn->fd = client;
         conn->upstream_fd = -1;
         conn->peer_address = peer_address.sin_addr;
+        conn->peer_port = peer_address.sin_port;
         conn->last_active = time(NULL);
         conn->peek_started = conn->last_active;
         (void) setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -8909,6 +9016,7 @@ magnus_stream_accept(int epoll_fd)
                 magnus_stream_close(epoll_fd, conn);
                 continue;
             }
+            magnus_stream_after_connect(epoll_fd, conn);
         } else {
             conn->stage = MAGNUS_STREAM_PEEKING;
             magnus_stream_advance_peek(epoll_fd, conn);
@@ -9422,6 +9530,15 @@ magnus_apply_config(const magnus_config_t *config)
      * here; only the active-health probe array (reset in the loop below,
      * alongside the other two clusters) needs it. */
     magnus_stream_cluster = new_stream_cluster;
+    /* PROXY protocol emission: applies uniformly across the whole
+     * stream_listen surface (see magnus_config_t.stream_proxy_protocol's
+     * own comment) -- a straight overwrite, like stream_lb_policy, since
+     * it involves no listening socket and no in-flight per-connection
+     * state that could go stale-by-position the way the two pools above
+     * can. In-flight connections are unaffected either way: the header
+     * (if any) was already built once by magnus_stream_connect() at
+     * accept time, well before any reload could change this. */
+    magnus_stream_proxy_protocol_mode = config->stream_proxy_protocol;
     /* No active-health probe array or connection pool exists for these
      * (see the comment where new_sni_clusters[] was built above), so a
      * straight overwrite is the whole swap -- no flush/reset step
@@ -9744,6 +9861,16 @@ magnus_parse_options(int argc, char **argv)
                 magnus_stream_cluster.policy = MAGNUS_LB_LEAST_CONN;
             } else if (strcmp(argv[index + 1], "ip_hash") == 0) {
                 magnus_stream_cluster.policy = MAGNUS_LB_IP_HASH;
+            } else {
+                break;
+            }
+        } else if (strcmp(argv[index], "--stream-proxy-protocol") == 0) {
+            if (strcmp(argv[index + 1], "off") == 0) {
+                magnus_stream_proxy_protocol_mode = MAGNUS_PROXY_PROTOCOL_OFF;
+            } else if (strcmp(argv[index + 1], "v1") == 0) {
+                magnus_stream_proxy_protocol_mode = MAGNUS_PROXY_PROTOCOL_V1;
+            } else if (strcmp(argv[index + 1], "v2") == 0) {
+                magnus_stream_proxy_protocol_mode = MAGNUS_PROXY_PROTOCOL_V2;
             } else {
                 break;
             }
@@ -10117,6 +10244,7 @@ magnus_parse_options(int argc, char **argv)
                     "[--stream-listen <1-65535> --stream-upstream "
                     "<ipv4:port[:weight]> ...] "
                     "[--stream-lb-policy round_robin|least_conn|ip_hash] "
+                    "[--stream-proxy-protocol off|v1|v2] "
                     "[--stream-sni-route "
                     "'<pattern> <ipv4:port[:weight]>' ...] "
                     "[--udp-listen <1-65535> --udp-upstream "
