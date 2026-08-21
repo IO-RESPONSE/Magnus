@@ -483,7 +483,7 @@ connection-pool and common-request-model decisions).
       magnus's own server-side sweep is what enforces it. See
       `CHANGELOG.md` 1.15.0 for the full detail.
     - **2c-4 — gRPC-aware routing/observability polish. Shipped in
-      1.16.0 -- closes out the gRPC track.** New `header_prefix:<name>=<value>`
+      1.16.0.** New `header_prefix:<name>=<value>`
       route condition (a `header:<name>=<value>` exact match can never
       reliably gate on gRPC's own `content-type: application/grpc[+codec]`
       shape); `grpc-status`-aware access logging and a new
@@ -507,6 +507,52 @@ connection-pool and common-request-model decisions).
       carrying it back sticking to the same upstream endpoint every time
       against a cluster that round-robins without one. See
       `CHANGELOG.md` 1.16.0 for the full detail.
+    - **2c-5 — upstream connection pooling + stream multiplexing. Shipped
+      in 1.17.0 -- closes out the gRPC track.** Replaces 2c-1's
+      one-fresh-TCP+h2-handshake-per-RPC design with a small pool
+      (`MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT`, 4) of shared, long-lived
+      upstream connections per endpoint that many concurrent client-side
+      gRPC streams multiplex onto via nghttp2's own `stream_user_data`
+      mechanism (`nghttp2_submit_request2()`'s last parameter,
+      `nghttp2_session_get_stream_user_data()` to resolve which
+      `magnus_h2_stream` a given upstream frame belongs to) -- no
+      hand-rolled stream-id map needed. `magnus_grpc_conn_pick()` prefers
+      opening a fresh connection while the pool has room and every
+      existing one already has real load on it, and only multiplexes onto
+      an existing connection once the pool is fully warm ("pool for
+      parallelism, multiplex for overflow"); nghttp2 itself queues a
+      request past the peer's own advertised
+      `SETTINGS_MAX_CONCURRENT_STREAMS` and sends it automatically once
+      room frees up, so magnus never needs to track or enforce that limit
+      for correctness, only for this load-spreading heuristic. A
+      connection is recycled (GOAWAY-style: stop accepting new streams,
+      let attached ones finish, then close) after
+      `MAGNUS_GRPC_POOL_MAX_REQUESTS_PER_CONNECTION` (100000) RPCs or
+      `MAGNUS_GRPC_POOL_IDLE_TIMEOUT_SECONDS` (60) of no attached streams,
+      and unconditionally on a received GOAWAY or any fatal I/O error
+      (which fans a clean UNAVAILABLE out to every stream still attached,
+      via a connection-owned intrusive list of them). Deliberately
+      accepted trade-off: an *async* connect/I/O failure discovered via
+      epoll no longer transparently retries the affected RPC(s) onto a
+      different endpoint the way pre-pooling 2c-1..2c-4 did (a *synchronous*
+      failure picking the very first connection to a never-yet-proven
+      endpoint still does) -- see `magnus_h2_grpc_start()`'s own comment
+      on why this is judged an acceptable narrowing rather than an
+      oversight (UNAVAILABLE is specifically the one gRPC status real
+      client libraries already retry on their own by default). Verified
+      against a real `grpcio` server: 30 concurrent client RPCs measurably
+      multiplexed onto exactly 4 physical upstream connections (`ss -tn`
+      during the burst), completing in ~0.1s against a 50ms-per-call
+      server-side delay -- proof of genuine concurrent multiplexing within
+      one connection, not just connection-level parallelism -- plus
+      confirmed connection reuse across separate, non-overlapping request
+      bursts. See `CHANGELOG.md` 1.17.0 for the full detail, including a
+      real bug this increment found and fixed (a client-role nghttp2
+      session that never calls `nghttp2_submit_settings()` once silently
+      stops invoking frame callbacks for everything the peer sends back
+      after its own initial SETTINGS, indistinguishable from a hung
+      connection without instrumenting nghttp2's own call sequence to
+      notice).
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

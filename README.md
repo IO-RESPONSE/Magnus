@@ -100,7 +100,14 @@ independently by IORESPONSE.
   `magnus_grpc_status_total{code="N"}` `/metrics` counter report the
   real gRPC outcome, since the wire `:status` alone is always 200; and
   session affinity (the same `MAGNUS_AFFINITY` cookie the h1/h2-proxy
-  paths already issue) works identically for gRPC traffic
+  paths already issue) works identically for gRPC traffic. Upstream
+  connections are pooled and multiplexed per endpoint (a small
+  per-endpoint pool of long-lived connections, up to
+  `MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT`, that many concurrent RPCs
+  share via nghttp2's own stream multiplexing) rather than a fresh
+  TCP+h2 handshake per RPC -- pool for parallelism, multiplex for
+  overflow once the pool is warm; a connection recycles gracefully after
+  a request-count/idle budget or on GOAWAY/a fatal I/O error
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

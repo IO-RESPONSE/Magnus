@@ -1,5 +1,133 @@
 # Changelog
 
+## 1.17.0
+
+### Added
+
+- **gRPC upstream connection pooling + stream multiplexing (roadmap
+  2c-5) -- closes out the gRPC track (2c-1 through 2c-5).** Replaces
+  2c-1's design (a fresh TCP + h2 handshake, opened and torn down, per
+  single unary RPC) with a small pool of shared, long-lived upstream
+  connections per `grpc_upstream` endpoint
+  (`MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT`, 4) that many concurrent
+  client-side gRPC streams multiplex onto, exactly the way a real h2
+  client library would.
+- New `magnus_grpc_conn_t` type (`magnus_grpc_pool[endpoint][slot]`, a
+  fixed 8x4 grid, no allocation): one magnus-owned CLIENT-role nghttp2
+  session, one TCP fd, and an intrusive list of every `magnus_h2_stream`
+  currently attached to it. Streams attach via
+  `nghttp2_submit_request2()`'s own `stream_user_data` parameter
+  (immediately followed by `nghttp2_session_set_stream_user_data()`, per
+  that function's own documented handling of the "stream not created
+  yet" window) rather than a hand-rolled stream-id-to-stream map; every
+  nghttp2 callback for the shared session resolves its owning stream via
+  `nghttp2_session_get_stream_user_data()` instead of being handed it
+  directly as callback context (which is now the connection, needed for
+  connection-level events like GOAWAY).
+- `magnus_grpc_conn_pick()`: the load-spreading heuristic -- prefers
+  opening a brand-new connection over piling onto an existing one
+  whenever the pool still has room *and* the least-loaded existing
+  connection already has any real load on it at all, so the first few
+  concurrent RPCs to an endpoint each get their own dedicated connection
+  (no head-of-line blocking between unrelated RPCs), and only once that
+  many are already busy does a new RPC genuinely multiplex onto an
+  existing one. Not a manual cap on streams-per-connection: nghttp2
+  itself queues a request past the peer's own advertised
+  `SETTINGS_MAX_CONCURRENT_STREAMS` and sends it automatically once room
+  frees up, so magnus never needs to track or enforce that limit for
+  correctness, only for this heuristic.
+- Connection lifecycle: a connection is recycled (stop accepting *new*
+  streams, let attached ones finish, then close) after
+  `MAGNUS_GRPC_POOL_MAX_REQUESTS_PER_CONNECTION` (100000) RPCs served or
+  `MAGNUS_GRPC_POOL_IDLE_TIMEOUT_SECONDS` (60s) fully idle, and
+  unconditionally on a received GOAWAY (tracked via a new session-level
+  `on_frame_recv` case) or any fatal I/O error
+  (`magnus_grpc_conn_fail()`, which fans a clean `grpc-status: 14`
+  UNAVAILABLE out to every RPC still attached via the connection's own
+  intrusive stream list, then closes once the last one detaches). Unlike
+  the h1 reverse-proxy connection pool (deliberately *not*
+  epoll-registered while idle, liveness checked lazily at checkout), an
+  idle pooled gRPC connection stays epoll-registered for `EPOLLIN`
+  always -- it is a live, shared nghttp2 session that can receive an
+  unsolicited GOAWAY or PING at any moment, and this pool is small
+  enough (at most `MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS *
+  MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT` fds) for that to cost
+  nothing meaningful.
+- New `on_frame_not_send` nghttp2 callback: handles the narrow race where
+  a connection's queued HEADERS frame becomes unsendable after all (a
+  GOAWAY arriving in the gap between `magnus_grpc_conn_pick()` choosing a
+  connection and nghttp2 actually flushing that frame) -- reuses the
+  existing `grpc_stream_closed` finalization path (an RPC that closes
+  with no `grpc-status` ever named already resolves to a clean
+  UNAVAILABLE/UNKNOWN there), no new field needed.
+- `magnus_expire_proxies()`'s gRPC branch split in two: per-stream
+  concerns (a client's own `grpc-timeout` deadline, and the default
+  per-stream read/inactivity timeout once a connection is connected)
+  stay in the existing per-stream sweep, since reacting to either
+  individually only ever affects the one stream being checked; a
+  connect timeout on a still-connecting *new* pooled connection moved to
+  a new connection-level sweep, `magnus_grpc_pool_expire()`, since it can
+  affect every stream that raced to attach to that same connection at
+  once -- reacting to that per-stream in the old shared loop would have
+  meant the first stream's own reaction closing the connection while
+  later streams in the same loop iteration still pointed at it, a
+  use-after-free.
+- **Deliberately accepted trade-off, not an oversight:** an *asynchronous*
+  connect/I/O failure discovered later via epoll
+  (`magnus_grpc_conn_fail()`) no longer transparently retries the
+  affected RPC(s) onto a different endpoint the way the pre-pooling
+  design did for every RPC (since before 2c-5, "this RPC's own connect
+  failed" and "the connection failed" were necessarily the same event).
+  A *synchronous* failure picking the very first connection for a
+  request still retries a different endpoint before ever answering the
+  client, unchanged. See `magnus_h2_grpc_start()`'s own comment for the
+  full reasoning -- in short: a pooled connection, once proven, is
+  reused across many RPCs, so an async failure now only ever affects the
+  (typically one) RPC(s) that happened to be first to a not-yet-proven
+  endpoint; UNAVAILABLE (what the client gets instead) is specifically
+  the one gRPC status real client libraries already retry on their own
+  by default.
+
+### Fixed
+
+- A client-role nghttp2 session that never calls
+  `nghttp2_submit_settings()` at least once (with any entry list, even
+  empty) silently stops invoking `on_frame_recv`/`on_header` for
+  anything the peer sends back past the peer's *own* initial SETTINGS
+  frame -- `nghttp2_session_mem_recv2()` keeps reporting the peer's bytes
+  as successfully consumed, so this looks exactly like a hung upstream,
+  not a protocol violation, without independently instrumenting
+  nghttp2's own callback sequence to notice the silence starts right
+  after the peer's SETTINGS. Found while building this increment (the
+  2c-1..2c-4 code submitted its own settings incidentally, as part of
+  capping `MAX_CONCURRENT_STREAMS`, an artifact this rewrite initially
+  dropped along with that now-unneeded cap). Fixed by
+  `magnus_grpc_conn_open()` always submitting an empty initial SETTINGS
+  once per connection, independent of whether magnus has anything of its
+  own to advertise.
+
+Verified against a real, independent gRPC implementation (`grpcio`,
+Python): 30 concurrent client RPCs against a real `grpcio` server (each
+call independently connecting to magnus, a distinct client-side h2
+connection per call) measurably multiplexed onto exactly 4 physical
+upstream TCP connections (`ss -tn` sampled repeatedly during the burst),
+completing in ~0.1s total against a 50ms-per-call server-side delay --
+proof of genuine concurrent stream multiplexing within a shared
+connection, not merely connection-level parallelism (a purely serialized
+4-connections-at-a-time model would have taken roughly 8x that). A
+follow-up sequential call after the burst reused one of the same 4
+already-open connections rather than opening a new one, confirming
+idle-but-healthy connections are kept pooled, not torn down between
+bursts. Permanent regression coverage in `tests/test-core.sh` (the
+existing 2c-4 multi-endpoint/affinity block) updated so its raw
+hand-rolled fake upstreams loop for multiple RPCs per connection instead
+of closing after one -- matching both a real gRPC server's own behavior
+and what this increment now actually exercises (the block's own repeat
+sticky-affinity calls now genuinely reuse a pooled connection rather
+than each opening a fresh one). `make clean && make test` and `make
+sanitize` (ASan+UBSan) both green. Image rebuilt, `./scripts/test-image.sh`
+passes.
+
 ## 1.16.0
 
 ### Added

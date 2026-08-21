@@ -2495,35 +2495,43 @@ def read_exact(sock, n):
 
 
 def handle(conn):
+    # Loops for as many RPCs as arrive on this one connection, not just
+    # one -- magnus pools/multiplexes its upstream gRPC connections
+    # (roadmap 2c-5) rather than opening a fresh one per RPC, so the
+    # affinity test below (repeat calls carrying the same sticky cookie)
+    # genuinely exercises connection *reuse*, exactly like a real gRPC
+    # server would ever expect. Sends its own initial SETTINGS once, right
+    # after the connection preface, not per-RPC.
     read_exact(conn, len(PREFACE))
-    stream_id = None
-    end_stream_seen = False
-    while not end_stream_seen:
-        header = read_exact(conn, 9)
-        length = (header[0] << 16) | (header[1] << 8) | header[2]
-        frame_type = header[3]
-        flags = header[4]
-        sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
-        read_exact(conn, length) if length else b""
-        if frame_type == 0x1:
-            stream_id = sid
-            if flags & 0x1:
-                end_stream_seen = True
-        elif frame_type == 0x0:
-            if flags & 0x1:
-                end_stream_seen = True
-
     conn.sendall(frame(0x4, 0x0, 0))
     conn.sendall(frame(0x4, 0x1, 0))
-    resp_headers = build_headers_block([
-        (":status", "200"), ("content-type", "application/grpc"),
-    ])
-    conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))
-    payload = ("endpoint-" + ENDPOINT_ID).encode()
-    grpc_frame = bytes([0]) + len(payload).to_bytes(4, "big") + payload
-    conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))
-    trailer = build_headers_block([("grpc-status", "0"), ("grpc-message", "")])
-    conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))
+    while True:
+        stream_id = None
+        end_stream_seen = False
+        while not end_stream_seen:
+            header = read_exact(conn, 9)
+            length = (header[0] << 16) | (header[1] << 8) | header[2]
+            frame_type = header[3]
+            flags = header[4]
+            sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
+            read_exact(conn, length) if length else b""
+            if frame_type == 0x1:
+                stream_id = sid
+                if flags & 0x1:
+                    end_stream_seen = True
+            elif frame_type == 0x0:
+                if flags & 0x1:
+                    end_stream_seen = True
+
+        resp_headers = build_headers_block([
+            (":status", "200"), ("content-type", "application/grpc"),
+        ])
+        conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))
+        payload = ("endpoint-" + ENDPOINT_ID).encode()
+        grpc_frame = bytes([0]) + len(payload).to_bytes(4, "big") + payload
+        conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))
+        trailer = build_headers_block([("grpc-status", "0"), ("grpc-message", "")])
+        conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))
 
 
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
