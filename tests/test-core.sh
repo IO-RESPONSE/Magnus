@@ -34,6 +34,10 @@ cleanup() {
     kill -TERM "$backend4_pid" >/dev/null 2>&1 || true
     wait "$backend4_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend5_pid:-}" ]; then
+    kill -TERM "$backend5_pid" >/dev/null 2>&1 || true
+    wait "$backend5_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -1926,6 +1930,9 @@ port_grpc_stream_fake_upstream=$((port + 53))
 port_grpc_stream=$((port + 54))
 port_grpc_slow_fake_upstream=$((port + 55))
 port_grpc_slow=$((port + 56))
+port_grpc_multi_a=$((port + 57))
+port_grpc_multi_b=$((port + 58))
+port_grpc_multi=$((port + 59))
 
 python3 - "$port_grpc_fake_upstream" >"$web_root/grpc-fake-upstream.log" 2>&1 <<'PYEOF' &
 import socket
@@ -2438,6 +2445,163 @@ backend4_pid=
 kill -TERM "$backend3_pid" 2>/dev/null
 wait "$backend3_pid" 2>/dev/null || true
 backend3_pid=
+
+# Routing/observability/affinity polish (roadmap 2c-4): two distinguishable
+# fake upstreams (each answers with its own endpoint id in the response
+# body) behind one magnus instance with two grpc_upstream entries and a
+# route matched by `header_prefix:content-type=application/grpc` instead
+# of a catch-all path_prefix -- proving the new condition actually gates
+# dispatch, not just that action=grpc still works once matched.
+magnus_grpc_multi_fake_upstream() {
+  python3 - "$1" "$2" >>"$web_root/grpc-multi-upstream.log" 2>&1 <<'PYEOF' &
+import socket
+import sys
+import threading
+
+PORT = int(sys.argv[1])
+ENDPOINT_ID = sys.argv[2]
+PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def hpack_string(s):
+    b = s.encode() if isinstance(s, str) else s
+    assert len(b) < 127
+    return bytes([len(b)]) + b
+
+
+def hpack_literal_new_name(name, value):
+    return b"\x00" + hpack_string(name) + hpack_string(value)
+
+
+def build_headers_block(pairs):
+    return b"".join(hpack_literal_new_name(k, v) for k, v in pairs)
+
+
+def frame(frame_type, flags, stream_id, payload=b""):
+    length = len(payload)
+    header = bytes([(length >> 16) & 0xff, (length >> 8) & 0xff, length & 0xff,
+                     frame_type, flags]) + stream_id.to_bytes(4, "big")
+    return header + payload
+
+
+def read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("peer closed early")
+        data += chunk
+    return data
+
+
+def handle(conn):
+    read_exact(conn, len(PREFACE))
+    stream_id = None
+    end_stream_seen = False
+    while not end_stream_seen:
+        header = read_exact(conn, 9)
+        length = (header[0] << 16) | (header[1] << 8) | header[2]
+        frame_type = header[3]
+        flags = header[4]
+        sid = int.from_bytes(header[5:9], "big") & 0x7fffffff
+        read_exact(conn, length) if length else b""
+        if frame_type == 0x1:
+            stream_id = sid
+            if flags & 0x1:
+                end_stream_seen = True
+        elif frame_type == 0x0:
+            if flags & 0x1:
+                end_stream_seen = True
+
+    conn.sendall(frame(0x4, 0x0, 0))
+    conn.sendall(frame(0x4, 0x1, 0))
+    resp_headers = build_headers_block([
+        (":status", "200"), ("content-type", "application/grpc"),
+    ])
+    conn.sendall(frame(0x1, 0x4, stream_id, resp_headers))
+    payload = ("endpoint-" + ENDPOINT_ID).encode()
+    grpc_frame = bytes([0]) + len(payload).to_bytes(4, "big") + payload
+    conn.sendall(frame(0x0, 0x0, stream_id, grpc_frame))
+    trailer = build_headers_block([("grpc-status", "0"), ("grpc-message", "")])
+    conn.sendall(frame(0x1, 0x4 | 0x1, stream_id, trailer))
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", PORT))
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+}
+magnus_grpc_multi_fake_upstream "$port_grpc_multi_a" A
+backend4_pid=$!
+magnus_grpc_multi_fake_upstream "$port_grpc_multi_b" B
+backend5_pid=$!
+sleep 1
+
+"$binary" --port "$port_grpc_multi" \
+  --grpc-upstream "127.0.0.1:$port_grpc_multi_a:1" \
+  --grpc-upstream "127.0.0.1:$port_grpc_multi_b:1" \
+  --route "header_prefix:content-type=application/grpc; action=grpc" \
+  --access-log on 2>>"$log" &
+backend3_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_grpc_multi/healthz" >/dev/null && break
+  sleep 1
+done
+
+# header_prefix actually gates dispatch: a content-type carrying a codec
+# suffix (never an exact match for "application/grpc") still matches, and
+# a request with no grpc-shaped content-type at all falls through to
+# ordinary (here: 404, no root configured) dispatch instead.
+prefix_status=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_code}' -X POST -H 'content-type: application/grpc+proto' \
+  -H 'te: trailers' "http://127.0.0.1:$port_grpc_multi/echo.Echo/SayHello")
+test "$prefix_status" = '200'
+no_match_status=$(curl --http2-prior-knowledge --silent --output /dev/null \
+  --write-out '%{http_code}' "http://127.0.0.1:$port_grpc_multi/echo.Echo/SayHello")
+test "$no_match_status" = '404'
+
+# Session affinity: capture the Set-Cookie magnus issues on a first call
+# (no cookie jar yet), then confirm every subsequent call carrying it
+# sticks to the exact same endpoint rather than round-robining -- proven
+# by the response body itself naming which fake upstream answered.
+cookie_jar="$web_root/grpc-affinity-cookies.txt"
+first_body=$(curl --http2-prior-knowledge --fail --silent -X POST \
+  -H 'content-type: application/grpc' -H 'te: trailers' \
+  --data-binary $'\x00\x00\x00\x00\x00' -c "$cookie_jar" \
+  "http://127.0.0.1:$port_grpc_multi/echo.Echo/SayHello" | tail -c 10)
+for attempt in 1 2 3 4; do
+  sticky_body=$(curl --http2-prior-knowledge --fail --silent -X POST \
+    -H 'content-type: application/grpc' -H 'te: trailers' \
+    --data-binary $'\x00\x00\x00\x00\x00' -b "$cookie_jar" \
+    "http://127.0.0.1:$port_grpc_multi/echo.Echo/SayHello" | tail -c 10)
+  test "$sticky_body" = "$first_body"
+done
+
+# grpc-status-aware access logging and /metrics: the access log line for
+# a successful gRPC call carries a real grpc_status=0 field, and /metrics
+# reports the same outcome under magnus_grpc_status_total{code="0"} --
+# neither of which existed before 2c-4 (every gRPC response's wire
+# :status is always 200, so status= alone could never distinguish success
+# from failure for this traffic).
+grep -q 'target=/echo\.Echo/SayHello.*grpc_status=0' "$log"
+metrics_body=$(curl --silent "http://127.0.0.1:$port_grpc_multi/metrics")
+echo "$metrics_body" | grep -q '^magnus_grpc_status_total{code="0"} [1-9][0-9]*$'
+echo "grpc: routing/affinity/observability ok"
+
+kill -TERM "$backend3_pid" 2>/dev/null
+wait "$backend3_pid" 2>/dev/null || true
+backend3_pid=
+kill -TERM "$backend5_pid" 2>/dev/null
+wait "$backend5_pid" 2>/dev/null || true
+backend5_pid=
+kill -TERM "$backend4_pid" 2>/dev/null
+wait "$backend4_pid" 2>/dev/null || true
+backend4_pid=
 
 kill -TERM "$server_pid"
 wait "$server_pid"

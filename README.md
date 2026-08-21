@@ -29,8 +29,9 @@ independently by IORESPONSE.
   keeps the *client* connection alive, independent of whether the
   upstream leg is pooled
 - Advanced routing: repeatable `route` rules (host/path-prefix/method/
-  header/cookie/query/source-CIDR, combinable with AND, first match
-  wins) ahead of the built-in dispatch, actioned as proxy/deny/static
+  header/header-prefix/cookie/query/source-CIDR, combinable with AND,
+  first match wins) ahead of the built-in dispatch, actioned as
+  proxy/deny/static/grpc
 - DNS-resolved upstreams: an `upstream` entry may be a hostname,
   resolved asynchronously on a dedicated background thread (this
   codebase's first thread) so the event loop never blocks; fixed-interval
@@ -91,7 +92,15 @@ independently by IORESPONSE.
   propagated into an absolute deadline (clamped to 5 minutes) that
   replaces the stream's default connect/read timeout budget; exceeding
   it answers `grpc-status: 4` (DEADLINE_EXCEEDED) rather than waiting on
-  a slow or stuck upstream indefinitely
+  a slow or stuck upstream indefinitely. A new `header_prefix:<name>=<value>`
+  route condition (case-insensitive prefix match on a header's value)
+  can gate `action=grpc` on `content-type` alone
+  (`header_prefix:content-type=application/grpc`), covering every codec
+  suffix a real client might send; the access log and a new
+  `magnus_grpc_status_total{code="N"}` `/metrics` counter report the
+  real gRPC outcome, since the wire `:status` alone is always 200; and
+  session affinity (the same `MAGNUS_AFFINITY` cookie the h1/h2-proxy
+  paths already issue) works identically for gRPC traffic
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

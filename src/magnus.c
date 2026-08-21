@@ -36,7 +36,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.15.0"
+#define MAGNUS_VERSION "1.16.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -624,6 +624,20 @@ static uint64_t magnus_responses_4xx;
 static uint64_t magnus_responses_5xx;
 static uint64_t magnus_bytes_sent;
 static uint64_t magnus_rate_limited_total;
+/* gRPC-status-aware observability (roadmap 2c-4): indices 0-16, the 17
+ * canonical gRPC status codes (0=OK ... 16=UNAUTHENTICATED). Deliberately
+ * separate from magnus_responses_4xx/5xx above -- a gRPC response's own
+ * wire :status is always 200 regardless of outcome (see
+ * magnus_h2_grpc_fail()'s own comment), so those two counters stay
+ * exactly what they always were, an HTTP-status-code breakdown, and this
+ * is what actually answers "how many gRPC calls failed, and how." Only
+ * incremented for the two dispatch outcomes that already call
+ * magnus_access_log() with a real grpc_status (magnus_h2_grpc_fail(), and
+ * magnus_h2_grpc_handle_upstream()'s own stream-closed finalization) --
+ * a mid-stream abort (magnus_h2_grpc_abort()) does not log or count here
+ * either, matching how the h1-proxy path's own magnus_h2_proxy_abort()
+ * has never counted toward magnus_responses_4xx/5xx. */
+static uint64_t magnus_grpc_status_counts[17];
 
 /* Access log: off/on, and 1-in-N sampling, both configurable (magnus_config
  * access_log / access_log_sample) so a busy deployment can turn the log
@@ -849,23 +863,36 @@ magnus_access_log_flush(void)
     magnus_access_log_length = 0;
 }
 
+/* `grpc_status` is one of the 17 canonical gRPC status codes (0-16) for a
+ * gRPC-dispatched request (roadmap 2c-4), or -1 for every other request --
+ * the wire :status a gRPC response carries is always 200 regardless of
+ * outcome (see magnus_h2_grpc_fail()'s own comment), so without this the
+ * access log's own status= field cannot tell a successful RPC from a
+ * failed one at all. Appended as its own grpc_status= field rather than
+ * folded into status= itself, so every other request's log line (the
+ * overwhelming majority, even on a deployment that does use gRPC) stays
+ * exactly as it always has -- no reader has to special-case a field that
+ * is only ever present for one kind of request. */
 static void
 magnus_access_log(const char *request_id, struct in_addr client_address,
                   const char *method, const char *target, unsigned status,
-                  double latency_ms)
+                  double latency_ms, int grpc_status)
 {
     int written;
     char client_ip[INET_ADDRSTRLEN];
+    char grpc_field[32] = "";
     if (!magnus_access_log_enabled) return;
     magnus_access_log_seen++;
     if (magnus_access_log_sample > 1
         && (magnus_access_log_seen % magnus_access_log_sample) != 0) return;
     inet_ntop(AF_INET, &client_address, client_ip, sizeof(client_ip));
+    if (grpc_status >= 0)
+        snprintf(grpc_field, sizeof(grpc_field), "grpc_status=%d ", grpc_status);
     written = snprintf(magnus_access_log_buffer + magnus_access_log_length,
         sizeof(magnus_access_log_buffer) - magnus_access_log_length,
         "access request_id=%s method=%s target=%s status=%u "
-        "latency_ms=%.2f client_ip=%s\n", request_id, method, target, status,
-        latency_ms, client_ip);
+        "latency_ms=%.2f %sclient_ip=%s\n", request_id, method, target, status,
+        latency_ms, grpc_field, client_ip);
     if (written < 0) return;
     if ((size_t) written >= sizeof(magnus_access_log_buffer)
                             - magnus_access_log_length) {
@@ -873,8 +900,8 @@ magnus_access_log(const char *request_id, struct in_addr client_address,
         written = snprintf(magnus_access_log_buffer,
             sizeof(magnus_access_log_buffer),
             "access request_id=%s method=%s target=%s status=%u "
-            "latency_ms=%.2f client_ip=%s\n", request_id, method, target,
-            status, latency_ms, client_ip);
+            "latency_ms=%.2f %sclient_ip=%s\n", request_id, method, target,
+            status, latency_ms, grpc_field, client_ip);
         if (written > 0 && (size_t) written < sizeof(magnus_access_log_buffer))
             magnus_access_log_length = (size_t) written;
         return;
@@ -1298,7 +1325,8 @@ magnus_proxy_fail(int epoll_fd, magnus_connection_t *connection,
         magnus_record_latency(latency_ms);
         magnus_access_log(request.request_id, connection->client_address,
                           connection->proxy_log_method,
-                          connection->proxy_log_target, status, latency_ms);
+                          connection->proxy_log_target, status, latency_ms,
+                          -1);
     }
     return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
 }
@@ -1587,7 +1615,8 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             magnus_access_log(connection->proxy_request_id,
                               connection->client_address,
                               connection->proxy_log_method,
-                              connection->proxy_log_target, 101, latency_ms);
+                              connection->proxy_log_target, 101, latency_ms,
+                              -1);
         }
         return magnus_proxy_flush(epoll_fd, connection);
     }
@@ -1636,7 +1665,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
                           connection->client_address,
                           connection->proxy_log_method,
                           connection->proxy_log_target, info.status,
-                          latency_ms);
+                          latency_ms, -1);
     }
     return magnus_proxy_flush(epoll_fd, connection);
 }
@@ -3207,7 +3236,7 @@ magnus_h2_proxy_fail(magnus_connection_t *connection,
         magnus_record_latency(latency_ms);
         magnus_access_log(stream->request_id, stream->effective_client_address,
                           stream->log_method,
-                          stream->log_target, status_code, latency_ms);
+                          stream->log_target, status_code, latency_ms, -1);
     }
 }
 
@@ -3709,7 +3738,7 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
         magnus_record_latency(latency_ms);
         magnus_access_log(stream->request_id, stream->effective_client_address,
                           stream->log_method,
-                          stream->log_target, info.status, latency_ms);
+                          stream->log_target, info.status, latency_ms, -1);
     }
     magnus_h2_proxy_maybe_complete(stream);
     return true;
@@ -3916,6 +3945,21 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
  * grpc-status=14 (UNAVAILABLE) rather than an ordinary 502/504 the way
  * action=proxy would. */
 
+/* Increments magnus_grpc_status_counts[] for a completed gRPC dispatch
+ * (roadmap 2c-4) -- bounds-checked against a string that, in practice,
+ * only ever holds "0" through "16" (every caller passes a literal from
+ * that set), but this stays defensive against anything else (an
+ * out-of-range or non-numeric string) by simply not counting it rather
+ * than indexing out of bounds. */
+static void
+magnus_grpc_record_status(const char *grpc_status_code)
+{
+    char *end;
+    long code = strtol(grpc_status_code, &end, 10);
+    if (*end != '\0' || end == grpc_status_code || code < 0 || code > 16) return;
+    magnus_grpc_status_counts[code]++;
+}
+
 static bool
 magnus_grpc_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
 {
@@ -3997,8 +4041,10 @@ magnus_h2_grpc_fail(magnus_connection_t *connection,
                                     headers, count, NULL);
     magnus_requests_total++;
     magnus_record_latency(latency_ms);
+    magnus_grpc_record_status(grpc_status_code);
     magnus_access_log(stream->request_id, stream->effective_client_address,
-                      stream->log_method, stream->log_target, 200, latency_ms);
+                      stream->log_method, stream->log_target, 200, latency_ms,
+                      (int) strtol(grpc_status_code, NULL, 10));
 }
 
 /* nghttp2 data-provider read callback for a gRPC-dispatched stream's
@@ -4077,13 +4123,26 @@ static void
 magnus_h2_grpc_submit_headers(magnus_connection_t *connection,
                               struct magnus_h2_stream *stream)
 {
-    nghttp2_nv headers[2 + 16];
+    nghttp2_nv headers[3 + 16];
     size_t count = 0;
+    char cookie_value[128];
     const char *status_text = stream->grpc_response_status[0] != '\0'
         ? stream->grpc_response_status : "200";
 
     headers[count++] = magnus_h2_nv(":status", status_text);
     headers[count++] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
+    if (stream->issue_affinity_cookie) {
+        /* Session affinity (roadmap 2c-4) -- same MAGNUS_AFFINITY cookie
+         * attributes the h1/h2-proxy paths already issue (see
+         * magnus_proxy_sanitize_response_headers()'s own Set-Cookie
+         * line). Harmless if the client never round-trips it (most real
+         * gRPC clients have no automatic cookie jar) -- see
+         * magnus_h2_grpc_start()'s own comment. */
+        snprintf(cookie_value, sizeof(cookie_value),
+                "%s=%s; Path=/; HttpOnly; SameSite=Lax",
+                MAGNUS_AFFINITY_COOKIE_NAME, stream->affinity_key);
+        headers[count++] = magnus_h2_nv("set-cookie", cookie_value);
+    }
     for (size_t i = 0; i < stream->grpc_response_header_count
                        && count < sizeof(headers) / sizeof(headers[0]); i++) {
         headers[count++] = magnus_h2_nv(stream->grpc_response_headers[i].name,
@@ -4560,6 +4619,10 @@ magnus_h2_grpc_connect_failed(magnus_connection_t *connection,
             if (magnus_h2_grpc_build_session(stream) == 0
                 && magnus_h2_grpc_connect_endpoint(connection, stream,
                                                    (size_t) endpoint) == 0) {
+                stream->issue_affinity_cookie = true;
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
                 return;
             }
             if (stream->grpc_session != NULL) {
@@ -4577,13 +4640,26 @@ magnus_h2_grpc_connect_failed(magnus_connection_t *connection,
 /* Entry point from magnus_h2_dispatch(): picks a healthy
  * magnus_grpc_cluster endpoint, builds this stream's outbound gRPC
  * request/session, and connects -- retrying once on an immediate connect
- * failure exactly like the h1-proxy path. No session affinity (see this
- * block's own top comment). */
+ * failure exactly like the h1-proxy path. Session affinity (roadmap
+ * 2c-4) works the same way as the h1/h2-proxy paths: a valid
+ * MAGNUS_AFFINITY cookie in the request's "cookie" header is preferred
+ * for the first attempt only, and a fresh one is issued (via
+ * magnus_h2_grpc_submit_headers()) whenever this stream did not arrive
+ * with one, or its preferred endpoint was not used. Whether a given real
+ * gRPC client actually persists and resends that cookie on its next call
+ * is client-dependent -- the same as any other Set-Cookie a server hands
+ * out -- but reading one is unconditionally safe, so this stays exactly
+ * as capable as the h1/h2-proxy paths rather than a silently narrower
+ * version of the same mechanism. */
 static void
 magnus_h2_grpc_start(magnus_connection_t *connection,
                      struct magnus_h2_stream *stream)
 {
     const char *timeout_header;
+    const char *cookie_header = magnus_http_header_find(&stream->parsed, "cookie");
+    char client_affinity[64] = "";
+    bool sticky;
+    size_t preferred_index;
 
     magnus_generate_token(stream->request_id);
     strncpy(stream->log_method, stream->parsed.method,
@@ -4611,19 +4687,41 @@ magnus_h2_grpc_start(magnus_connection_t *connection,
         }
     }
 
+    if (cookie_header != NULL)
+        (void) magnus_http_extract_cookie(cookie_header, strlen(cookie_header),
+                                          MAGNUS_AFFINITY_COOKIE_NAME,
+                                          client_affinity,
+                                          sizeof(client_affinity));
+    sticky = magnus_decode_affinity_cookie(
+        client_affinity[0] != '\0' ? client_affinity : NULL, &preferred_index);
+    stream->issue_affinity_cookie = !sticky;
+
     for (;;) {
-        int endpoint = magnus_cluster_select(&magnus_grpc_cluster,
-                                             magnus_now_ms(), NULL);
+        int endpoint = sticky
+            ? magnus_cluster_select_sticky(&magnus_grpc_cluster,
+                                           magnus_now_ms(), preferred_index)
+            : magnus_cluster_select(&magnus_grpc_cluster, magnus_now_ms(),
+                                    NULL);
         if (endpoint < 0) {
             magnus_h2_grpc_fail(connection, stream, "14",
                                 "no healthy gRPC upstream available");
             return;
+        }
+        if (sticky) {
+            sticky = false;
+        } else if (stream->attempt > 0) {
+            stream->issue_affinity_cookie = true;
         }
         stream->attempt++;
         stream->endpoint_index = (size_t) endpoint;
         if (magnus_h2_grpc_build_session(stream) == 0
             && magnus_h2_grpc_connect_endpoint(connection, stream,
                                                (size_t) endpoint) == 0) {
+            if (stream->issue_affinity_cookie) {
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
+            }
             return;
         }
         if (stream->grpc_session != NULL) {
@@ -4905,10 +5003,12 @@ magnus_h2_grpc_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
                                               - stream->started_ms);
                 magnus_requests_total++;
                 magnus_record_latency(latency_ms);
+                magnus_grpc_record_status(stream->grpc_status);
                 magnus_access_log(stream->request_id,
                                   stream->effective_client_address,
                                   stream->log_method, stream->log_target,
-                                  status_for_log, latency_ms);
+                                  status_for_log, latency_ms,
+                                  (int) strtol(stream->grpc_status, NULL, 10));
             }
         }
         magnus_h2_stream_teardown_upstream(stream);
@@ -5040,6 +5140,28 @@ magnus_build_metrics(char *out, size_t out_capacity)
             (unsigned long long) magnus_latency_count);
         if (line > 0 && (size_t) line < out_capacity - written)
             written += (size_t) line;
+    }
+
+    /* gRPC-status breakdown (roadmap 2c-4) -- gated on
+     * magnus_grpc_upstream_enabled (unlike magnus_upstream_healthy above,
+     * which always iterates every configured HTTP/1.x endpoint even at
+     * zero) so a deployment that never configured a grpc_upstream at all
+     * gets no new lines here whatsoever; among gRPC status codes
+     * themselves, only ones that have actually occurred at least once are
+     * emitted, keeping this lean rather than always printing all 17. */
+    if (magnus_grpc_upstream_enabled && written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "# TYPE magnus_grpc_status_total counter\n");
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+        for (int code = 0; code < 17 && written < out_capacity; code++) {
+            if (magnus_grpc_status_counts[code] == 0) continue;
+            int line2 = snprintf(out + written, out_capacity - written,
+                "magnus_grpc_status_total{code=\"%d\"} %llu\n", code,
+                (unsigned long long) magnus_grpc_status_counts[code]);
+            if (line2 < 0 || (size_t) line2 >= out_capacity - written) return;
+            written += (size_t) line2;
+        }
     }
 }
 
@@ -5236,7 +5358,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         magnus_record_latency(latency_ms);
         magnus_access_log(request.request_id, connection->client_address,
                           request.method, request.path,
-                          request.status, latency_ms);
+                          request.status, latency_ms, -1);
     }
     return 0;
 }

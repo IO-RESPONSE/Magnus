@@ -1,5 +1,67 @@
 # Changelog
 
+## 1.16.0
+
+### Added
+
+- **gRPC routing/observability/affinity polish (roadmap 2c-4) -- closes
+  out the gRPC track (2c-1 through 2c-4).**
+- New route condition `header_prefix:<name>=<value>` (case-insensitive
+  prefix match on a header's value, vs. `header:<name>=<value>`'s exact
+  match): specifically because a real gRPC request's `content-type` is
+  `application/grpc` with an optional client-chosen codec suffix
+  (`+proto`/`+json`/...), which an exact-match condition can never
+  reliably cover. `header_prefix:content-type=application/grpc; action=grpc`
+  now gates a route on "this looks like gRPC" without needing a
+  `path_prefix` catch-all -- not gRPC-specific in the matcher itself
+  (general prefix matching on any header), matching how this codebase's
+  other route conditions are never narrower than the mechanism actually
+  needs to be.
+- `magnus_access_log()` gained a `grpc_status` field (only present for a
+  gRPC-dispatched request): the wire `:status` a gRPC response carries is
+  always 200 regardless of outcome, so `status=` alone could never
+  distinguish a successful RPC from a failed one for this traffic. A new
+  `/metrics` counter, `magnus_grpc_status_total{code="N"}` (one of the 17
+  canonical gRPC status codes), gives the same breakdown for monitoring
+  -- gated on at least one `grpc_upstream` being configured at all, and
+  only emitting codes that have actually occurred, so a deployment that
+  never uses gRPC gets no new `/metrics` output whatsoever.
+- Session affinity for `action=grpc` routes, mirroring the h1/h2-proxy
+  paths exactly: a valid `MAGNUS_AFFINITY` cookie in the request's
+  `cookie` header is preferred for the first connect attempt, and a
+  fresh one is issued via `Set-Cookie` on the response headers whenever
+  this stream did not arrive with one (or its preferred endpoint could
+  not be used). Whether a given real gRPC client actually persists and
+  resends it is client-dependent -- most have no automatic cookie jar --
+  but reading one is unconditionally safe, and a gateway or client that
+  does thread cookies through now gets exactly the same stickiness the
+  HTTP/1.x reverse-proxy path already provides.
+
+Deliberately out of scope for this increment: upstream connection
+pooling/multiplexing for the gRPC cluster (2c-1's one-shot-per-RPC
+connection remains unchanged) -- architecturally comparable in size to
+2c-2's own streaming rework, not a "polish" item, and left for a future
+increment of its own rather than rushed in here.
+
+Verified against a real, independent gRPC implementation (`grpcio`,
+Python): `header_prefix` correctly routes a request carrying
+`content-type: application/grpc+proto` (never an exact match for
+`application/grpc`) while a request with no grpc-shaped content-type at
+all correctly falls through to ordinary dispatch (a plain 404, not a
+raw HTTP/2 error); a real client's own `initial_metadata()` shows the
+exact `Set-Cookie: MAGNUS_AFFINITY=...` this increment issues; passing
+that cookie back as `cookie` metadata on 10 further calls stuck to the
+same upstream endpoint every time (both encoded endpoint indices
+tested), against a cluster that round-robins between two distinct,
+identifiable upstreams when no cookie is presented at all; the access
+log and `/metrics` for a successful call, a client-error call, and a
+gateway-failure call each showed the correct real gRPC status code
+(`0`/`3`/`14`) rather than a uniform `200`. New permanent regression
+coverage added to `tests/test-core.sh` (curl plus its own cookie jar
+against two distinguishable raw hand-rolled h2 upstreams, no pip
+dependency). `make clean && make test` and `make sanitize` (ASan+UBSan)
+both green. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.15.0
 
 ### Added

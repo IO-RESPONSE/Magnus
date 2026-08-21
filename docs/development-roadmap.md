@@ -482,16 +482,31 @@ connection-pool and common-request-model decisions).
       a raw socket client with no client-side timer of its own proving
       magnus's own server-side sweep is what enforces it. See
       `CHANGELOG.md` 1.15.0 for the full detail.
-    - **2c-4 — gRPC-aware routing/observability polish.** Route matching
-      on `content-type: application/grpc` (or a `grpc_service=<name>`
-      condition parsed from `:path`) as an alternative to requiring an
-      explicit `action=grpc` route; `grpc-status`-aware access logging
-      and `/metrics` (2c-1 deliberately does not touch
-      `magnus_responses_4xx/5xx` for a gRPC outcome, since the wire
-      `:status` is always 200 -- see `magnus_h2_grpc_fail()`'s own
-      comment); session affinity and upstream connection
-      pooling/multiplexing for the gRPC cluster, mirroring 1a's own for
-      the HTTP/1.x one.
+    - **2c-4 — gRPC-aware routing/observability polish. Shipped in
+      1.16.0 -- closes out the gRPC track.** New `header_prefix:<name>=<value>`
+      route condition (a `header:<name>=<value>` exact match can never
+      reliably gate on gRPC's own `content-type: application/grpc[+codec]`
+      shape); `grpc-status`-aware access logging and a new
+      `magnus_grpc_status_total{code="N"}` `/metrics` counter (2c-1
+      deliberately never touched `magnus_responses_4xx/5xx` for a gRPC
+      outcome, since the wire `:status` is always 200 -- see
+      `magnus_h2_grpc_fail()`'s own comment; this is what actually
+      answers "how many gRPC calls failed, and how"); session affinity
+      for `action=grpc` routes, mirroring the h1/h2-proxy paths exactly
+      (`MAGNUS_AFFINITY` cookie, read and issued the same way). Deferred a `grpc_service=<name>` `:path`
+      condition as redundant -- `path_prefix=/pkg.Service/` already
+      expresses the same scoping with the existing mechanism, so a
+      dedicated condition would not have earned its own code. Also
+      deliberately out of scope: upstream connection pooling/
+      multiplexing for the gRPC cluster (a fresh TCP+h2 handshake per RPC
+      remains unchanged from 2c-1) -- architecturally comparable in size
+      to 2c-2's own streaming rework, not a "polish" item, left for a
+      future increment of its own. Verified against a real `grpcio`
+      client and server, including its own `initial_metadata()` showing
+      the exact `Set-Cookie` this increment issues, and 10 further calls
+      carrying it back sticking to the same upstream endpoint every time
+      against a cluster that round-robins without one. See
+      `CHANGELOG.md` 1.16.0 for the full detail.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

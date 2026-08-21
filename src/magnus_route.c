@@ -150,6 +150,8 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
                 magnus_route_match_kind_t kind;
                 if (magnus_route_equal_ci(cursor, key_length, "header"))
                     kind = MAGNUS_ROUTE_MATCH_HEADER;
+                else if (magnus_route_equal_ci(cursor, key_length, "header_prefix"))
+                    kind = MAGNUS_ROUTE_MATCH_HEADER_PREFIX;
                 else if (magnus_route_equal_ci(cursor, key_length, "cookie"))
                     kind = MAGNUS_ROUTE_MATCH_COOKIE;
                 else if (magnus_route_equal_ci(cursor, key_length, "query"))
@@ -245,6 +247,12 @@ magnus_route_condition_matches(const magnus_route_condition_t *condition,
     case MAGNUS_ROUTE_MATCH_HEADER: {
         const char *actual = magnus_http_header_find(request, condition->key);
         return actual != NULL && strcasecmp(actual, condition->value) == 0;
+    }
+    case MAGNUS_ROUTE_MATCH_HEADER_PREFIX: {
+        const char *actual = magnus_http_header_find(request, condition->key);
+        return actual != NULL
+            && strncasecmp(actual, condition->value,
+                           strlen(condition->value)) == 0;
     }
     case MAGNUS_ROUTE_MATCH_COOKIE: {
         const char *cookie_header = magnus_http_header_find(request, "cookie");
