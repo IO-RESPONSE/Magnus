@@ -642,6 +642,60 @@ connection-pool and common-request-model decisions).
     routed the same client IP to the same endpoint across both HTTP/1.1
     and HTTP/2 requests against one shared cluster. See `CHANGELOG.md`
     1.19.0 for the full detail.
+  - **Active health check expansion 2f-1 — HTTP-level probing, gRPC
+    cluster coverage, full configurability. Shipped in 1.20.0 -- closes
+    out Phase 2's own headline scope.** The `upstream` cluster's active
+    probe (independent of live traffic, see M3) upgrades from a bare
+    non-blocking TCP `connect()` to a real HTTP/1.1 `GET` against a
+    configurable `health_check_path`, success iff the response status
+    equals a configurable `health_check_expected_status` -- catching a
+    backend that accepts connections but answers every request with a
+    5xx, which a bare `connect()` could never tell apart from actually
+    healthy. `health_check_interval_seconds`/`_timeout_seconds`/
+    `_failure_threshold`/`_cooldown_seconds` (previously hardcoded
+    constants) are now config keys / matching `--health-check-*` CLI
+    flags, the failure/cooldown pair shared by both clusters' circuit-
+    breaker state exactly as it already was pre-2f. The `grpc_upstream`
+    cluster -- which had no active probe at all before this increment,
+    only whatever live gRPC traffic happened to reveal -- now gets one
+    too, deliberately kept TCP-connect-only rather than an HTTP/1.1 GET:
+    a real gRPC server is typically HTTP/2-only, and a raw HTTP/1.1
+    request line into that socket would get every probe rejected by a
+    perfectly healthy backend, a false-negative regression rather than
+    real coverage. `/metrics` gained `magnus_grpc_upstream_healthy{endpoint=...}`,
+    mirroring the `upstream` cluster's pre-existing `magnus_upstream_healthy`.
+    Both probe state machines (CONNECTING -> (HTTP mode only) SENDING ->
+    READING) share one parameterized implementation, dispatched twice per
+    tick -- see `magnus_health_tick()`'s own comment on why a single
+    unified loop would not actually simplify anything. A reload
+    (`magnus_apply_config()`) now also closes every in-flight probe and
+    resets its next-probe timer, the same stale-by-position fix already
+    applied to the two connection pools and the cache on every prior
+    reload-touching increment -- an in-flight probe for old position N
+    otherwise belongs to whatever backend used to be there, not
+    necessarily the new cluster's position N. Deliberately out of scope:
+    a way to disable active checking per cluster (it stays unconditionally
+    on, exactly as the pre-2f TCP-only version already was); a real gRPC
+    Health Checking Protocol probe for the `grpc_upstream` cluster (a much
+    larger increment: full HTTP/2 framing plus the standard
+    `grpc.health.v1.Health/Check` service, not a probe-mechanism tweak).
+    Verified live: a real HTTP/1.1 GET against a backend that accepts
+    every TCP connection but always answers 500 is found unhealthy by
+    active checking alone (no proxy traffic sent, same M3 discipline);
+    the same backend configured healthy via a different
+    `health_check_path` stays healthy the whole time, proving the new
+    knobs actually reach the probe; a `grpc_upstream` endpoint that is
+    simply down is found (and, once a listener comes up, recovered)
+    purely via the background TCP-connect probe. One real bug caught by
+    this live testing, not code review: the new HTTP-mode probe's GET
+    request reaches a real backend's own request handler (unlike the
+    pre-2f bare `connect()`, which never sent a byte) -- the pre-existing
+    cache regression test's exact upstream-hit-counter assertions
+    (`tests/test-core.sh`) broke because the default 5-second probe
+    interval could now land a background GET on the same fake upstream
+    those assertions count against; fixed by pushing that test's own
+    `--health-check-interval` out past its runtime, not by changing
+    product behavior. See `CHANGELOG.md` 1.20.0 for the full detail.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

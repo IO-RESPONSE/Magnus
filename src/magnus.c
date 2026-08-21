@@ -37,7 +37,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.19.0"
+#define MAGNUS_VERSION "1.20.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -777,11 +777,56 @@ magnus_dns_apply_result(const magnus_dns_result_t *result, void *data)
 /* Health-probe fds share the same epoll_fd as client/upstream connections.
  * Index i+1 (0 means "not a probe fd") names the cluster endpoint a given
  * fd is probing, so the main dispatch loop can route its events here
- * instead of treating it as client or proxied-upstream traffic. */
+ * instead of treating it as client or proxied-upstream traffic. Two
+ * independent owner maps (roadmap 2f) since the `upstream` cluster's
+ * probes and the `grpc_upstream` cluster's probes are separate state
+ * machines running against separate magnus_cluster_t instances -- see
+ * magnus_health_tick()'s own comment on why they are not unified into
+ * one array. */
 static int magnus_health_probe_owner[MAGNUS_MAX_FDS];
-static int magnus_health_probe_fd[MAGNUS_MAX_UPSTREAMS];
-static time_t magnus_health_probe_started[MAGNUS_MAX_UPSTREAMS];
+static int magnus_grpc_health_probe_owner[MAGNUS_MAX_FDS];
+
+/* Active health checking (roadmap 2f): interval/timeout apply to both
+ * clusters' probes; path/expected_status are consulted only by the
+ * `upstream` cluster's HTTP-mode probe (see magnus_health_advance()).
+ * Defaults reproduce this codebase's pre-2f hardcoded behavior; overridden
+ * by magnus_config's own health_check_* keys / the matching --health-
+ * check-* CLI flags. */
+#define MAGNUS_HEALTH_CHECK_PATH_MAX 256
+static unsigned magnus_health_check_interval_seconds =
+    MAGNUS_HEALTH_CHECK_INTERVAL_SECONDS;
+static unsigned magnus_health_check_timeout_seconds =
+    MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS;
+static char magnus_health_check_path[MAGNUS_HEALTH_CHECK_PATH_MAX] = "/";
+static unsigned magnus_health_check_expected_status = 200;
+
+/* Per-endpoint active-probe state. A probe walks CONNECTING -> (HTTP mode
+ * only) SENDING -> READING; a TCP-only probe (the gRPC cluster's own,
+ * see below) resolves the instant CONNECTING succeeds, never entering the
+ * other two stages. `response` accumulates just enough of the reply to
+ * read its status line -- this is a liveness probe, not a real HTTP
+ * client, so the body is never read. */
+typedef enum {
+    MAGNUS_HEALTH_PROBE_CONNECTING,
+    MAGNUS_HEALTH_PROBE_SENDING,
+    MAGNUS_HEALTH_PROBE_READING
+} magnus_health_probe_stage_t;
+
+typedef struct {
+    int fd;
+    time_t started;
+    magnus_health_probe_stage_t stage;
+    char request[MAGNUS_HEALTH_CHECK_PATH_MAX + 64];
+    size_t request_length;
+    size_t request_sent;
+    char response[256];
+    size_t response_length;
+} magnus_health_probe_t;
+
+static magnus_health_probe_t magnus_health_probes[MAGNUS_MAX_UPSTREAMS];
 static time_t magnus_health_last_probe[MAGNUS_MAX_UPSTREAMS];
+static magnus_health_probe_t magnus_grpc_health_probes[MAGNUS_MAX_UPSTREAMS];
+static time_t magnus_grpc_health_last_probe[MAGNUS_MAX_UPSTREAMS];
 static uint64_t magnus_connections_total;
 static uint64_t magnus_connections_active;
 static uint64_t magnus_requests_total;
@@ -6547,6 +6592,29 @@ magnus_build_metrics(char *out, size_t out_capacity)
             if (line2 < 0 || (size_t) line2 >= out_capacity - written) return;
             written += (size_t) line2;
         }
+        /* Active health checking now covers the gRPC cluster too (roadmap
+         * 2f, TCP-connect probe only -- see magnus_health_tick()'s own
+         * comment on why not a real HTTP GET here); before this it had no
+         * per-endpoint health observability of its own at all, only
+         * whatever live gRPC traffic happened to reveal. Mirrors
+         * magnus_upstream_healthy above, one line per configured gRPC
+         * endpoint. */
+        if (written < out_capacity) {
+            int line = snprintf(out + written, out_capacity - written,
+                "# TYPE magnus_grpc_upstream_healthy gauge\n");
+            if (line > 0 && (size_t) line < out_capacity - written)
+                written += (size_t) line;
+        }
+        for (size_t index = 0; index < magnus_grpc_cluster.count
+             && written < out_capacity; index++) {
+            int line = snprintf(out + written, out_capacity - written,
+                "magnus_grpc_upstream_healthy{endpoint=\"%s:%u\"} %d\n",
+                magnus_grpc_cluster.endpoints[index].address,
+                magnus_grpc_cluster.endpoints[index].port,
+                magnus_grpc_cluster.endpoints[index].healthy ? 1 : 0);
+            if (line < 0 || (size_t) line >= out_capacity - written) return;
+            written += (size_t) line;
+        }
     }
 
     /* Reverse-proxy cache (roadmap 2d-1) -- always emitted (like the
@@ -7762,32 +7830,178 @@ magnus_expire_proxies(int epoll_fd, time_t now)
     }
 }
 
-/* Active health checking: independent of live traffic, periodically opens
- * a bare non-blocking TCP connect() to each cluster endpoint and feeds the
- * outcome into the same magnus_cluster_result() passive-health state that
- * real proxy traffic feeds, so an endpoint can be found (and recover) even
- * while it is receiving no requests at all. */
+/* Active health checking (roadmap 2f): independent of live traffic,
+ * periodically probes each cluster endpoint and feeds the outcome into
+ * the same magnus_cluster_result() passive-health state that real proxy
+ * traffic feeds, so an endpoint can be found (and recover) even while it
+ * is receiving no requests at all. Two modes: the `upstream` cluster gets
+ * a real HTTP/1.1 GET against magnus_health_check_path, success iff the
+ * response status equals magnus_health_check_expected_status -- a
+ * backend that accepts connections but returns 500s on everything is
+ * caught, which a bare connect() never could. The `grpc_upstream`
+ * cluster stays TCP-connect-only: a real gRPC server is typically
+ * HTTP/2-only, and speaking a raw HTTP/1.1 request line into that socket
+ * would just get every probe rejected by a perfectly healthy backend --
+ * a false-negative regression, not real coverage. Still real coverage
+ * over the pre-2f state, which ran no active probe against this cluster
+ * at all. Both modes share one parameterized state machine below,
+ * dispatched twice (once per cluster) from magnus_health_tick(). */
 
 static void
-magnus_health_close_probe(int epoll_fd, size_t index)
+magnus_health_close_probe(int epoll_fd, magnus_health_probe_t *probes,
+                          int *owner, size_t index)
 {
-    int fd = magnus_health_probe_fd[index];
+    int fd = probes[index].fd;
     if (fd < 0) return;
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-    magnus_health_probe_owner[fd] = 0;
+    owner[fd] = 0;
     close(fd);
-    magnus_health_probe_fd[index] = -1;
+    probes[index].fd = -1;
 }
 
 static void
-magnus_health_start_probe(int epoll_fd, size_t index, time_t now)
+magnus_health_fail(int epoll_fd, magnus_cluster_t *cluster,
+                   magnus_health_probe_t *probes, int *owner, size_t index)
+{
+    magnus_cluster_result(cluster, index, false, magnus_now_ms());
+    magnus_health_close_probe(epoll_fd, probes, owner, index);
+}
+
+static void
+magnus_health_succeed(int epoll_fd, magnus_cluster_t *cluster,
+                      magnus_health_probe_t *probes, int *owner, size_t index)
+{
+    magnus_cluster_result(cluster, index, true, magnus_now_ms());
+    magnus_health_close_probe(epoll_fd, probes, owner, index);
+}
+
+static void
+magnus_health_rearm(int epoll_fd, int fd, uint32_t events)
+{
+    struct epoll_event event = { .events = events, .data.fd = fd };
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event);
+}
+
+/* Extracts the status code from as much of an HTTP/1.x response as has
+ * been buffered so far. Returns false (need more bytes, or truly
+ * malformed once the caller's buffer is full) until at least one byte
+ * past a well-formed 3-digit status code has arrived -- deliberately not
+ * requiring the full status line, since that byte alone is enough to
+ * know the 3 digits were not cut short by the buffer's own edge. Not a
+ * general HTTP parser: this is a liveness probe reading its own
+ * configured backend, not untrusted input, so "reasonably correct" is
+ * the bar, not exploit-proof. */
+static bool
+magnus_health_parse_status(const char *response, size_t length,
+                           unsigned *out_status)
+{
+    const char *limit = response + length;
+    const char *space;
+    const char *digits;
+    const char *cursor;
+    unsigned long status;
+    char *end;
+
+    if (length < 12 || strncmp(response, "HTTP/1.", 7) != 0) return false;
+    space = memchr(response, ' ', length);
+    if (space == NULL) return false;
+    digits = space + 1;
+    cursor = digits;
+    while (cursor < limit && isdigit((unsigned char) *cursor)) cursor++;
+    if ((size_t) (cursor - digits) != 3 || cursor >= limit) return false;
+    status = strtoul(digits, &end, 10);
+    if (end != cursor) return false;
+    *out_status = (unsigned) status;
+    return true;
+}
+
+/* Drives one probe forward as far as it can go without blocking, from
+ * whatever stage it is currently in. Called both right after a
+ * synchronous connect() (typical for loopback/LAN targets) and from
+ * every subsequent epoll event for that fd -- a probe that completes a
+ * whole stage without ever returning EAGAIN (the common case for a tiny
+ * request/response against a healthy local backend) falls straight
+ * through every remaining stage in one call, exactly like the pre-2f
+ * TCP-only probe already resolved synchronously in the common case. */
+static void
+magnus_health_advance(int epoll_fd, magnus_cluster_t *cluster,
+                      magnus_health_probe_t *probes, int *owner,
+                      size_t index, bool http_mode)
+{
+    magnus_health_probe_t *probe = &probes[index];
+    int fd = probe->fd;
+
+    if (probe->stage == MAGNUS_HEALTH_PROBE_CONNECTING) {
+        if (!http_mode) {
+            magnus_health_succeed(epoll_fd, cluster, probes, owner, index);
+            return;
+        }
+        probe->stage = MAGNUS_HEALTH_PROBE_SENDING;
+        magnus_health_rearm(epoll_fd, fd, EPOLLOUT | EPOLLRDHUP);
+    }
+    if (probe->stage == MAGNUS_HEALTH_PROBE_SENDING) {
+        while (probe->request_sent < probe->request_length) {
+            ssize_t written = write(fd, probe->request + probe->request_sent,
+                                    probe->request_length
+                                    - probe->request_sent);
+            if (written < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+                return;
+            }
+            probe->request_sent += (size_t) written;
+        }
+        probe->stage = MAGNUS_HEALTH_PROBE_READING;
+        magnus_health_rearm(epoll_fd, fd, EPOLLIN | EPOLLRDHUP);
+    }
+    if (probe->stage == MAGNUS_HEALTH_PROBE_READING) {
+        for (;;) {
+            ssize_t received;
+            unsigned status;
+            if (probe->response_length >= sizeof(probe->response)) {
+                magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+                return;
+            }
+            received = read(fd, probe->response + probe->response_length,
+                            sizeof(probe->response) - probe->response_length);
+            if (received < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+                magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+                return;
+            }
+            if (received == 0) {
+                magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+                return;
+            }
+            probe->response_length += (size_t) received;
+            if (magnus_health_parse_status(probe->response,
+                                           probe->response_length, &status)) {
+                if (status == magnus_health_check_expected_status) {
+                    magnus_health_succeed(epoll_fd, cluster, probes, owner,
+                                          index);
+                } else {
+                    magnus_health_fail(epoll_fd, cluster, probes, owner,
+                                       index);
+                }
+                return;
+            }
+        }
+    }
+}
+
+static void
+magnus_health_start_probe(int epoll_fd, magnus_cluster_t *cluster,
+                          magnus_health_probe_t *probes, int *owner,
+                          bool (*sockaddr_fn)(size_t, struct sockaddr_in *),
+                          size_t index, time_t now, bool http_mode)
 {
     struct sockaddr_in address;
     struct epoll_event event;
+    magnus_health_probe_t *probe = &probes[index];
     int fd;
     int result;
 
-    if (!magnus_endpoint_sockaddr(index, &address)) return;
+    if (!sockaddr_fn(index, &address)) return;
     fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
         if (fd >= 0) close(fd);
@@ -7796,7 +8010,7 @@ magnus_health_start_probe(int epoll_fd, size_t index, time_t now)
     result = connect(fd, (struct sockaddr *) &address, sizeof(address));
     if (result < 0 && errno != EINPROGRESS) {
         close(fd);
-        magnus_cluster_result(&magnus_cluster, index, false, magnus_now_ms());
+        magnus_cluster_result(cluster, index, false, magnus_now_ms());
         return;
     }
     event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
@@ -7805,54 +8019,100 @@ magnus_health_start_probe(int epoll_fd, size_t index, time_t now)
         close(fd);
         return;
     }
-    magnus_health_probe_fd[index] = fd;
-    magnus_health_probe_owner[fd] = (int) (index + 1);
-    magnus_health_probe_started[index] = now;
+    probe->fd = fd;
+    probe->started = now;
+    probe->stage = MAGNUS_HEALTH_PROBE_CONNECTING;
+    probe->request_sent = 0;
+    probe->response_length = 0;
+    probe->request_length = 0;
+    if (http_mode) {
+        /* Host: the endpoint's own literal IPv4 address -- a cluster
+         * endpoint carries no separate virtual-host name to probe with,
+         * same as the plain TCP-connect probe never had one either. */
+        int length = snprintf(probe->request, sizeof(probe->request),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: magnus-health-check/1\r\n"
+            "Connection: close\r\n\r\n",
+            magnus_health_check_path, cluster->endpoints[index].address);
+        if (length > 0 && (size_t) length < sizeof(probe->request)) {
+            probe->request_length = (size_t) length;
+        }
+    }
+    owner[fd] = (int) (index + 1);
     if (result == 0) {
-        /* connected synchronously (typical for loopback/LAN targets):
-         * resolve immediately instead of waiting on an epoll event that a
-         * level-triggered, already-satisfied condition may not re-deliver. */
-        magnus_cluster_result(&magnus_cluster, index, true, magnus_now_ms());
-        magnus_health_close_probe(epoll_fd, index);
+        /* connected synchronously: resolve as far as possible immediately
+         * instead of waiting on an epoll event that a level-triggered,
+         * already-satisfied condition may not re-deliver. */
+        magnus_health_advance(epoll_fd, cluster, probes, owner, index,
+                              http_mode);
     }
 }
 
 static void
-magnus_health_handle_probe(int epoll_fd, size_t index, uint32_t flags)
+magnus_health_handle_probe(int epoll_fd, magnus_cluster_t *cluster,
+                           magnus_health_probe_t *probes, int *owner,
+                           size_t index, uint32_t flags, bool http_mode)
 {
-    int fd = magnus_health_probe_fd[index];
-    bool success = false;
-    if (fd < 0) return;
-    if ((flags & (EPOLLERR | EPOLLHUP)) == 0) {
-        int error = 0;
-        socklen_t length = sizeof(error);
-        success = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0
-                   && error == 0;
+    magnus_health_probe_t *probe = &probes[index];
+    if (probe->fd < 0) return;
+    if (probe->stage == MAGNUS_HEALTH_PROBE_CONNECTING) {
+        bool success = false;
+        if ((flags & (EPOLLERR | EPOLLHUP)) == 0) {
+            int error = 0;
+            socklen_t length = sizeof(error);
+            success = getsockopt(probe->fd, SOL_SOCKET, SO_ERROR, &error,
+                                 &length) == 0 && error == 0;
+        }
+        if (!success) {
+            magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+            return;
+        }
     }
-    magnus_cluster_result(&magnus_cluster, index, success, magnus_now_ms());
-    magnus_health_close_probe(epoll_fd, index);
+    magnus_health_advance(epoll_fd, cluster, probes, owner, index, http_mode);
 }
 
 static void
-magnus_health_tick(int epoll_fd, time_t now)
+magnus_health_tick_cluster(int epoll_fd, magnus_cluster_t *cluster,
+                           magnus_health_probe_t *probes, time_t *last_probe,
+                           int *owner,
+                           bool (*sockaddr_fn)(size_t, struct sockaddr_in *),
+                           time_t now, bool http_mode)
 {
     size_t index;
-    for (index = 0; index < magnus_cluster.count; index++) {
-        if (magnus_health_probe_fd[index] >= 0) {
-            if (now - magnus_health_probe_started[index]
-                >= MAGNUS_HEALTH_PROBE_TIMEOUT_SECONDS) {
-                magnus_cluster_result(&magnus_cluster, index, false,
-                                      magnus_now_ms());
-                magnus_health_close_probe(epoll_fd, index);
+    for (index = 0; index < cluster->count; index++) {
+        if (probes[index].fd >= 0) {
+            if ((unsigned) (now - probes[index].started)
+                >= magnus_health_check_timeout_seconds) {
+                magnus_health_fail(epoll_fd, cluster, probes, owner, index);
             }
             continue;
         }
-        if (now - magnus_health_last_probe[index]
-            >= MAGNUS_HEALTH_CHECK_INTERVAL_SECONDS) {
-            magnus_health_last_probe[index] = now;
-            magnus_health_start_probe(epoll_fd, index, now);
+        if ((unsigned) (now - last_probe[index])
+            >= magnus_health_check_interval_seconds) {
+            last_probe[index] = now;
+            magnus_health_start_probe(epoll_fd, cluster, probes, owner,
+                                      sockaddr_fn, index, now, http_mode);
         }
     }
+}
+
+/* Dispatched once per cluster rather than unified into one loop over "all
+ * endpoints everywhere": the two clusters have independent endpoint
+ * counts/indices, independent owner maps (a raw fd number means a
+ * different endpoint depending which cluster it belongs to), and -- the
+ * actual reason a shared loop would not simplify anything -- different
+ * probe modes (see the block comment above magnus_health_close_probe()). */
+static void
+magnus_health_tick(int epoll_fd, time_t now)
+{
+    magnus_health_tick_cluster(epoll_fd, &magnus_cluster, magnus_health_probes,
+                               magnus_health_last_probe,
+                               magnus_health_probe_owner,
+                               magnus_endpoint_sockaddr, now, true);
+    magnus_health_tick_cluster(epoll_fd, &magnus_grpc_cluster,
+                               magnus_grpc_health_probes,
+                               magnus_grpc_health_last_probe,
+                               magnus_grpc_health_probe_owner,
+                               magnus_grpc_endpoint_sockaddr, now, false);
 }
 
 static int
@@ -7957,8 +8217,9 @@ magnus_apply_config(const magnus_config_t *config)
         SSL_CTX_set_options(new_tls_context, SSL_OP_NO_COMPRESSION);
         magnus_h2_configure_alpn(new_tls_context);
     }
-    magnus_cluster_init(&new_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS, config->lb_policy);
+    magnus_cluster_init(&new_cluster, config->health_check_failure_threshold,
+                        (uint64_t) config->health_check_cooldown_seconds
+                        * 1000, config->lb_policy);
     for (index = 0; index < config->upstream_count; index++) {
         if (magnus_cluster_add(&new_cluster, config->upstreams[index].address,
                                config->upstreams[index].port,
@@ -7968,16 +8229,22 @@ magnus_apply_config(const magnus_config_t *config)
             return -1;
         }
     }
-    /* The gRPC cluster's own policy is never exposed to config/CLI in
-     * this increment (roadmap 2e-1 is scoped to the h1/h2 proxy dispatch
+    /* The gRPC cluster's own load-balancing policy is never exposed to
+     * config/CLI (roadmap 2e-1 is scoped to the h1/h2 proxy dispatch
      * paths' own shared `magnus_cluster` only -- see
      * magnus_cluster_endpoint_begin()'s own comment on why the gRPC
      * cluster does not participate in MAGNUS_LB_LEAST_CONN's live
      * counting at all, which MAGNUS_LB_IP_HASH does not strictly need but
      * is left equally out of scope here for the same reason: a distinct
-     * future increment, not silently half-done). */
-    magnus_cluster_init(&new_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
+     * future increment, not silently half-done). The circuit-breaker
+     * failure_threshold/cooldown are a different, orthogonal axis --
+     * shared by both clusters' passive health state since well before
+     * roadmap 2f, and now driven by the same health_check_* config keys
+     * as the `upstream` cluster's own active probe (roadmap 2f). */
+    magnus_cluster_init(&new_grpc_cluster,
+                        config->health_check_failure_threshold,
+                        (uint64_t) config->health_check_cooldown_seconds
+                        * 1000, MAGNUS_LB_ROUND_ROBIN);
     for (index = 0; index < config->grpc_upstream_count; index++) {
         if (magnus_cluster_add(&new_grpc_cluster,
                                config->grpc_upstreams[index].address,
@@ -8011,6 +8278,28 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_grpc_pool_close_all();
     magnus_grpc_cluster = new_grpc_cluster;
     magnus_grpc_upstream_enabled = new_grpc_cluster.count > 0;
+    /* Same stale-by-position hazard once more (roadmap 2f): an in-flight
+     * active-health probe for old position N belongs to whatever backend
+     * used to be there, not necessarily the new cluster's position N.
+     * Closing every in-flight probe and resetting last_probe (so a fresh
+     * one starts promptly under the new generation, rather than waiting
+     * out whatever fraction of the old interval happened to remain) is
+     * the same fix magnus_pool_close_all()/magnus_grpc_pool_close_all()
+     * already apply to the two connection pools above. */
+    for (size_t probe_index = 0; probe_index < MAGNUS_MAX_UPSTREAMS;
+         probe_index++) {
+        magnus_health_close_probe(magnus_global_epoll_fd, magnus_health_probes,
+                                  magnus_health_probe_owner, probe_index);
+        magnus_health_close_probe(magnus_global_epoll_fd,
+                                  magnus_grpc_health_probes,
+                                  magnus_grpc_health_probe_owner, probe_index);
+        magnus_health_last_probe[probe_index] = 0;
+        magnus_grpc_health_last_probe[probe_index] = 0;
+    }
+    magnus_health_check_interval_seconds = config->health_check_interval_seconds;
+    magnus_health_check_timeout_seconds = config->health_check_timeout_seconds;
+    strcpy(magnus_health_check_path, config->health_check_path);
+    magnus_health_check_expected_status = config->health_check_expected_status;
     /* Reverse-proxy cache (roadmap 2d-1): a reload can change which
      * routes have cache=on at all, or the cluster a cached response's
      * host+target combination would now hit -- flushed unconditionally,
@@ -8259,6 +8548,53 @@ magnus_parse_options(int argc, char **argv)
             } else {
                 break;
             }
+        } else if (strcmp(argv[index], "--health-check-path") == 0) {
+            const char *path = argv[index + 1];
+            if (*path != '/' || strlen(path) >= sizeof(magnus_health_check_path)
+                || strpbrk(path, " \t\r\n") != NULL) break;
+            strcpy(magnus_health_check_path, path);
+        } else if (strcmp(argv[index], "--health-check-expected-status") == 0) {
+            char *end;
+            unsigned long status;
+            errno = 0;
+            status = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || status < 100 || status > 599)
+                break;
+            magnus_health_check_expected_status = (unsigned) status;
+        } else if (strcmp(argv[index], "--health-check-interval") == 0) {
+            char *end;
+            unsigned long seconds;
+            errno = 0;
+            seconds = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || seconds == 0 || seconds > 3600)
+                break;
+            magnus_health_check_interval_seconds = (unsigned) seconds;
+        } else if (strcmp(argv[index], "--health-check-timeout") == 0) {
+            char *end;
+            unsigned long seconds;
+            errno = 0;
+            seconds = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || seconds == 0 || seconds > 3600)
+                break;
+            magnus_health_check_timeout_seconds = (unsigned) seconds;
+        } else if (strcmp(argv[index], "--health-check-failure-threshold") == 0) {
+            char *end;
+            unsigned long count;
+            errno = 0;
+            count = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || count == 0 || count > 1000)
+                break;
+            magnus_cluster.failure_threshold = (unsigned) count;
+            magnus_grpc_cluster.failure_threshold = (unsigned) count;
+        } else if (strcmp(argv[index], "--health-check-cooldown") == 0) {
+            char *end;
+            unsigned long seconds;
+            errno = 0;
+            seconds = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || seconds == 0 || seconds > 86400)
+                break;
+            magnus_cluster.cooldown_ms = (uint64_t) seconds * 1000;
+            magnus_grpc_cluster.cooldown_ms = (uint64_t) seconds * 1000;
         } else if (strcmp(argv[index], "--access-log-sample") == 0) {
             char *end;
             unsigned long sample;
@@ -8352,9 +8688,16 @@ magnus_parse_options(int argc, char **argv)
     fprintf(stderr, "usage: %s --port <1-65535> [--root <directory>] "
                     "[--tls-cert <pem> --tls-key <pem>] "
                     "[--upstream <ipv4:port[:weight]> ...] "
+                    "[--lb-policy round_robin|least_conn|ip_hash] "
                     "[--rate-limit <rps[:burst]>] "
                     "[--admin-socket <path>] "
                     "[--access-log on|off] [--access-log-sample <n>] "
+                    "[--health-check-path </path>] "
+                    "[--health-check-expected-status <100-599>] "
+                    "[--health-check-interval <seconds>] "
+                    "[--health-check-timeout <seconds>] "
+                    "[--health-check-failure-threshold <n>] "
+                    "[--health-check-cooldown <seconds>] "
                     "[--route <spec> ...] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
@@ -8403,6 +8746,19 @@ main(int argc, char **argv)
     if (magnus_dns_eventfd < 0) {
         fprintf(stderr, "magnus: dns: resolver unavailable (%s); hostname "
                         "upstreams will not resolve\n", strerror(errno));
+    }
+    /* Must happen before magnus_parse_options(): --config mode calls
+     * magnus_apply_config() from inside option parsing, which closes any
+     * in-flight active-health probe for every position on every config
+     * load (not just a later reload -- see its own comment on the stale-
+     * by-position hazard). Static storage zero-initializes these arrays,
+     * and 0 is a live fd (stdin) -- without this, that very first
+     * magnus_apply_config() call would call close() on whatever
+     * uninitialized/zero fd value each slot happened to hold. */
+    for (size_t probe_index = 0; probe_index < MAGNUS_MAX_UPSTREAMS;
+         probe_index++) {
+        magnus_health_probes[probe_index].fd = -1;
+        magnus_grpc_health_probes[probe_index].fd = -1;
     }
     port = magnus_parse_options(argc, argv);
     magnus_listen_port = port;
@@ -8473,9 +8829,8 @@ main(int argc, char **argv)
     signal(SIGTERM, magnus_signal_handler);
     signal(SIGHUP, magnus_reload_signal_handler);
     signal(SIGPIPE, SIG_IGN);
-    for (size_t index = 0; index < MAGNUS_MAX_UPSTREAMS; index++) {
-        magnus_health_probe_fd[index] = -1;
-    }
+    /* Active-health probe fd slots were already reset to -1 before
+     * magnus_parse_options() -- see that call site's own comment. */
     fprintf(stderr, "magnus: native engine listening on 0.0.0.0:%u\n", port);
 
     while (magnus_running) {
@@ -8556,8 +8911,17 @@ main(int argc, char **argv)
             }
             if (fd >= 0 && fd < MAGNUS_MAX_FDS
                 && magnus_health_probe_owner[fd] != 0) {
-                magnus_health_handle_probe(epoll_fd,
-                    (size_t) (magnus_health_probe_owner[fd] - 1), flags);
+                magnus_health_handle_probe(epoll_fd, &magnus_cluster,
+                    magnus_health_probes, magnus_health_probe_owner,
+                    (size_t) (magnus_health_probe_owner[fd] - 1), flags, true);
+                continue;
+            }
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_grpc_health_probe_owner[fd] != 0) {
+                magnus_health_handle_probe(epoll_fd, &magnus_grpc_cluster,
+                    magnus_grpc_health_probes, magnus_grpc_health_probe_owner,
+                    (size_t) (magnus_grpc_health_probe_owner[fd] - 1), flags,
+                    false);
                 continue;
             }
             if (fd < 0 || fd >= MAGNUS_MAX_FDS

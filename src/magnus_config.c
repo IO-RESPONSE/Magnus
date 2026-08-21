@@ -150,6 +150,12 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     memset(config, 0, sizeof(*config));
     config->access_log_enabled = true;
     config->access_log_sample = 1;
+    strcpy(config->health_check_path, "/");
+    config->health_check_expected_status = 200;
+    config->health_check_interval_seconds = 5;
+    config->health_check_timeout_seconds = 2;
+    config->health_check_failure_threshold = 3;
+    config->health_check_cooldown_seconds = 5;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     file = fopen(path, "r");
@@ -326,6 +332,67 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+        } else if (strcmp(key, "health_check_path") == 0) {
+            if (*value != '/' || strlen(value) >= sizeof(config->health_check_path)
+                || strpbrk(value, " \t\r\n") != NULL) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_path' must start "
+                                        "with '/' and contain no whitespace, "
+                                        "got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(config->health_check_path, value);
+        } else if (strcmp(key, "health_check_expected_status") == 0) {
+            unsigned long status;
+            if (!magnus_config_parse_uint(value, 100, 599, &status)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_expected_status' "
+                                        "must be 100-599, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->health_check_expected_status = (unsigned) status;
+        } else if (strcmp(key, "health_check_interval_seconds") == 0) {
+            unsigned long seconds;
+            if (!magnus_config_parse_uint(value, 1, 3600, &seconds)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_interval_seconds' "
+                                        "must be 1-3600, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->health_check_interval_seconds = (unsigned) seconds;
+        } else if (strcmp(key, "health_check_timeout_seconds") == 0) {
+            unsigned long seconds;
+            if (!magnus_config_parse_uint(value, 1, 3600, &seconds)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_timeout_seconds' "
+                                        "must be 1-3600, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->health_check_timeout_seconds = (unsigned) seconds;
+        } else if (strcmp(key, "health_check_failure_threshold") == 0) {
+            unsigned long count;
+            if (!magnus_config_parse_uint(value, 1, 1000, &count)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_failure_threshold' "
+                                        "must be 1-1000, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->health_check_failure_threshold = (unsigned) count;
+        } else if (strcmp(key, "health_check_cooldown_seconds") == 0) {
+            unsigned long seconds;
+            if (!magnus_config_parse_uint(value, 1, 86400, &seconds)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'health_check_cooldown_seconds' "
+                                        "must be 1-86400, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->health_check_cooldown_seconds = (unsigned) seconds;
         } else if (strcmp(key, "access_log_sample") == 0) {
             unsigned long sample;
             if (!magnus_config_parse_uint(value, 1, 1000000, &sample)) {

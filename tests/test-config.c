@@ -54,6 +54,12 @@ main(void)
     assert(config.access_log_sample == 1);
     assert(!config.has_admin_socket);
     assert(config.lb_policy == MAGNUS_LB_ROUND_ROBIN);
+    assert(strcmp(config.health_check_path, "/") == 0);
+    assert(config.health_check_expected_status == 200);
+    assert(config.health_check_interval_seconds == 5);
+    assert(config.health_check_timeout_seconds == 2);
+    assert(config.health_check_failure_threshold == 3);
+    assert(config.health_check_cooldown_seconds == 5);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -72,6 +78,12 @@ main(void)
             "access_log = off\n"
             "access_log_sample = 20\n"
             "lb_policy = least_conn\n"
+            "health_check_path = /healthz\n"
+            "health_check_expected_status = 204\n"
+            "health_check_interval_seconds = 10\n"
+            "health_check_timeout_seconds = 3\n"
+            "health_check_failure_threshold = 5\n"
+            "health_check_cooldown_seconds = 30\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -96,6 +108,41 @@ main(void)
     assert(config.rate_limit_rps == 50.0);
     assert(config.rate_limit_burst == 100.0);
     assert(config.lb_policy == MAGNUS_LB_LEAST_CONN);
+    assert(strcmp(config.health_check_path, "/healthz") == 0);
+    assert(config.health_check_expected_status == 204);
+    assert(config.health_check_interval_seconds == 10);
+    assert(config.health_check_timeout_seconds == 3);
+    assert(config.health_check_failure_threshold == 5);
+    assert(config.health_check_cooldown_seconds == 30);
+
+    /* health_check_*: malformed/out-of-range values rejected. */
+    write_file(config_path, "port = 8080\nhealth_check_path = no-leading-slash\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "health_check_path") != NULL);
+    write_file(config_path, "port = 8080\nhealth_check_path = /has space\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nhealth_check_expected_status = 99\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "health_check_expected_status") != NULL);
+    write_file(config_path, "port = 8080\nhealth_check_expected_status = 600\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nhealth_check_interval_seconds = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "health_check_interval_seconds") != NULL);
+    write_file(config_path, "port = 8080\nhealth_check_timeout_seconds = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nhealth_check_failure_threshold = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nhealth_check_cooldown_seconds = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
 
     /* lb_policy: every recognized value, and an invalid one rejected. */
     write_file(config_path, "port = 8080\nlb_policy = round_robin\n");

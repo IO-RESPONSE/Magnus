@@ -71,6 +71,25 @@ typedef struct {
     unsigned access_log_sample;
     bool has_admin_socket;
     char admin_socket[MAGNUS_CONFIG_PATH_MAX];
+    /* Active health checking (roadmap 2f): applies uniformly to both the
+     * `upstream` cluster's HTTP-level probe (GET health_check_path,
+     * success iff the response status equals health_check_expected_status)
+     * and the `grpc_upstream` cluster's plain TCP-connect probe (path/
+     * expected_status are meaningless there -- see magnus_apply_config()'s
+     * own comment on why an HTTP/1.1 GET is not sent to a gRPC-only
+     * upstream). failure_threshold/cooldown_seconds feed
+     * magnus_cluster_init() for both clusters, the same trip/recovery
+     * state active probes already shared with live-traffic passive health
+     * before this increment. Defaults (path "/", expected_status 200,
+     * interval 5s, timeout 2s, failure_threshold 3, cooldown 5s) exactly
+     * reproduce this codebase's pre-2f hardcoded behavior when a config
+     * never mentions any of these keys. */
+    char health_check_path[MAGNUS_CONFIG_PATH_MAX];
+    unsigned health_check_expected_status;
+    unsigned health_check_interval_seconds;
+    unsigned health_check_timeout_seconds;
+    unsigned health_check_failure_threshold;
+    unsigned health_check_cooldown_seconds;
     /* Parsed eagerly here (not left as raw strings) so a malformed route
      * is caught by config validation itself, same as every other field --
      * see magnus_route_parse(). Evaluated in file order; the first
@@ -95,10 +114,17 @@ typedef enum {
  *     access_log is 'on'/'off', access_log_sample is a positive integer,
  *     route is a valid magnus_route_parse() spec -- see magnus_route.h,
  *     lb_policy is 'round_robin'/'least_conn'/'ip_hash' -- see
- *     magnus_policy.h's own magnus_lb_policy_t)
+ *     magnus_policy.h's own magnus_lb_policy_t, health_check_path starts
+ *     with '/' and carries no whitespace, health_check_expected_status is
+ *     100-599, health_check_interval_seconds/_timeout_seconds/
+ *     _failure_threshold/_cooldown_seconds are all positive integers)
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
- *     lb_policy defaults to "round_robin" when omitted
+ *     lb_policy defaults to "round_robin" when omitted; health_check_path
+ *     defaults to "/", health_check_expected_status to 200,
+ *     health_check_interval_seconds to 5, health_check_timeout_seconds to
+ *     2, health_check_failure_threshold to 3, health_check_cooldown_seconds
+ *     to 5
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

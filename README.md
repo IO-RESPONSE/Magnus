@@ -58,9 +58,17 @@ independently by IORESPONSE.
   shape) while leaving ordinary traffic and every other connection
   unaffected; graceful shutdown sends a real GOAWAY frame to every open
   h2 connection before closing it
-- Multi-endpoint cluster routing, wired to live traffic; active (periodic
-  probe) and passive (live-traffic) health share one circuit-breaker state;
-  cookie-based session affinity; per-client-IP ingress rate limiting
+- Multi-endpoint cluster routing, wired to live traffic; active and passive
+  (live-traffic) health share one circuit-breaker state; cookie-based
+  session affinity; per-client-IP ingress rate limiting. Active checking is
+  a real HTTP/1.1 `GET` against a configurable `health_check_path`,
+  success iff the response status matches a configurable
+  `health_check_expected_status` (`--health-check-path`/`--health-check-
+  expected-status`, plus `--health-check-interval`/`-timeout`/`-failure-
+  threshold`/`-cooldown`) -- catching a backend that accepts connections
+  but answers every request with a 5xx. The gRPC cluster gets active
+  checking too (TCP-connect only, since a real gRPC server is typically
+  HTTP/2-only)
 - Real IP resolution behind a trusted reverse proxy: PROXY protocol v1/v2
   (detected before TLS handshake or h2c preface, for either entry point)
   and RFC 7239 `Forwarded`/`X-Forwarded-For` (right-most-untrusted-hop,

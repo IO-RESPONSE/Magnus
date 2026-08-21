@@ -54,6 +54,14 @@ cleanup() {
     kill -TERM "$backend9_pid" >/dev/null 2>&1 || true
     wait "$backend9_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend10_pid:-}" ]; then
+    kill -TERM "$backend10_pid" >/dev/null 2>&1 || true
+    wait "$backend10_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend11_pid:-}" ]; then
+    kill -TERM "$backend11_pid" >/dev/null 2>&1 || true
+    wait "$backend11_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -2731,8 +2739,15 @@ for attempt in 1 2 3 4 5; do
   sleep 1
 done
 
+# --health-check-interval is pushed out to effectively "never, within this
+# test's runtime": roadmap 2f's active probe is now a real HTTP GET that
+# reaches this fake upstream's own request handler (unlike the pre-2f
+# bare TCP connect(), which never did), so an unthrottled default would
+# increment hits_file in the background and corrupt the exact-hit-count
+# assertions below.
 "$binary" --port "$port_cache" --upstream "127.0.0.1:$upstream_cache" \
   --route "path_prefix=/; action=proxy; cache=on" \
+  --health-check-interval 3600 \
   --access-log on 2>>"$log" &
 server_pid=$!
 for attempt in 1 2 3 4 5; do
@@ -2820,7 +2835,8 @@ server_pid=
 # even for an otherwise-identical upstream/path -- opt-in is per route,
 # never a global default.
 "$binary" --port "$port_cache_off" --upstream "127.0.0.1:$upstream_cache" \
-  --route "path_prefix=/; action=proxy" 2>>"$log" &
+  --route "path_prefix=/; action=proxy" --health-check-interval 3600 \
+  2>>"$log" &
 server_pid=$!
 for attempt in 1 2 3 4 5; do
   curl --fail --silent "http://127.0.0.1:$port_cache_off/healthz" >/dev/null && break
@@ -2961,3 +2977,134 @@ kill -TERM "$backend9_pid" 2>/dev/null
 wait "$backend9_pid" 2>/dev/null || true
 backend9_pid=
 echo "lb: least_conn/ip_hash ok"
+
+# Active health check expansion (roadmap 2f): the `upstream` cluster's
+# active probe is now a real HTTP/1.1 GET (health_check_path, success iff
+# the response status equals health_check_expected_status) instead of a
+# bare TCP connect() -- this backend accepts every connection but always
+# answers 500 on "/" and 200 on "/ok", something a bare connect() probe
+# could never have told apart. --health-check-interval/--timeout/
+# --failure-threshold are all tightened for a fast, deterministic test
+# instead of waiting out the multi-second defaults.
+port_hc_backend=$((port + 68))
+python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def do_GET(self):
+        status = 200 if self.path == '/ok' else 500
+        self.send_response(status)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $port_hc_backend), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend10_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_hc_backend/ok" >/dev/null && break
+  sleep 1
+done
+
+# Default health_check_path ("/") hits the always-500 branch: active
+# checking alone (no proxy traffic sent at all, same M3 discipline) must
+# find this endpoint unhealthy even though it accepts every TCP connect.
+port_hc_default=$((port + 69))
+"$binary" --port "$port_hc_default" --upstream "127.0.0.1:$port_hc_backend" \
+  --health-check-interval 1 --health-check-timeout 1 \
+  --health-check-failure-threshold 2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_hc_default/healthz" >/dev/null && break
+  sleep 1
+done
+hc_unhealthy_seen=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_hc_default/metrics" \
+      | grep -Eq '^magnus_upstream_endpoints_healthy 0$'; then
+    hc_unhealthy_seen=1
+    break
+  fi
+done
+test "$hc_unhealthy_seen" = 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Same backend, --health-check-path pointed at the 200-answering branch
+# instead: the endpoint must stay healthy the whole time, proving the
+# path/expected-status knobs actually reach the probe rather than the
+# default silently winning.
+port_hc_ok=$((port + 70))
+"$binary" --port "$port_hc_ok" --upstream "127.0.0.1:$port_hc_backend" \
+  --health-check-path /ok --health-check-interval 1 --health-check-timeout 1 \
+  --health-check-failure-threshold 2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_hc_ok/healthz" >/dev/null && break
+  sleep 1
+done
+sleep 4
+curl --fail --silent "http://127.0.0.1:$port_hc_ok/metrics" \
+  | grep -Eq '^magnus_upstream_endpoints_healthy 1$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend10_pid" 2>/dev/null
+wait "$backend10_pid" 2>/dev/null || true
+backend10_pid=
+
+# The gRPC cluster gets active health checking too (TCP-connect only, no
+# HTTP GET -- see magnus_health_tick()'s own comment on why): before this
+# increment it had none at all, only whatever live traffic happened to
+# reveal. Same M3 discipline -- no gRPC traffic sent, only the background
+# probe can move magnus_grpc_upstream_healthy.
+port_grpc_hc_backend=$((port + 71))
+port_grpc_hc=$((port + 72))
+"$binary" --port "$port_grpc_hc" \
+  --grpc-upstream "127.0.0.1:$port_grpc_hc_backend" \
+  --route "path_prefix=/; action=grpc" \
+  --health-check-interval 1 --health-check-timeout 1 \
+  --health-check-failure-threshold 2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_grpc_hc/healthz" >/dev/null && break
+  sleep 1
+done
+grpc_hc_unhealthy_seen=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_grpc_hc/metrics" \
+      | grep -Eq "^magnus_grpc_upstream_healthy\{endpoint=\"127\.0\.0\.1:$port_grpc_hc_backend\"\} 0\$"; then
+    grpc_hc_unhealthy_seen=1
+    break
+  fi
+done
+test "$grpc_hc_unhealthy_seen" = 1
+
+# Bringing up a plain listener on that port (not a real gRPC server --
+# this cluster's active probe is TCP-connect-only, so a bare accept()
+# loop is exactly what it is testing) flips it back to healthy purely via
+# the background probe.
+python3 -m http.server "$port_grpc_hc_backend" --bind 127.0.0.1 \
+  --directory "$web_root" >/dev/null 2>&1 &
+backend11_pid=$!
+grpc_hc_recovered=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_grpc_hc/metrics" \
+      | grep -Eq "^magnus_grpc_upstream_healthy\{endpoint=\"127\.0\.0\.1:$port_grpc_hc_backend\"\} 1\$"; then
+    grpc_hc_recovered=1
+    break
+  fi
+done
+test "$grpc_hc_recovered" = 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend11_pid" 2>/dev/null
+wait "$backend11_pid" 2>/dev/null || true
+backend11_pid=
+echo "health-check: http-mode/path/expected-status/grpc-coverage ok"

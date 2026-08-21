@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.20.0
+
+### Added
+
+- **Active health check expansion (roadmap 2f-1): HTTP-level probing,
+  gRPC cluster coverage, full configurability -- closes out Phase 2's
+  own headline scope.** The `upstream` cluster's active probe (M3,
+  independent of live traffic) upgrades from a bare non-blocking TCP
+  `connect()` to a real HTTP/1.1 `GET` against a configurable
+  `health_check_path` (default `/`), success iff the response status
+  equals a configurable `health_check_expected_status` (default 200) --
+  catching a backend that accepts connections but answers every request
+  with a 5xx, which a bare `connect()` could never tell apart from
+  actually healthy.
+- `health_check_interval_seconds`/`_timeout_seconds`/`_failure_threshold`/
+  `_cooldown_seconds` (previously hardcoded constants -- 5s/2s/3/5s) are
+  now config keys / matching `--health-check-interval`/`-timeout`/
+  `-failure-threshold`/`-cooldown` CLI flags. failure_threshold/cooldown
+  feed both clusters' shared circuit-breaker state exactly as they
+  already did pre-2f (this was never `upstream`-cluster-specific); only
+  the probe *mechanism itself* (path/expected-status) is HTTP-cluster-
+  only, for the reason below.
+- The `grpc_upstream` cluster -- which had no active probe at all before
+  this increment, only whatever live gRPC traffic happened to reveal --
+  now gets one too, deliberately kept TCP-connect-only rather than an
+  HTTP/1.1 GET: a real gRPC server is typically HTTP/2-only, and a raw
+  HTTP/1.1 request line into that socket would get every probe rejected
+  by a perfectly healthy backend -- a false-negative regression, not real
+  coverage. Still real coverage over the pre-2f state, which ran nothing
+  at all. `/metrics` gained `magnus_grpc_upstream_healthy{endpoint=...}`,
+  mirroring the `upstream` cluster's pre-existing `magnus_upstream_healthy`.
+- Both probe state machines (`CONNECTING` -> HTTP-mode-only `SENDING` ->
+  `READING`) share one parameterized implementation
+  (`magnus_health_advance()` and friends), dispatched twice per tick --
+  once per cluster, each with its own owner map, probe-state array, and
+  sockaddr resolver, since the two clusters have independent endpoint
+  indices and (the actual reason a unified loop would not simplify
+  anything) different probe modes.
+- A config reload (`magnus_apply_config()`) now also closes every
+  in-flight active probe and resets its next-probe timer, the same
+  stale-by-position fix already applied to the two connection pools and
+  the reverse-proxy cache on every prior reload-touching increment -- an
+  in-flight probe for old position N otherwise belongs to whatever
+  backend used to be there, not necessarily the new cluster's position N.
+- Deliberately out of scope: a way to disable active checking per cluster
+  (it stays unconditionally on, exactly as the pre-2f TCP-only version
+  already was); a real gRPC Health Checking Protocol probe
+  (`grpc.health.v1.Health/Check`) for the `grpc_upstream` cluster -- a
+  much larger increment (full HTTP/2 framing plus a real gRPC service
+  call), not a probe-mechanism tweak.
+
+### Fixed
+
+Found only through live testing, not code review: the new HTTP-mode
+probe's GET request reaches a real backend's own request handler (unlike
+the pre-2f bare `connect()`, which never sent a single byte) -- the
+pre-existing reverse-proxy-cache regression test's exact upstream-hit-
+counter assertions (`tests/test-core.sh`) broke, because the default
+5-second probe interval could now land a background GET on the same fake
+upstream those assertions count hits against mid-test. Fixed by pushing
+that test's own `--health-check-interval` out past its runtime, not by
+changing product behavior -- any real deployment relying on precise
+upstream request counts (an unusual thing to depend on, but not unheard
+of for billing/quota-style backends) now needs to account for the same
+background traffic this feature intentionally introduces.
+
+### Verified
+
+Live, against real backends: an HTTP/1.1 GET against a backend that
+accepts every TCP connection but always answers 500 on `/` is found
+unhealthy by active checking alone (no proxy traffic sent at all, same
+M3 discipline); the same backend configured healthy via a different
+`health_check_path` (serving 200 there instead) stays healthy the whole
+time, proving the new knobs actually reach the probe rather than the
+default silently winning; a `grpc_upstream` endpoint that is simply down
+is found (and, once a listener comes up, recovered) purely via the
+background TCP-connect probe, with no gRPC traffic sent. New unit
+coverage in `tests/test-config.c` (every `health_check_*` key's default,
+explicit value, and rejection case). New permanent regression coverage
+in `tests/test-core.sh`. `make clean && make test` and `make sanitize`
+(ASan+UBSan) both green. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.19.0
 
 ### Added
