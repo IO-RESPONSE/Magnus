@@ -10,6 +10,7 @@
 #include "magnus_proxy.h"
 #include "magnus_realip.h"
 #include "magnus_route.h"
+#include "magnus_sni.h"
 #include "magnus_ws.h"
 
 #include <arpa/inet.h>
@@ -37,27 +38,37 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.21.0"
+#define MAGNUS_VERSION "1.22.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
 #define MAGNUS_MAX_BODY (1 * 1024 * 1024)
-/* Bumped 2048 -> 9216 (roadmap 3a): with the `upstream`, `grpc_upstream`,
- * and `stream` clusters all at their own max endpoint count plus every
- * gRPC status code and every latency-histogram bucket all actually
- * present at once, /metrics' real worst-case body is close to 6.2KB --
- * comfortably past the old 2048-byte ceiling, which silently emptied the
- * *entire* response (not just truncated the body) once the rendered body
- * plus headers exceeded it, a real bug found live rather than in code
- * review (see CHANGELOG.md 3a's own writeup). MAGNUS_METRICS_BUFFER stays
- * comfortably below this with headroom for HTTP headers. */
-#define MAGNUS_OUTPUT_LIMIT 9216
+/* Bumped 2048 -> 9216 (roadmap 3a), then -> 17408 (roadmap 3b): with the
+ * `upstream`, `grpc_upstream`, and `stream` clusters all at their own max
+ * endpoint count plus every gRPC status code and every latency-histogram
+ * bucket all actually present at once, /metrics' real worst-case body was
+ * already close to 6.2KB at 3a -- comfortably past the *original*
+ * 2048-byte ceiling, which silently emptied the *entire* response (not
+ * just truncated the body) once the rendered body plus headers exceeded
+ * it, a real bug found live rather than in code review (see
+ * CHANGELOG.md 3a's own writeup). 3b's own stream_sni_route clusters add
+ * a genuinely large *theoretical* worst case on top of that (up to
+ * MAGNUS_CONFIG_MAX_SNI_ROUTES patterns, each up to
+ * MAGNUS_CONFIG_MAX_UPSTREAMS endpoints, one gauge line apiece) --
+ * comfortable headroom for any deployment actually likely to exist
+ * (a handful of patterns, a handful of endpoints each) rather than the
+ * full theoretical maximum, which would still gracefully truncate (per-
+ * endpoint/per-pattern loops stop appending once out of room, exactly
+ * the existing documented behavior below) rather than repeat 3a's whole-
+ * response-emptied bug. MAGNUS_METRICS_BUFFER stays comfortably below
+ * this with headroom for HTTP headers. */
+#define MAGNUS_OUTPUT_LIMIT 17408
 /* Sized to stay well clear of MAGNUS_OUTPUT_LIMIT once wrapped in
  * response headers; magnus_build_metrics()'s per-endpoint/per-bucket
  * loops stop appending once they run out of room rather than risk
  * overflowing the response envelope, so the fixed aggregate lines are
  * always present even when there is not room for full detail. */
-#define MAGNUS_METRICS_BUFFER 8192
+#define MAGNUS_METRICS_BUFFER 16384
 #define MAGNUS_IDLE_SECONDS 30
 #define MAGNUS_HEADER_TIMEOUT_SECONDS 10
 #define MAGNUS_PROXY_BUFFER 16384
@@ -67,6 +78,12 @@
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_PROXY_MAX_ATTEMPTS 2
+/* TLS passthrough / SNI routing (roadmap 3b): how long a stream
+ * connection may sit in MAGNUS_STREAM_PEEKING before giving up and
+ * falling back to the default stream_upstream cluster -- the same
+ * fallback a parsed-but-unmatched or genuinely malformed ClientHello
+ * already gets, just triggered by a stalled/slow client instead. */
+#define MAGNUS_STREAM_PEEK_TIMEOUT_SECONDS 5
 /* gRPC deadline propagation (roadmap 2c-3): an explicit upper bound on
  * how far a client-supplied grpc-timeout may extend a stream's
  * connect/read budget past the default MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/
@@ -479,6 +496,21 @@ static bool magnus_stream_enabled;
 static unsigned magnus_stream_port;
 static int magnus_stream_listener = -1;
 
+/* TLS passthrough / SNI routing (roadmap 3b): layered on top of
+ * magnus_stream_cluster above, never a replacement for it. Each entry is
+ * its own independent magnus_cluster_t (own endpoints, own round_robin
+ * selection, own passive circuit-breaker state) matched by pattern,
+ * first-match-wins in config-file order -- see
+ * magnus_sni_select_cluster()'s own comment on why active health
+ * checking is deliberately out of scope for these. */
+typedef struct {
+    char pattern[MAGNUS_CONFIG_SNI_PATTERN_MAX];
+    magnus_cluster_t cluster;
+} magnus_sni_cluster_t;
+
+static magnus_sni_cluster_t magnus_sni_clusters[MAGNUS_CONFIG_MAX_SNI_ROUTES];
+static size_t magnus_sni_cluster_count;
+
 /* One direction of a stream connection's byte relay: `buffer[sent..length)`
  * is buffered-but-not-yet-written to the destination fd. `source_eof` is
  * set once read() on the source fd returns 0; once that pipe's own buffer
@@ -488,7 +520,18 @@ static int magnus_stream_listener = -1;
  * client that sends a request-like preamble then only reads a long-lived
  * response stream). magnus_stream_pipe_done() below is true once both of
  * those have happened, at which point this direction contributes nothing
- * more to the connection's lifetime. */
+ * more to the connection's lifetime.
+ *
+ * Doubles as the SNI peek buffer (roadmap 3b): during MAGNUS_STREAM_PEEKING
+ * the client's initial bytes are read directly into c2u.buffer (with
+ * upstream_fd still -1, sent staying 0) while magnus_sni_extract() is
+ * attempted against what has accumulated so far. Once a cluster is picked
+ * and connected, those same buffered bytes are exactly what
+ * magnus_stream_pump() needs to flush to the upstream first -- they are
+ * genuinely part of the ClientHello the backend must see unmodified for
+ * passthrough to mean anything, so reusing this buffer rather than
+ * copying into a separate one is not just an optimization, it is what
+ * makes forwarding them automatic instead of one more thing to remember. */
 typedef struct {
     char buffer[MAGNUS_PROXY_BUFFER];
     size_t length;
@@ -497,40 +540,60 @@ typedef struct {
     bool dest_shutdown;
 } magnus_stream_pipe_t;
 
+typedef enum {
+    /* Buffering the client's initial bytes into c2u, looking for a TLS
+     * SNI hostname to route on -- only ever entered when at least one
+     * stream_sni_route is configured; a deployment with none goes
+     * straight to CONNECTING; see magnus_stream_accept()'s own comment. */
+    MAGNUS_STREAM_PEEKING,
+    /* upstream_fd is open; connect() not yet confirmed. */
+    MAGNUS_STREAM_CONNECTING,
+    /* Fully connected; ordinary bidirectional pumping. */
+    MAGNUS_STREAM_RELAYING
+} magnus_stream_conn_stage_t;
+
 /* One L4 passthrough connection: a client fd, the upstream fd it was
- * matched to at accept time (never re-picked later -- unlike the L7 proxy,
- * there is no retry budget here, since by the time any bytes have been
- * read there is no "request" to safely retry, only an already-in-progress
- * byte stream), and one magnus_stream_pipe_t per direction. `connecting`
- * is true from accept time until the upstream connect() is confirmed (an
- * EPOLLOUT event, or synchronously at accept time on a fast/local
- * backend) -- see magnus_stream_service()'s own comment on why writing to
- * (or reading from) a not-yet-connected non-blocking socket in the
- * meantime is still safe. `endpoint_counted` mirrors the same idempotent-
- * release guard magnus_cluster_endpoint_begin()/_end() already needed for
- * the L7 proxy paths (roadmap 2e-1) -- here there is only ever one
- * completion path (magnus_stream_close()), so it is a simpler true-once
- * flag rather than needing to survive multiple possible teardown routes. */
+ * matched to (once picked -- -1 while still MAGNUS_STREAM_PEEKING), and
+ * one magnus_stream_pipe_t per direction. `cluster` is which cluster
+ * `endpoint_index` is an index into -- magnus_stream_cluster itself if
+ * SNI routing is disabled, never matched, or gave up (peek buffer full/
+ * timed out) without a decision, or one of magnus_sni_clusters[] if a
+ * pattern matched. Unlike the L7 proxy, there is no retry budget here --
+ * by the time any bytes have been read there is no "request" to safely
+ * retry, only an already-in-progress byte stream. `endpoint_counted`
+ * mirrors the same idempotent-release guard
+ * magnus_cluster_endpoint_begin()/_end() already needed for the L7 proxy
+ * paths (roadmap 2e-1) -- here there is only ever one completion path
+ * (magnus_stream_close()), so it is a simpler true-once flag rather than
+ * needing to survive multiple possible teardown routes. */
 typedef struct {
     int fd;
     int upstream_fd;
+    magnus_stream_conn_stage_t stage;
+    magnus_cluster_t *cluster;
     size_t endpoint_index;
     bool endpoint_counted;
-    bool connecting;
+    /* Captured once at accept4() time -- magnus_cluster_select()'s own
+     * ip_hash policy, and a peek-timeout/full-buffer fallback decision,
+     * both need it well after the original accept() call has returned. */
+    struct in_addr peer_address;
     time_t last_active;
     time_t connect_started;
+    time_t peek_started;
     magnus_stream_pipe_t c2u;
     magnus_stream_pipe_t u2c;
 } magnus_stream_conn_t;
 
 /* Keyed by the client fd (magnus_stream_owner) and, separately, by the
- * upstream fd (magnus_stream_upstream_owner) -- both point at the same
- * magnus_stream_conn_t, exactly the two-owner-map shape the L7 proxy
- * already uses for magnus_connections{,_upstream_owner}. Active-health
- * probe state for this cluster (TCP-connect only, same reasoning as the
- * gRPC cluster -- see magnus_health_tick()'s own comment) lives in its own
+ * upstream fd (magnus_stream_upstream_owner, unused while still
+ * MAGNUS_STREAM_PEEKING) -- both point at the same magnus_stream_conn_t,
+ * exactly the two-owner-map shape the L7 proxy already uses for
+ * magnus_connections{,_upstream_owner}. Active-health probe state for
+ * magnus_stream_cluster (TCP-connect only, same reasoning as the gRPC
+ * cluster -- see magnus_health_tick()'s own comment) lives in its own
  * third probe array, dispatched from the same magnus_health_tick_cluster()
- * roadmap 2f already generalized for exactly this. */
+ * roadmap 2f already generalized for exactly this; magnus_sni_clusters[]
+ * gets passive health only -- see its own comment on why. */
 static magnus_stream_conn_t *magnus_stream_owner[MAGNUS_MAX_FDS];
 static magnus_stream_conn_t *magnus_stream_upstream_owner[MAGNUS_MAX_FDS];
 /* magnus_stream_health_probes/_last_probe/_probe_owner (same shape as the
@@ -6750,6 +6813,33 @@ magnus_build_metrics(char *out, size_t out_capacity)
             if (line2 < 0 || (size_t) line2 >= out_capacity - written) return;
             written += (size_t) line2;
         }
+        /* TLS passthrough / SNI routing (roadmap 3b) -- one gauge line
+         * per (pattern, endpoint) pair across every configured
+         * stream_sni_route cluster; empty (no extra lines at all) when
+         * none are configured, same as the base block above already is
+         * when stream_listen itself is unused. */
+        if (magnus_sni_cluster_count > 0 && written < out_capacity) {
+            int line3 = snprintf(out + written, out_capacity - written,
+                "# TYPE magnus_stream_sni_upstream_healthy gauge\n");
+            if (line3 > 0 && (size_t) line3 < out_capacity - written)
+                written += (size_t) line3;
+        }
+        for (size_t route_index = 0; route_index < magnus_sni_cluster_count
+             && written < out_capacity; route_index++) {
+            magnus_sni_cluster_t *route = &magnus_sni_clusters[route_index];
+            for (size_t index = 0; index < route->cluster.count
+                 && written < out_capacity; index++) {
+                int line4 = snprintf(out + written, out_capacity - written,
+                    "magnus_stream_sni_upstream_healthy{pattern=\"%s\","
+                    "endpoint=\"%s:%u\"} %d\n",
+                    route->pattern, route->cluster.endpoints[index].address,
+                    route->cluster.endpoints[index].port,
+                    route->cluster.endpoints[index].healthy ? 1 : 0);
+                if (line4 < 0 || (size_t) line4 >= out_capacity - written)
+                    return;
+                written += (size_t) line4;
+            }
+        }
     }
 
     /* Reverse-proxy cache (roadmap 2d-1) -- always emitted (like the
@@ -8259,12 +8349,51 @@ magnus_health_tick(int epoll_fd, time_t now)
                                magnus_stream_endpoint_sockaddr, now, false);
 }
 
-/* L4 TCP passthrough (roadmap 3a): a raw bidirectional byte relay between
- * a client fd and the upstream fd it was matched to at accept time -- no
- * HTTP parsing, no framing awareness of any kind. Everything below mirrors
- * established patterns elsewhere in this file (the L7 proxy's own
- * buffered-write backpressure, the active-health probe's own epoll-
- * interest rearming) rather than inventing new ones. */
+/* L4 TCP passthrough (roadmap 3a), extended with TLS passthrough / SNI
+ * routing (3b): a raw bidirectional byte relay between a client fd and
+ * the upstream fd it was matched to -- no HTTP parsing, no framing
+ * awareness of any kind, and (3b) no TLS termination either, just enough
+ * of a peek at the ClientHello to decide which cluster's endpoint to
+ * relay to. Everything below mirrors established patterns elsewhere in
+ * this file (the L7 proxy's own buffered-write backpressure, the
+ * active-health probe's own epoll-interest rearming) rather than
+ * inventing new ones. */
+
+/* First pattern match wins, config-file order, same evaluation order
+ * `route` already uses for L7. Returns NULL (caller falls back to
+ * magnus_stream_cluster) when SNI routing is disabled entirely
+ * (magnus_sni_cluster_count == 0, the common case for a deployment that
+ * never configured stream_sni_route) or when `hostname` matches none of
+ * the configured patterns. */
+static magnus_cluster_t *
+magnus_sni_select_cluster(const char *hostname)
+{
+    for (size_t index = 0; index < magnus_sni_cluster_count; index++) {
+        if (magnus_sni_pattern_matches(magnus_sni_clusters[index].pattern,
+                                       hostname))
+            return &magnus_sni_clusters[index].cluster;
+    }
+    return NULL;
+}
+
+/* Generic sockaddr resolver taking an explicit cluster, unlike
+ * magnus_endpoint_sockaddr()/magnus_grpc_endpoint_sockaddr()/
+ * magnus_stream_endpoint_sockaddr() (each implicitly bound to one fixed
+ * global cluster, for magnus_health_tick()'s own fixed-signature probe
+ * callback) -- needed here because a stream connection's eventual
+ * cluster is only known at connect time, picked fresh per connection
+ * from either magnus_stream_cluster or one of magnus_sni_clusters[]. */
+static bool
+magnus_cluster_endpoint_sockaddr(magnus_cluster_t *cluster, size_t index,
+                                 struct sockaddr_in *out)
+{
+    if (index >= cluster->count) return false;
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port = htons((uint16_t) cluster->endpoints[index].port);
+    return inet_pton(AF_INET, cluster->endpoints[index].address,
+                     &out->sin_addr) == 1;
+}
 
 static bool
 magnus_stream_pipe_done(const magnus_stream_pipe_t *pipe)
@@ -8342,11 +8471,13 @@ magnus_stream_pump(magnus_stream_pipe_t *pipe, int source_fd, int dest_fd,
 /* Recomputes and applies both fds' epoll interest from current pipe state,
  * unconditionally (an extra epoll_ctl MOD when nothing actually changed
  * is cheap and simple to reason about -- the same trade-off
- * magnus_health_rearm() already makes). EPOLLIN on a side is only asked
- * for while the pipe it feeds has room (i.e. is fully flushed) and its
- * source has not EOF'd; EPOLLOUT is only asked for while there is
- * something buffered to flush toward it, or (upstream_fd only) while the
- * connect() itself is still outstanding. */
+ * magnus_health_rearm() already makes). While still MAGNUS_STREAM_PEEKING
+ * there is no upstream_fd yet, so only the client fd (plain EPOLLIN,
+ * looking for more ClientHello bytes) is touched at all. Once connected,
+ * EPOLLIN on a side is only asked for while the pipe it feeds has room
+ * (i.e. is fully flushed) and its source has not EOF'd; EPOLLOUT is only
+ * asked for while there is something buffered to flush toward it, or
+ * (upstream_fd only) while the connect() itself is still outstanding. */
 static void
 magnus_stream_rearm(int epoll_fd, magnus_stream_conn_t *conn)
 {
@@ -8354,13 +8485,21 @@ magnus_stream_rearm(int epoll_fd, magnus_stream_conn_t *conn)
     uint32_t client_events = EPOLLRDHUP;
     uint32_t upstream_events = EPOLLRDHUP;
 
+    if (conn->stage == MAGNUS_STREAM_PEEKING) {
+        event = (struct epoll_event) { .events = EPOLLIN | EPOLLRDHUP,
+                                       .data.fd = conn->fd };
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &event);
+        return;
+    }
+
     if (!conn->c2u.source_eof && conn->c2u.length == conn->c2u.sent)
         client_events |= EPOLLIN;
     if (conn->u2c.length > conn->u2c.sent)
         client_events |= EPOLLOUT;
     if (!conn->u2c.source_eof && conn->u2c.length == conn->u2c.sent)
         upstream_events |= EPOLLIN;
-    if (conn->c2u.length > conn->c2u.sent || conn->connecting)
+    if (conn->c2u.length > conn->c2u.sent
+        || conn->stage == MAGNUS_STREAM_CONNECTING)
         upstream_events |= EPOLLOUT;
 
     event = (struct epoll_event) { .events = client_events, .data.fd = conn->fd };
@@ -8376,15 +8515,175 @@ magnus_stream_close(int epoll_fd, magnus_stream_conn_t *conn)
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
     magnus_stream_owner[conn->fd] = NULL;
     close(conn->fd);
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->upstream_fd, NULL);
-    magnus_stream_upstream_owner[conn->upstream_fd] = NULL;
-    close(conn->upstream_fd);
+    /* upstream_fd is still -1 for a connection that never made it past
+     * MAGNUS_STREAM_PEEKING (client closed, or the peek buffer filled/
+     * timed out and even the default-cluster fallback connect() itself
+     * failed) -- guarded the same way magnus_close_connection() already
+     * guards its own upstream_fd, for the same reason (calloc() zero-
+     * initializes this field to 0, a live fd, not -1). */
+    if (conn->upstream_fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->upstream_fd, NULL);
+        magnus_stream_upstream_owner[conn->upstream_fd] = NULL;
+        close(conn->upstream_fd);
+    }
     if (conn->endpoint_counted) {
-        magnus_cluster_endpoint_end(&magnus_stream_cluster, conn->endpoint_index);
+        magnus_cluster_endpoint_end(conn->cluster, conn->endpoint_index);
         conn->endpoint_counted = false;
     }
     if (magnus_stream_connections_active > 0) magnus_stream_connections_active--;
     free(conn);
+}
+
+/* Opens a non-blocking connect() to endpoint `selected` of `cluster` for
+ * a connection that has already been accepted (conn->fd already
+ * registered with epoll) -- shared by magnus_stream_accept()'s own
+ * immediate-connect path (SNI routing disabled) and
+ * magnus_stream_peek_decide() below (SNI routing enabled, decision just
+ * made). Registers the new upstream fd with epoll and transitions
+ * conn->stage to MAGNUS_STREAM_CONNECTING or (synchronous connect,
+ * typical for loopback/LAN targets) straight to MAGNUS_STREAM_RELAYING,
+ * resolving the circuit-breaker result immediately in that case, same as
+ * every other synchronous-completion path in this file. Only ever
+ * cleans up what it itself opened on failure -- the caller is
+ * responsible for tearing down the rest of `conn`. */
+static bool
+magnus_stream_connect(int epoll_fd, magnus_stream_conn_t *conn,
+                      magnus_cluster_t *cluster, size_t selected)
+{
+    struct sockaddr_in upstream_address;
+    int upstream_fd;
+    int connect_result;
+    int one = 1;
+    struct epoll_event event;
+
+    if (!magnus_cluster_endpoint_sockaddr(cluster, selected, &upstream_address))
+        return false;
+    upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (upstream_fd < 0 || upstream_fd >= MAGNUS_MAX_FDS) {
+        if (upstream_fd >= 0) close(upstream_fd);
+        return false;
+    }
+    connect_result = connect(upstream_fd, (struct sockaddr *) &upstream_address,
+                             sizeof(upstream_address));
+    if (connect_result < 0 && errno != EINPROGRESS) {
+        magnus_cluster_result(cluster, selected, false, magnus_now_ms());
+        close(upstream_fd);
+        return false;
+    }
+    (void) setsockopt(upstream_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    event = (struct epoll_event) {
+        .events = (uint32_t) (connect_result != 0 ? EPOLLOUT : EPOLLIN)
+                  | EPOLLRDHUP,
+        .data.fd = upstream_fd
+    };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, upstream_fd, &event) < 0) {
+        close(upstream_fd);
+        return false;
+    }
+    conn->upstream_fd = upstream_fd;
+    conn->cluster = cluster;
+    conn->endpoint_index = selected;
+    conn->connect_started = time(NULL);
+    magnus_cluster_endpoint_begin(cluster, selected);
+    conn->endpoint_counted = true;
+    magnus_stream_upstream_owner[upstream_fd] = conn;
+    conn->stage = connect_result != 0 ? MAGNUS_STREAM_CONNECTING
+                                       : MAGNUS_STREAM_RELAYING;
+    if (connect_result == 0) {
+        magnus_cluster_result(cluster, selected, true, magnus_now_ms());
+    }
+    return true;
+}
+
+/* Finalizes a MAGNUS_STREAM_PEEKING decision: `cluster` is the SNI
+ * cluster a matched ClientHello picked, or NULL for every other outcome
+ * (no stream_sni_route configured at all, a parsed-but-unmatched
+ * hostname, a definitively-not-TLS or malformed ClientHello, the peek
+ * buffer filling up without ever resolving, the client closing before
+ * sending enough bytes to decide, or a peek timeout) -- all of which
+ * fall back to the plain, always-present magnus_stream_cluster, exactly
+ * the fallback behavior this roadmap increment was scoped to have.
+ * Whatever bytes already sit in conn->c2u.buffer (the real ClientHello
+ * prefix, peeked but never consumed) are left in place;
+ * magnus_stream_connect()'s own synchronous-connect case flushes them
+ * immediately below when possible, same as any other synchronous-
+ * completion path in this file -- otherwise the ordinary pump on the
+ * first upstream-writable event picks them up. */
+static void
+magnus_stream_peek_decide(int epoll_fd, magnus_stream_conn_t *conn,
+                          magnus_cluster_t *cluster)
+{
+    int selected;
+
+    if (cluster == NULL) cluster = &magnus_stream_cluster;
+    selected = magnus_cluster_select(cluster, magnus_now_ms(), NULL,
+                                     conn->peer_address);
+    if (selected < 0
+        || !magnus_stream_connect(epoll_fd, conn, cluster, (size_t) selected)) {
+        magnus_stream_close(epoll_fd, conn);
+        return;
+    }
+    if (conn->stage == MAGNUS_STREAM_RELAYING && conn->c2u.length > 0) {
+        if (!magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
+                                &magnus_stream_bytes_c2u_total)) {
+            magnus_stream_close(epoll_fd, conn);
+            return;
+        }
+    }
+    magnus_stream_rearm(epoll_fd, conn);
+}
+
+/* Reads more of the client's initial bytes directly into conn->c2u.buffer
+ * (see magnus_stream_pipe_t's own comment on why that buffer specifically,
+ * not a separate one) and attempts magnus_sni_extract() against what has
+ * accumulated -- called both right after accept() (in case the
+ * ClientHello arrived as part of the client's very first flight of
+ * bytes, resolving synchronously) and from every subsequent EPOLLIN event
+ * on the client fd while still MAGNUS_STREAM_PEEKING. Every exit funnels
+ * through magnus_stream_peek_decide() above once an outcome is known;
+ * MAGNUS_SNI_INCOMPLETE alone loops back to read further immediately
+ * rather than waiting for another epoll event, matching this file's own
+ * "resolve as far as possible synchronously" convention. */
+static void
+magnus_stream_advance_peek(int epoll_fd, magnus_stream_conn_t *conn)
+{
+    for (;;) {
+        ssize_t received;
+        char hostname[MAGNUS_SNI_HOSTNAME_MAX];
+        magnus_sni_result_t result;
+
+        if (conn->c2u.length >= sizeof(conn->c2u.buffer)) {
+            magnus_stream_peek_decide(epoll_fd, conn, NULL);
+            return;
+        }
+        received = read(conn->fd, conn->c2u.buffer + conn->c2u.length,
+                        sizeof(conn->c2u.buffer) - conn->c2u.length);
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                magnus_stream_rearm(epoll_fd, conn);
+                return;
+            }
+            magnus_stream_close(epoll_fd, conn);
+            return;
+        }
+        if (received == 0) {
+            /* Client closed before ever sending a resolvable ClientHello.
+             * Falls back like any other unresolved peek rather than being
+             * special-cased -- the default cluster's own connect (or the
+             * pump once connected, finding the client side already at
+             * EOF) unwinds this the normal way. */
+            magnus_stream_peek_decide(epoll_fd, conn, NULL);
+            return;
+        }
+        conn->c2u.length += (size_t) received;
+
+        result = magnus_sni_extract((const unsigned char *) conn->c2u.buffer,
+                                    conn->c2u.length, hostname, sizeof(hostname));
+        if (result == MAGNUS_SNI_INCOMPLETE) continue;
+        magnus_stream_peek_decide(epoll_fd, conn,
+            result == MAGNUS_SNI_OK ? magnus_sni_select_cluster(hostname) : NULL);
+        return;
+    }
 }
 
 /* Called for every epoll event on either of `conn`'s two fds -- `fd`/
@@ -8396,7 +8695,7 @@ magnus_stream_close(int epoll_fd, magnus_stream_conn_t *conn)
  * to do (magnus_stream_pump() returns almost immediately on EAGAIN), and
  * avoids having to reason precisely about which flag combination implies
  * which direction needs servicing. Writing to (or reading from)
- * conn->upstream_fd while conn->connecting is still true is safe on
+ * conn->upstream_fd while still MAGNUS_STREAM_CONNECTING is safe on
  * Linux -- both simply return EAGAIN/EWOULDBLOCK until the connection
  * actually completes, which magnus_stream_pump() already treats as
  * "nothing to do yet". */
@@ -8405,7 +8704,15 @@ magnus_stream_service(int epoll_fd, magnus_stream_conn_t *conn, int fd,
                       uint32_t flags)
 {
     conn->last_active = time(NULL);
-    if (conn->connecting && fd == conn->upstream_fd) {
+    if (conn->stage == MAGNUS_STREAM_PEEKING) {
+        if ((flags & EPOLLERR) != 0) {
+            magnus_stream_close(epoll_fd, conn);
+            return;
+        }
+        magnus_stream_advance_peek(epoll_fd, conn);
+        return;
+    }
+    if (conn->stage == MAGNUS_STREAM_CONNECTING && fd == conn->upstream_fd) {
         bool success = false;
         if ((flags & (EPOLLERR | EPOLLHUP)) == 0) {
             int error = 0;
@@ -8413,13 +8720,13 @@ magnus_stream_service(int epoll_fd, magnus_stream_conn_t *conn, int fd,
             success = getsockopt(conn->upstream_fd, SOL_SOCKET, SO_ERROR,
                                  &error, &length) == 0 && error == 0;
         }
-        magnus_cluster_result(&magnus_stream_cluster, conn->endpoint_index,
-                              success, magnus_now_ms());
+        magnus_cluster_result(conn->cluster, conn->endpoint_index, success,
+                              magnus_now_ms());
         if (!success) {
             magnus_stream_close(epoll_fd, conn);
             return;
         }
-        conn->connecting = false;
+        conn->stage = MAGNUS_STREAM_RELAYING;
     }
     if ((flags & EPOLLERR) != 0
         || !magnus_stream_pump(&conn->c2u, conn->fd, conn->upstream_fd,
@@ -8436,16 +8743,16 @@ magnus_stream_service(int epoll_fd, magnus_stream_conn_t *conn, int fd,
     magnus_stream_rearm(epoll_fd, conn);
 }
 
-/* Accepts every currently-pending connection on magnus_stream_listener,
- * picks an endpoint (magnus_stream_cluster.policy -- no cookie-based
- * affinity, since there is no HTTP-level cookie at L4; ip_hash is the
- * client-IP-consistent option instead), and opens a matched non-blocking
- * connect() to it. Unlike the L7 proxy path there is no retry budget: an
- * L4 tunnel has no "request" to safely retry once any bytes have moved,
- * and a connect()-stage failure here is reported the same way a real
- * client would see any other closed door -- an immediately-reset client
- * connection, via magnus_stream_close() once magnus_stream_service()'s
- * own connecting-confirmation branch observes the failure. */
+/* Accepts every currently-pending connection on magnus_stream_listener.
+ * With no stream_sni_route configured at all (the common case), an
+ * endpoint of magnus_stream_cluster is picked and connected immediately,
+ * exactly as roadmap 3a always did -- zero peeking overhead for a
+ * deployment that never asked for SNI routing. Otherwise the connection
+ * starts MAGNUS_STREAM_PEEKING and magnus_stream_advance_peek() takes it
+ * from there. Unlike the L7 proxy path there is no retry budget: an L4
+ * tunnel has no "request" to safely retry once any bytes have moved, and
+ * a connect()-stage failure is reported the same way a real client would
+ * see any other closed door -- an immediately-reset connection. */
 static void
 magnus_stream_accept(int epoll_fd)
 {
@@ -8456,10 +8763,6 @@ magnus_stream_accept(int epoll_fd)
                              (struct sockaddr *) &peer_address, &peer_length,
                              SOCK_NONBLOCK | SOCK_CLOEXEC);
         magnus_stream_conn_t *conn;
-        struct sockaddr_in upstream_address;
-        int upstream_fd;
-        int connect_result;
-        int selected;
         int one = 1;
         struct epoll_event event;
 
@@ -8472,75 +8775,40 @@ magnus_stream_accept(int epoll_fd)
             close(client);
             continue;
         }
-        selected = magnus_cluster_select(&magnus_stream_cluster, magnus_now_ms(),
-                                         NULL, peer_address.sin_addr);
-        if (selected < 0
-            || !magnus_stream_endpoint_sockaddr((size_t) selected,
-                                                &upstream_address)) {
-            close(client);
-            continue;
-        }
-        upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (upstream_fd < 0 || upstream_fd >= MAGNUS_MAX_FDS) {
-            if (upstream_fd >= 0) close(upstream_fd);
-            close(client);
-            continue;
-        }
-        connect_result = connect(upstream_fd, (struct sockaddr *) &upstream_address,
-                                 sizeof(upstream_address));
-        if (connect_result < 0 && errno != EINPROGRESS) {
-            magnus_cluster_result(&magnus_stream_cluster, (size_t) selected,
-                                  false, magnus_now_ms());
-            close(upstream_fd);
-            close(client);
-            continue;
-        }
         conn = calloc(1, sizeof(*conn));
         if (conn == NULL) {
-            close(upstream_fd);
             close(client);
             continue;
         }
         conn->fd = client;
-        conn->upstream_fd = upstream_fd;
-        conn->endpoint_index = (size_t) selected;
-        conn->connecting = connect_result != 0;
+        conn->upstream_fd = -1;
+        conn->peer_address = peer_address.sin_addr;
         conn->last_active = time(NULL);
-        conn->connect_started = conn->last_active;
+        conn->peek_started = conn->last_active;
         (void) setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        (void) setsockopt(upstream_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         event = (struct epoll_event) { .events = EPOLLIN | EPOLLRDHUP,
                                        .data.fd = client };
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client, &event) < 0) {
-            close(upstream_fd);
             close(client);
             free(conn);
             continue;
         }
-        event = (struct epoll_event) {
-            .events = (uint32_t) (conn->connecting ? EPOLLOUT : EPOLLIN)
-                      | EPOLLRDHUP,
-            .data.fd = upstream_fd
-        };
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, upstream_fd, &event) < 0) {
-            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client, NULL);
-            close(upstream_fd);
-            close(client);
-            free(conn);
-            continue;
-        }
-        magnus_cluster_endpoint_begin(&magnus_stream_cluster, conn->endpoint_index);
-        conn->endpoint_counted = true;
         magnus_stream_owner[client] = conn;
-        magnus_stream_upstream_owner[upstream_fd] = conn;
         magnus_stream_connections_total++;
         magnus_stream_connections_active++;
-        if (!conn->connecting) {
-            /* connected synchronously (typical for loopback/LAN targets) --
-             * resolve the circuit-breaker result immediately, same as
-             * every other connect()-confirmation path in this file. */
-            magnus_cluster_result(&magnus_stream_cluster, conn->endpoint_index,
-                                  true, magnus_now_ms());
+
+        if (magnus_sni_cluster_count == 0) {
+            int selected = magnus_cluster_select(&magnus_stream_cluster,
+                magnus_now_ms(), NULL, conn->peer_address);
+            if (selected < 0
+                || !magnus_stream_connect(epoll_fd, conn, &magnus_stream_cluster,
+                                          (size_t) selected)) {
+                magnus_stream_close(epoll_fd, conn);
+                continue;
+            }
+        } else {
+            conn->stage = MAGNUS_STREAM_PEEKING;
+            magnus_stream_advance_peek(epoll_fd, conn);
         }
     }
 }
@@ -8548,21 +8816,31 @@ magnus_stream_accept(int epoll_fd)
 /* 1Hz sweep companion to magnus_expire_idle(): a stream connection with no
  * bytes flowing in either direction for MAGNUS_IDLE_SECONDS is closed
  * (the same idle budget every other connection type in this file already
- * uses), and one still waiting on its upstream connect() past
- * MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS is treated as a connect failure.
- * Walks magnus_stream_owner (keyed by client fd) only, never
- * magnus_stream_upstream_owner -- both point at the same connections, so
- * walking both would visit (and double-close) each one twice. */
+ * uses); one still MAGNUS_STREAM_PEEKING past
+ * MAGNUS_STREAM_PEEK_TIMEOUT_SECONDS gives up and falls back to the
+ * default cluster via magnus_stream_peek_decide() (the same outcome a
+ * parsed-but-unmatched or malformed ClientHello already gets, just
+ * triggered by a stalled/slow client instead of a parse result); one
+ * still MAGNUS_STREAM_CONNECTING past MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS
+ * is treated as a connect failure. Walks magnus_stream_owner (keyed by
+ * client fd) only, never magnus_stream_upstream_owner -- both point at
+ * the same connections, so walking both would visit (and double-close)
+ * each one twice. */
 static void
 magnus_stream_expire_idle(int epoll_fd, time_t now)
 {
     for (int fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
         magnus_stream_conn_t *conn = magnus_stream_owner[fd];
         if (conn == NULL) continue;
-        if (conn->connecting
+        if (conn->stage == MAGNUS_STREAM_PEEKING
+            && now - conn->peek_started >= MAGNUS_STREAM_PEEK_TIMEOUT_SECONDS) {
+            magnus_stream_peek_decide(epoll_fd, conn, NULL);
+            continue;
+        }
+        if (conn->stage == MAGNUS_STREAM_CONNECTING
             && now - conn->connect_started >= MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS) {
-            magnus_cluster_result(&magnus_stream_cluster, conn->endpoint_index,
-                                  false, magnus_now_ms());
+            magnus_cluster_result(conn->cluster, conn->endpoint_index, false,
+                                  magnus_now_ms());
             magnus_stream_close(epoll_fd, conn);
             continue;
         }
@@ -8651,6 +8929,7 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_cluster_t new_cluster;
     magnus_cluster_t new_grpc_cluster;
     magnus_cluster_t new_stream_cluster;
+    magnus_sni_cluster_t new_sni_clusters[MAGNUS_CONFIG_MAX_SNI_ROUTES];
     size_t index;
 
     if (config->has_root) {
@@ -8732,6 +9011,32 @@ magnus_apply_config(const magnus_config_t *config)
             return -1;
         }
     }
+    /* TLS passthrough / SNI routing (roadmap 3b): one independent cluster
+     * per configured pattern, round_robin only (no active health probe,
+     * no configurable policy -- see magnus_config_sni_route_t's own
+     * comment on why this is a deliberate, documented scope cut for this
+     * increment) but still sharing the same passive circuit-breaker
+     * failure_threshold/cooldown every other cluster in this file uses.
+     * Hot-reloadable, unlike stream_listen itself: adding, removing, or
+     * changing a pattern's endpoints touches no listening socket. */
+    for (index = 0; index < config->sni_route_count; index++) {
+        magnus_cluster_init(&new_sni_clusters[index].cluster,
+                            config->health_check_failure_threshold,
+                            (uint64_t) config->health_check_cooldown_seconds
+                            * 1000, MAGNUS_LB_ROUND_ROBIN);
+        strcpy(new_sni_clusters[index].pattern, config->sni_routes[index].pattern);
+        for (size_t j = 0; j < config->sni_routes[index].upstream_count; j++) {
+            if (magnus_cluster_add(&new_sni_clusters[index].cluster,
+                                   config->sni_routes[index].upstreams[j].address,
+                                   config->sni_routes[index].upstreams[j].port,
+                                   config->sni_routes[index].upstreams[j].weight)
+                != 0) {
+                if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+                if (new_root_fd >= 0) close(new_root_fd);
+                return -1;
+            }
+        }
+    }
 
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     magnus_root_fd = new_root_fd;
@@ -8762,6 +9067,13 @@ magnus_apply_config(const magnus_config_t *config)
      * here; only the active-health probe array (reset in the loop below,
      * alongside the other two clusters) needs it. */
     magnus_stream_cluster = new_stream_cluster;
+    /* No active-health probe array or connection pool exists for these
+     * (see the comment where new_sni_clusters[] was built above), so a
+     * straight overwrite is the whole swap -- no flush/reset step
+     * equivalent to the ones around it needed. */
+    for (size_t i = 0; i < config->sni_route_count; i++)
+        magnus_sni_clusters[i] = new_sni_clusters[i];
+    magnus_sni_cluster_count = config->sni_route_count;
     /* Same stale-by-position hazard once more (roadmap 2f): an in-flight
      * active-health probe for old position N belongs to whatever backend
      * used to be there, not necessarily the new cluster's position N.
@@ -9056,6 +9368,75 @@ magnus_parse_options(int argc, char **argv)
             } else {
                 break;
             }
+        } else if (strcmp(argv[index], "--stream-sni-route") == 0) {
+            /* "<pattern> <ipv4:port[:weight]>", same shape as the
+             * config-file stream_sni_route key; repeatable, and multiple
+             * invocations sharing the same pattern accumulate into that
+             * pattern's own cluster, same as --stream-upstream does for
+             * the plain one. */
+            char outer_spec[256];
+            char *outer_saveptr = NULL;
+            char *pattern;
+            char *upstream_text;
+            const char *pattern_shape;
+            char inner_spec[80];
+            char *inner_saveptr = NULL;
+            char *address;
+            char *port_text;
+            char *weight_text;
+            char *end;
+            unsigned long upstream_port;
+            unsigned long weight = 1;
+            struct in_addr probe;
+            magnus_sni_cluster_t *route = NULL;
+            size_t i;
+
+            if (strlen(argv[index + 1]) >= sizeof(outer_spec)) break;
+            strcpy(outer_spec, argv[index + 1]);
+            pattern = strtok_r(outer_spec, " \t", &outer_saveptr);
+            upstream_text = strtok_r(NULL, " \t", &outer_saveptr);
+            if (pattern == NULL || upstream_text == NULL
+                || strtok_r(NULL, " \t", &outer_saveptr) != NULL) break;
+            pattern_shape = (pattern[0] == '*' && pattern[1] == '.')
+                ? pattern + 2 : pattern;
+            if (strlen(pattern) >= sizeof(route->pattern)
+                || !magnus_config_looks_like_hostname(pattern_shape)) break;
+
+            if (strlen(upstream_text) >= sizeof(inner_spec)) break;
+            strcpy(inner_spec, upstream_text);
+            address = strtok_r(inner_spec, ":", &inner_saveptr);
+            port_text = strtok_r(NULL, ":", &inner_saveptr);
+            weight_text = strtok_r(NULL, ":", &inner_saveptr);
+            if (address == NULL || port_text == NULL) break;
+            if (inet_pton(AF_INET, address, &probe) != 1) break;
+            errno = 0;
+            upstream_port = strtoul(port_text, &end, 10);
+            if (errno != 0 || *end != '\0' || upstream_port == 0
+                || upstream_port > 65535) break;
+            if (weight_text != NULL) {
+                errno = 0;
+                weight = strtoul(weight_text, &end, 10);
+                if (errno != 0 || *end != '\0' || weight == 0
+                    || weight > 1000) break;
+            }
+
+            for (i = 0; i < magnus_sni_cluster_count; i++) {
+                if (strcmp(magnus_sni_clusters[i].pattern, pattern) == 0) {
+                    route = &magnus_sni_clusters[i];
+                    break;
+                }
+            }
+            if (route == NULL) {
+                if (magnus_sni_cluster_count == MAGNUS_CONFIG_MAX_SNI_ROUTES)
+                    break;
+                route = &magnus_sni_clusters[magnus_sni_cluster_count++];
+                magnus_cluster_init(&route->cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                                    MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
+                strcpy(route->pattern, pattern);
+            }
+            if (magnus_cluster_add(&route->cluster, address,
+                                   (unsigned) upstream_port,
+                                   (unsigned) weight) != 0) break;
         } else if (strcmp(argv[index], "--rate-limit") == 0) {
             /* requests-per-second, or requests-per-second:burst */
             char spec[32];
@@ -9236,6 +9617,11 @@ magnus_parse_options(int argc, char **argv)
                         "--port\n");
         exit(2);
     }
+    if (!magnus_stream_enabled && magnus_sni_cluster_count > 0) {
+        fprintf(stderr, "magnus: --stream-sni-route needs "
+                        "--stream-listen\n");
+        exit(2);
+    }
     if (index == argc && port != 0
         && ((certificate == NULL && private_key == NULL)
             || (certificate != NULL && private_key != NULL))) {
@@ -9273,6 +9659,8 @@ magnus_parse_options(int argc, char **argv)
                     "[--stream-listen <1-65535> --stream-upstream "
                     "<ipv4:port[:weight]> ...] "
                     "[--stream-lb-policy round_robin|least_conn|ip_hash] "
+                    "[--stream-sni-route "
+                    "'<pattern> <ipv4:port[:weight]>' ...] "
                     "[--route <spec> ...] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);

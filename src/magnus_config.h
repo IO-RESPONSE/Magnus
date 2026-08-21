@@ -18,6 +18,13 @@
  * has far fewer distinct backend clusters than a general reverse-proxy
  * fleet might, so 8 is generous without copying the 16 bound blindly. */
 #define MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS 8
+/* TLS passthrough / SNI routing (roadmap 3b): a modest cap on the number
+ * of *distinct patterns*, matching MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own
+ * "a real deployment has far fewer of these than the main upstream list"
+ * reasoning -- each pattern still gets up to MAGNUS_CONFIG_MAX_UPSTREAMS
+ * endpoints of its own. */
+#define MAGNUS_CONFIG_MAX_SNI_ROUTES 8
+#define MAGNUS_CONFIG_SNI_PATTERN_MAX 128
 
 typedef struct {
     struct in_addr network;
@@ -35,6 +42,15 @@ typedef struct {
     unsigned port;
     unsigned weight;
 } magnus_config_upstream_t;
+
+typedef struct {
+    /* An exact hostname, or a `*.` prefix followed by one -- see
+     * magnus_sni_pattern_matches() (magnus_sni.h) for the exact matching
+     * rule this drives at runtime. */
+    char pattern[MAGNUS_CONFIG_SNI_PATTERN_MAX];
+    size_t upstream_count;
+    magnus_config_upstream_t upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
+} magnus_config_sni_route_t;
 
 /* The full, validated shape of a magnus data-plane config file. Every
  * field here has already passed magnus_config_load()'s schema check --
@@ -80,6 +96,24 @@ typedef struct {
     size_t stream_upstream_count;
     magnus_config_upstream_t stream_upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
     magnus_lb_policy_t stream_lb_policy;
+    /* TLS passthrough / SNI routing (roadmap 3b): layered on top of the
+     * stream cluster above, never a replacement for it -- a connection
+     * whose peeked ClientHello either does not parse, carries no SNI, or
+     * matches none of these patterns falls back to the plain
+     * stream_upstream cluster (which stream_listen already requires be
+     * present). Each `stream_sni_route` line names one pattern plus one
+     * endpoint; multiple lines sharing the same pattern accumulate into
+     * that pattern's own cluster, first-match-wins in file order, the
+     * same evaluation order `route` already uses. Every matched
+     * cluster gets its own passive (connect-result) health tracking,
+     * same circuit-breaker mechanics as every other cluster in this
+     * codebase, but deliberately no active probe of its own in this
+     * increment (round_robin only, no configurable policy) -- a
+     * dynamic, unbounded-in-principle set of small clusters is a
+     * distinct future increment away from the "one active-probe-array
+     * per cluster" shape every other cluster here already uses. */
+    size_t sni_route_count;
+    magnus_config_sni_route_t sni_routes[MAGNUS_CONFIG_MAX_SNI_ROUTES];
     bool has_rate_limit;
     double rate_limit_rps;
     double rate_limit_burst;
@@ -136,7 +170,11 @@ typedef enum {
  *     _failure_threshold/_cooldown_seconds are all positive integers,
  *     stream_upstream must be a literal IPv4 address (not a hostname),
  *     stream_lb_policy is the same enum as lb_policy, stream_listen
- *     requires at least one stream_upstream and vice versa)
+ *     requires at least one stream_upstream and vice versa,
+ *     stream_sni_route is "<pattern> <ipv4:port[:weight]>" -- pattern is
+ *     an exact hostname or a `*.`-prefixed one, endpoint is a literal
+ *     IPv4 address same as stream_upstream, and stream_sni_route
+ *     requires stream_listen)
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
  *     lb_policy defaults to "round_robin" when omitted; health_check_path
@@ -145,7 +183,8 @@ typedef enum {
  *     2, health_check_failure_threshold to 3, health_check_cooldown_seconds
  *     to 5; stream_listen is optional (the L4 passthrough listener does
  *     not exist at all when omitted); stream_lb_policy defaults to
- *     "round_robin" when omitted
+ *     "round_robin" when omitted; stream_sni_route defaults to none (every
+ *     stream connection uses the plain stream_upstream cluster)
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

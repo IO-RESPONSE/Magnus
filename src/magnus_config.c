@@ -341,6 +341,89 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+        } else if (strcmp(key, "stream_sni_route") == 0) {
+            char spec[256];
+            char *saveptr = NULL;
+            char *pattern;
+            char *upstream_text;
+            const char *pattern_shape;
+            magnus_config_upstream_t upstream;
+            magnus_config_sni_route_t *route = NULL;
+            size_t i;
+
+            if (strlen(value) >= sizeof(spec)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_sni_route' too long");
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(spec, value);
+            pattern = strtok_r(spec, " \t", &saveptr);
+            upstream_text = strtok_r(NULL, " \t", &saveptr);
+            if (pattern == NULL || upstream_text == NULL
+                || strtok_r(NULL, " \t", &saveptr) != NULL) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_sni_route' must be "
+                                        "'<pattern> <ipv4:port[:weight]>', "
+                                        "got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            pattern_shape = (pattern[0] == '*' && pattern[1] == '.')
+                ? pattern + 2 : pattern;
+            if (strlen(pattern) >= sizeof(route->pattern)
+                || !magnus_config_looks_like_hostname(pattern_shape)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_sni_route': invalid "
+                                        "pattern '%s'", pattern);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_parse_upstream(upstream_text, &upstream)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_sni_route': endpoint must "
+                                        "be ipv4:port[:weight], got '%s'",
+                                        upstream_text);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (upstream.is_hostname) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_sni_route': endpoint must "
+                                        "be a literal IPv4 address, not a "
+                                        "hostname (got '%s')",
+                                        upstream.address);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            for (i = 0; i < config->sni_route_count; i++) {
+                if (strcmp(config->sni_routes[i].pattern, pattern) == 0) {
+                    route = &config->sni_routes[i];
+                    break;
+                }
+            }
+            if (route == NULL) {
+                if (config->sni_route_count == MAGNUS_CONFIG_MAX_SNI_ROUTES) {
+                    magnus_config_set_error(error, error_capacity, line_number,
+                                            "too many distinct "
+                                            "'stream_sni_route' patterns "
+                                            "(max %d)",
+                                            MAGNUS_CONFIG_MAX_SNI_ROUTES);
+                    fclose(file);
+                    return MAGNUS_CONFIG_ERROR;
+                }
+                route = &config->sni_routes[config->sni_route_count++];
+                strcpy(route->pattern, pattern);
+            }
+            if (route->upstream_count == MAGNUS_CONFIG_MAX_UPSTREAMS) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'stream_sni_route' "
+                                        "endpoints for pattern '%s' (max %d)",
+                                        pattern, MAGNUS_CONFIG_MAX_UPSTREAMS);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            route->upstreams[route->upstream_count++] = upstream;
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,
@@ -584,6 +667,11 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     if (config->has_stream_listen && config->stream_listen_port == config->port) {
         magnus_config_set_error(error, error_capacity, 0,
                                 "'stream_listen' must differ from 'port'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (!config->has_stream_listen && config->sni_route_count > 0) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'stream_sni_route' needs 'stream_listen'");
         return MAGNUS_CONFIG_ERROR;
     }
     return MAGNUS_CONFIG_OK;

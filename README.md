@@ -155,6 +155,18 @@ independently by IORESPONSE.
   `magnus_stream_connections_total`/`_active`,
   `magnus_stream_bytes_total{direction=...}`, and
   `magnus_stream_upstream_healthy{endpoint=...}`
+- TLS passthrough / SNI routing: routes a stream connection by its TLS
+  ClientHello hostname without ever terminating TLS
+  (`stream_sni_route`/`--stream-sni-route`, `"<pattern>
+  <ipv4:port[:weight]>"`, pattern an exact hostname or a `*.`-prefixed
+  one). Layered on top of the plain `stream_upstream` cluster above, never
+  a replacement for it -- an unmatched hostname, a non-TLS connection, a
+  malformed ClientHello, or a client that never sends enough to decide all
+  fall back to it. The client's initial bytes are peeked (never modified)
+  just far enough to find the SNI extension, then relayed to the matched
+  endpoint exactly as received -- genuine passthrough, not a translation.
+  `/metrics` gained `magnus_stream_sni_upstream_healthy{pattern=...,
+  endpoint=...}`
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

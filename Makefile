@@ -9,7 +9,7 @@ SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
            src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
            src/magnus_proxy.c src/magnus_realip.c src/magnus_route.c \
-           src/magnus_ws.c
+           src/magnus_sni.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -65,9 +65,10 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
 		build/test-base64 build/test-compression build/test-realip \
-		build/test-cache \
+		build/test-cache build/test-sni \
 		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2 \
-		build/fuzz-base64 build/fuzz-compression build/fuzz-realip
+		build/fuzz-base64 build/fuzz-compression build/fuzz-realip \
+		build/fuzz-sni
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
@@ -80,6 +81,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-compression
 	./build/test-realip
 	./build/test-cache
+	./build/test-sni
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
@@ -87,6 +89,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/fuzz-base64
 	./build/fuzz-compression
 	./build/fuzz-realip
+	./build/fuzz-sni
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -182,6 +185,14 @@ build/fuzz-realip: tests/fuzz-realip.c src/magnus_realip.c src/magnus_realip.h \
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-realip.c src/magnus_realip.c \
 		src/magnus_route.c src/magnus_http.c -o $@
+
+build/test-sni: tests/test-sni.c src/magnus_sni.c src/magnus_sni.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-sni.c src/magnus_sni.c -o $@
+
+build/fuzz-sni: tests/fuzz-sni.c src/magnus_sni.c src/magnus_sni.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-sni.c src/magnus_sni.c -o $@
 
 clean:
 	rm -rf build

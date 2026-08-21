@@ -757,6 +757,60 @@ connection-pool and common-request-model decisions).
     scope: TLS passthrough / SNI routing (3b) and UDP (3d) remain
     separate future increments, per this section's own scoping. See
     `CHANGELOG.md` 1.21.0 for the full detail.
+  - **TLS passthrough / SNI routing 3b — route by ClientHello hostname
+    without ever terminating TLS. Shipped in 1.22.0.** New module
+    `magnus_sni.c`/`.h`: a bounded parser reading only as much of a TLS
+    record as is needed to find the `server_name` extension in a
+    ClientHello (RFC 6066 3) -- never a general TLS parser, and
+    deliberately does not handle a ClientHello split across more than one
+    TLS record (vanishingly rare in practice; falls back the same way any
+    other unresolved case does). New `stream_sni_route` config key /
+    `--stream-sni-route` CLI flag: `"<pattern> <ipv4:port[:weight]>"`,
+    pattern either an exact hostname or a `*.`-prefixed one (requiring at
+    least one label before the dot, so `*.example.com` matches
+    `www.example.com` but not `example.com` itself), repeatable and
+    accumulating into that pattern's own independent `magnus_cluster_t`
+    (own round_robin selection, own passive circuit-breaker state) --
+    layered strictly on top of 3a's existing `stream_upstream` cluster,
+    never a replacement for it. A stream connection now has a third stage
+    ahead of connecting/relaying, `MAGNUS_STREAM_PEEKING`, entered only
+    when at least one `stream_sni_route` is configured (zero peeking
+    overhead otherwise, identical to 3a); the client's initial bytes are
+    read directly into the same buffer `magnus_stream_pump()` already uses
+    for its client-to-upstream relay, so once a cluster is picked those
+    genuine ClientHello bytes are exactly what gets flushed to the
+    backend first -- true passthrough, never re-encoded or copied
+    elsewhere. Every unresolved outcome (no `stream_sni_route` configured
+    at all, a parsed-but-unmatched hostname, a definitively-not-TLS or
+    malformed ClientHello, the peek buffer filling up without resolving,
+    the client closing early, or a new `MAGNUS_STREAM_PEEK_TIMEOUT_SECONDS`
+    (5s) timeout) falls back to the plain `stream_upstream` cluster, which
+    `stream_listen` already requires be present. `/metrics` gained
+    `magnus_stream_sni_upstream_healthy{pattern=...,endpoint=...}`.
+    Deliberately out of scope for this increment: active health checking
+    for `stream_sni_route` clusters (passive, connect-result-driven health
+    only -- a dynamic, unbounded-in-principle set of small clusters is a
+    distinct future increment away from the "one active-probe-array per
+    cluster" shape every other cluster in this file already uses) and a
+    configurable per-pattern load-balancing policy (round_robin only,
+    same scope cut the gRPC cluster's own policy already has). Verified
+    live under ASan+UBSan against real ClientHellos captured from
+    Python's own `ssl` module (not hand-typed) across three backends:
+    exact-pattern match, wildcard match, a bare domain correctly *not*
+    matching its own wildcard, an unmatched hostname, and plain non-TLS
+    traffic -- the last three all confirmed falling back to the default
+    cluster, with the matched cases additionally confirmed to relay the
+    original ClientHello bytes byte-for-byte unmodified; a ClientHello
+    trickled in dozens of tiny writes (forcing many separate epoll events
+    through the peek/re-arm loop rather than resolving synchronously in
+    one read) routed identically to the single-write case; a client that
+    never sends anything at all was found and fell back to the default
+    cluster after the peek timeout, not held open indefinitely. New unit
+    and fuzz coverage in `tests/test-sni.c`/`tests/fuzz-sni.c` (200k
+    mutation-based iterations, including a real captured TLS 1.3
+    ClientHello as a seed, not just hand-built ones) and new permanent
+    regression coverage in `tests/test-core.sh`. See `CHANGELOG.md`
+    1.22.0 for the full detail.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
   (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)

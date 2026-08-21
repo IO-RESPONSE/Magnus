@@ -74,6 +74,18 @@ cleanup() {
     kill -TERM "$backend14_pid" >/dev/null 2>&1 || true
     wait "$backend14_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend15_pid:-}" ]; then
+    kill -TERM "$backend15_pid" >/dev/null 2>&1 || true
+    wait "$backend15_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend16_pid:-}" ]; then
+    kill -TERM "$backend16_pid" >/dev/null 2>&1 || true
+    wait "$backend16_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend17_pid:-}" ]; then
+    kill -TERM "$backend17_pid" >/dev/null 2>&1 || true
+    wait "$backend17_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -3367,3 +3379,153 @@ kill -TERM "$backend14_pid" 2>/dev/null
 wait "$backend14_pid" 2>/dev/null || true
 backend14_pid=
 echo "stream: TCP passthrough (round_robin/ip_hash/byte-exact/health-check) ok"
+
+# TLS passthrough / SNI routing (roadmap 3b): a real TLS ClientHello,
+# captured from Python's own ssl module (not hand-typed), is peeked at
+# and routed by SNI without magnus ever terminating TLS -- the labelled
+# backend's own "WELCOME:<label>\n" banner, followed by the raw
+# ClientHello bytes echoed straight back, proves both which endpoint was
+# picked *and* that the original ClientHello prefix reached it byte-for-
+# byte unmodified (true passthrough, not a translation).
+portSniA=$((port + 84))
+portSniB=$((port + 85))
+portSniDefault=$((port + 86))
+labelled_backend "$portSniA" A >/dev/null 2>&1 &
+backend15_pid=$!
+labelled_backend "$portSniB" B >/dev/null 2>&1 &
+backend16_pid=$!
+labelled_backend "$portSniDefault" DEFAULT >/dev/null 2>&1 &
+backend17_pid=$!
+for sni_backend_port in "$portSniA" "$portSniB" "$portSniDefault"; do
+  for attempt in 1 2 3 4 5; do
+    python3 -c "
+import socket
+s = socket.create_connection(('127.0.0.1', $sni_backend_port), timeout=1)
+s.close()
+" 2>/dev/null && break
+    sleep 1
+  done
+done
+
+port_sni=$((port + 87))
+port_sni_stream=$((port + 88))
+"$binary" --port "$port_sni" --stream-listen "$port_sni_stream" \
+  --stream-upstream "127.0.0.1:$portSniDefault" \
+  --stream-sni-route "site-a.test 127.0.0.1:$portSniA" \
+  --stream-sni-route "*.wild.test 127.0.0.1:$portSniB" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_sni/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket, ssl, threading
+
+def capture_clienthello(hostname):
+    captured = {}
+    ready = threading.Event()
+    def server():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        captured['port'] = srv.getsockname()[1]
+        srv.listen(1)
+        ready.set()
+        conn, _ = srv.accept()
+        captured['bytes'] = conn.recv(65536)
+        conn.close()
+        srv.close()
+    t = threading.Thread(target=server)
+    t.start()
+    ready.wait()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection(('127.0.0.1', captured['port']), timeout=3)
+    try:
+        ctx.wrap_socket(raw, server_hostname=hostname)
+    except Exception:
+        pass
+    t.join(timeout=3)
+    return captured['bytes']
+
+def send_and_read(payload, target):
+    # A single recv() is not guaranteed to capture a large multi-part
+    # response in one call -- loop until 'target' bytes have arrived (the
+    # labelled backend's own two separate sendall()s: the welcome banner,
+    # then the echoed payload) or the connection closes/times out.
+    s = socket.create_connection(('127.0.0.1', $port_sni_stream), timeout=5)
+    s.settimeout(5)
+    s.sendall(payload)
+    received = b''
+    while len(received) < target:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        received += chunk
+    s.close()
+    return received
+
+ch_a = capture_clienthello('site-a.test')
+resp_a = send_and_read(ch_a, len(b'WELCOME:A\nA:') + len(ch_a))
+assert resp_a.startswith(b'WELCOME:A\n'), resp_a[:40]
+assert resp_a[len(b'WELCOME:A\n'):] == b'A:' + ch_a, 'ClientHello not relayed byte-for-byte'
+
+ch_wild = capture_clienthello('foo.wild.test')
+resp_wild = send_and_read(ch_wild, len(b'WELCOME:B\n'))
+assert resp_wild.startswith(b'WELCOME:B\n'), resp_wild[:40]
+
+# The bare wildcard domain itself must NOT match '*.wild.test' (needs a
+# label before the dot -- see magnus_sni_pattern_matches()'s own
+# comment), and an unrelated hostname matches nothing either: both fall
+# back to the default stream_upstream cluster.
+ch_bare = capture_clienthello('wild.test')
+resp_bare = send_and_read(ch_bare, len(b'WELCOME:DEFAULT\n'))
+assert resp_bare.startswith(b'WELCOME:DEFAULT\n'), resp_bare[:40]
+
+ch_other = capture_clienthello('unrelated.example.org')
+resp_other = send_and_read(ch_other, len(b'WELCOME:DEFAULT\n'))
+assert resp_other.startswith(b'WELCOME:DEFAULT\n'), resp_other[:40]
+
+# Plain non-TLS traffic (MAGNUS_SNI_NOT_TLS) falls back the same way.
+resp_http = send_and_read(b'GET / HTTP/1.1\r\nHost: site-a.test\r\n\r\n',
+                          len(b'WELCOME:DEFAULT\n'))
+assert resp_http.startswith(b'WELCOME:DEFAULT\n'), resp_http[:40]
+
+print('stream: SNI exact/wildcard/no-match/non-TLS routing ok')
+"
+curl --fail --silent "http://127.0.0.1:$port_sni/metrics" \
+  | grep -qE '^magnus_stream_sni_upstream_healthy\{pattern="site-a\.test",endpoint="127\.0\.0\.1:'"$portSniA"'"\} 1$'
+curl --fail --silent "http://127.0.0.1:$port_sni/metrics" \
+  | grep -qE '^magnus_stream_sni_upstream_healthy\{pattern="\*\.wild\.test",endpoint="127\.0\.0\.1:'"$portSniB"'"\} 1$'
+
+# A client that never sends enough to resolve SNI at all (nothing sent,
+# ever) is not held open forever -- MAGNUS_STREAM_PEEK_TIMEOUT_SECONDS
+# gives up and falls back to the default cluster the same way an
+# unmatched or malformed ClientHello does.
+python3 -c "
+import socket, time
+s = socket.create_connection(('127.0.0.1', $port_sni_stream), timeout=15)
+s.settimeout(15)
+start = time.time()
+banner = s.recv(4096)
+elapsed = time.time() - start
+assert banner.startswith(b'WELCOME:DEFAULT\n'), banner[:40]
+assert 3 <= elapsed <= 10, elapsed
+s.close()
+print('stream: SNI peek-timeout fallback ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend15_pid" 2>/dev/null
+wait "$backend15_pid" 2>/dev/null || true
+backend15_pid=
+kill -TERM "$backend16_pid" 2>/dev/null
+wait "$backend16_pid" 2>/dev/null || true
+backend16_pid=
+kill -TERM "$backend17_pid" 2>/dev/null
+wait "$backend17_pid" 2>/dev/null || true
+backend17_pid=
+echo "stream: TLS passthrough / SNI routing ok"

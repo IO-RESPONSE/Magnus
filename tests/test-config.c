@@ -63,6 +63,7 @@ main(void)
     assert(!config.has_stream_listen);
     assert(config.stream_upstream_count == 0);
     assert(config.stream_lb_policy == MAGNUS_LB_ROUND_ROBIN);
+    assert(config.sni_route_count == 0);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -91,6 +92,9 @@ main(void)
             "stream_upstream = 10.0.1.1:6000:2\n"
             "stream_upstream = 10.0.1.2:6000\n"
             "stream_lb_policy = ip_hash\n"
+            "stream_sni_route = a.example.com 10.0.2.1:7000\n"
+            "stream_sni_route = a.example.com 10.0.2.2:7000\n"
+            "stream_sni_route = *.b.example.com 10.0.2.3:7000:3\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -129,6 +133,15 @@ main(void)
     assert(config.stream_upstreams[0].weight == 2);
     assert(config.stream_upstreams[1].weight == 1);
     assert(config.stream_lb_policy == MAGNUS_LB_IP_HASH);
+    assert(config.sni_route_count == 2);
+    assert(strcmp(config.sni_routes[0].pattern, "a.example.com") == 0);
+    assert(config.sni_routes[0].upstream_count == 2);
+    assert(strcmp(config.sni_routes[0].upstreams[0].address, "10.0.2.1") == 0);
+    assert(config.sni_routes[0].upstreams[0].port == 7000);
+    assert(strcmp(config.sni_routes[0].upstreams[1].address, "10.0.2.2") == 0);
+    assert(strcmp(config.sni_routes[1].pattern, "*.b.example.com") == 0);
+    assert(config.sni_routes[1].upstream_count == 1);
+    assert(config.sni_routes[1].upstreams[0].weight == 3);
 
     /* stream_listen/stream_upstream: each requires the other, the port
      * must differ from the main listener, a hostname is rejected (same
@@ -164,6 +177,54 @@ main(void)
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
     assert(strstr(error, "stream_lb_policy") != NULL);
+
+    /* stream_sni_route: requires stream_listen, "<pattern> <endpoint>"
+     * shape, a hostname-shaped pattern (with or without a leading `*.`),
+     * a literal IPv4 endpoint (same restriction as stream_upstream), and
+     * two lines sharing a pattern accumulate into that pattern's own
+     * cluster rather than being rejected as a duplicate. */
+    write_file(config_path,
+        "port = 8080\nstream_sni_route = example.com 10.0.0.1:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_sni_route") != NULL);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\n"
+        "stream_sni_route = example.com\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\n"
+        "stream_sni_route = -bad..pattern 10.0.0.2:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\n"
+        "stream_sni_route = example.com backend.internal:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\n"
+        "stream_sni_route = example.com 10.0.0.2:6000 extra-token\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\n"
+        "stream_sni_route = example.com 10.0.0.2:6000\n"
+        "stream_sni_route = example.com 10.0.0.3:6000\n"
+        "stream_sni_route = *.example.com 10.0.0.4:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.sni_route_count == 2);
+    assert(strcmp(config.sni_routes[0].pattern, "example.com") == 0);
+    assert(config.sni_routes[0].upstream_count == 2);
+    assert(strcmp(config.sni_routes[1].pattern, "*.example.com") == 0);
+    assert(config.sni_routes[1].upstream_count == 1);
 
     /* health_check_*: malformed/out-of-range values rejected. */
     write_file(config_path, "port = 8080\nhealth_check_path = no-leading-slash\n");
