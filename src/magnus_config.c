@@ -311,6 +311,21 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+        } else if (strcmp(key, "lb_policy") == 0) {
+            if (strcmp(value, "round_robin") == 0) {
+                config->lb_policy = MAGNUS_LB_ROUND_ROBIN;
+            } else if (strcmp(value, "least_conn") == 0) {
+                config->lb_policy = MAGNUS_LB_LEAST_CONN;
+            } else if (strcmp(value, "ip_hash") == 0) {
+                config->lb_policy = MAGNUS_LB_IP_HASH;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'lb_policy' must be 'round_robin', "
+                                        "'least_conn', or 'ip_hash', got '%s'",
+                                        value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
         } else if (strcmp(key, "access_log_sample") == 0) {
             unsigned long sample;
             if (!magnus_config_parse_uint(value, 1, 1000000, &sample)) {

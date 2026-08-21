@@ -1,5 +1,74 @@
 # Changelog
 
+## 1.19.0
+
+### Added
+
+- **Advanced load balancing (roadmap 2e-1): `least_conn` and `ip_hash`
+  cluster policies, plus rendezvous-hashed affinity.** New
+  `magnus_lb_policy_t` enum (`round_robin` [default, unchanged],
+  `least_conn`, `ip_hash`), chosen once per `magnus_cluster_t` -- never
+  per request -- via a new `lb_policy=round_robin|least_conn|ip_hash`
+  config key / `--lb-policy` CLI flag, validated the same way
+  `access_log=on|off` already is (rejects an unrecognized value with a
+  line-numbered error). A client's own `MAGNUS_AFFINITY` cookie, when
+  present, still always takes priority over whichever policy is
+  configured -- the policy only governs a *fresh* (non-sticky) selection.
+- `least_conn` picks the healthy endpoint with the fewest requests
+  currently in flight against it, ties broken deterministically by lowest
+  index. New `magnus_endpoint_t.active_requests` live counter, maintained
+  by new `magnus_cluster_endpoint_begin()`/`magnus_cluster_endpoint_end()`
+  calls (bounds-guarded against underflow) at every HTTP/1.1 and HTTP/2
+  proxy attach/teardown point. Because a proxy attempt can end through
+  four different completion paths per protocol (normal teardown; an
+  inline connection-pool-checkin branch that bypasses it; and both of
+  those again for a `304`-revalidation completion), each begin is guarded
+  by a new idempotent `proxy_endpoint_counted` (h1) /
+  `cluster_endpoint_counted` (h2) flag so exactly one matching end is ever
+  released per begin, regardless of which path an attempt actually exits
+  through. `/metrics` gained a per-endpoint
+  `magnus_upstream_active_requests` gauge alongside the pre-existing
+  `magnus_upstream_healthy`.
+- `ip_hash` and the pre-existing cookie-based session affinity now both
+  resolve through one shared rendezvous (highest-random-weight) hashing
+  primitive, replacing the old naive `hash(key) % count` plus
+  linear-probe-forward scheme: an FNV-1a hash of the selection key
+  (raw client IP bytes for `ip_hash`, the affinity cookie token for
+  sticky sessions) is combined with each candidate endpoint's own
+  `"address:port"` identity string, and the highest-scoring healthy
+  endpoint wins. This buys a real property modulo hashing does not have:
+  adding or removing one endpoint only remaps the traffic that
+  endpoint's own score was responsible for, never a wholesale reshuffle
+  of every other endpoint's clients -- directly asserted in
+  `tests/test-policy.c`.
+- Deliberately out of scope for this increment: the separate
+  `magnus_grpc_cluster` (its own connection-pooling lifecycle from
+  roadmap 2c-5) does not gain a configurable policy or live
+  `least_conn` counting here -- it stays hardcoded at `round_robin`,
+  since its pooling model would need separate consideration.
+
+### Verified
+
+Against real concurrent/asymmetric-delay backends under ASan+UBSan:
+`least_conn` correctly avoided a backend deliberately held busy by an
+in-flight request -- busy state confirmed via `/metrics`' own
+`magnus_upstream_active_requests` gauge (polled, not a fixed sleep)
+before firing two concurrent follow-up requests, both of which landed on
+the two idle endpoints instead. `ip_hash` deterministically routed the
+same client IP to the same endpoint across both HTTP/1.1 and HTTP/2
+requests against one shared cluster. New unit test coverage in
+`tests/test-policy.c` (least_conn tie-breaking, underflow-safety of
+`_end()`, unhealthy-endpoint skip, affinity-cookie priority over both
+policies; ip_hash same-IP determinism, different-IP independence, and
+the rendezvous minimal-remapping property) and `tests/test-config.c`
+(`lb_policy=` accepted/rejected values). New permanent regression
+coverage in `tests/test-core.sh`: three live backends, one held busy on
+demand via a `/slow` endpoint, proving `least_conn` avoids it under real
+concurrent load, and an `ip_hash` block proving cross-protocol routing
+consistency from one client IP. `make clean && make test` and
+`make sanitize` (ASan+UBSan) both green. Image rebuilt,
+`./scripts/test-image.sh` passes.
+
 ## 1.18.0
 
 ### Added

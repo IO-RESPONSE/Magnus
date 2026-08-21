@@ -58,10 +58,9 @@ independently by IORESPONSE.
   shape) while leaving ordinary traffic and every other connection
   unaffected; graceful shutdown sends a real GOAWAY frame to every open
   h2 connection before closing it
-- Multi-endpoint cluster routing (weighted round-robin), wired to live
-  traffic; active (periodic probe) and passive (live-traffic) health share
-  one circuit-breaker state; cookie-based session affinity; per-client-IP
-  ingress rate limiting
+- Multi-endpoint cluster routing, wired to live traffic; active (periodic
+  probe) and passive (live-traffic) health share one circuit-breaker state;
+  cookie-based session affinity; per-client-IP ingress rate limiting
 - Real IP resolution behind a trusted reverse proxy: PROXY protocol v1/v2
   (detected before TLS handshake or h2c preface, for either entry point)
   and RFC 7239 `Forwarded`/`X-Forwarded-For` (right-most-untrusted-hop,
@@ -122,6 +121,17 @@ independently by IORESPONSE.
   revalidated via a conditional GET instead of a full re-fetch, and a
   confirming `304` is answered from the cached body with no second
   transfer (`X-Cache: REVALIDATED`)
+- Advanced load balancing: `lb_policy=round_robin|least_conn|ip_hash`
+  (`--lb-policy`), chosen once per cluster -- `round_robin` (smooth
+  weighted, the long-standing default) is unchanged; `least_conn` sends a
+  fresh request to whichever healthy endpoint currently has the fewest
+  requests in flight (a new per-endpoint live counter, exposed via
+  `/metrics` as `magnus_upstream_active_requests`); `ip_hash` and the
+  pre-existing `MAGNUS_AFFINITY` cookie affinity both resolve through one
+  rendezvous (highest-random-weight) hash, so adding or removing an
+  endpoint only remaps the traffic that endpoint's own score was
+  responsible for. A client's own affinity cookie, when present, always
+  takes priority over whichever policy is configured
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

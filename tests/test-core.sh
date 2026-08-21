@@ -42,6 +42,18 @@ cleanup() {
     kill -TERM "$backend6_pid" >/dev/null 2>&1 || true
     wait "$backend6_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend7_pid:-}" ]; then
+    kill -TERM "$backend7_pid" >/dev/null 2>&1 || true
+    wait "$backend7_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend8_pid:-}" ]; then
+    kill -TERM "$backend8_pid" >/dev/null 2>&1 || true
+    wait "$backend8_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend9_pid:-}" ]; then
+    kill -TERM "$backend9_pid" >/dev/null 2>&1 || true
+    wait "$backend9_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -2830,3 +2842,122 @@ kill -TERM "$backend6_pid" 2>/dev/null
 wait "$backend6_pid" 2>/dev/null || true
 backend6_pid=
 echo "cache: hit/miss/revalidate/opt-in ok"
+
+# Advanced load balancing (roadmap 2e-1): `--lb-policy least_conn|ip_hash`,
+# both selected only for a *fresh* (non-sticky-cookie) pick -- see
+# magnus_policy.h's own top comment. Three backends, labelled A/B/C by
+# response body, with A alone answering /slow after a deliberate 2s delay
+# so it can be driven "busy" on demand; B and C answer everything
+# instantly. Endpoint order (A, B, C) is significant: with every endpoint
+# idle, least_conn's own lowest-index tie-break always picks A first.
+portA=$((port + 63))
+portB=$((port + 64))
+portC=$((port + 65))
+for spec in "A:$portA" "B:$portB" "C:$portC"; do
+  label=${spec%%:*}
+  lb_port=${spec##*:}
+  python3 -c "
+import http.server, time
+
+LABEL = b'$label'
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def do_GET(self):
+        if self.path == '/slow':
+            time.sleep(2)
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(LABEL)))
+        self.end_headers()
+        self.wfile.write(LABEL)
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $lb_port), Handler).serve_forever()
+" >/dev/null 2>&1 &
+  case "$label" in
+    A) backend7_pid=$! ;;
+    B) backend8_pid=$! ;;
+    C) backend9_pid=$! ;;
+  esac
+done
+for lb_port in "$portA" "$portB" "$portC"; do
+  for attempt in 1 2 3 4 5; do
+    curl --fail --silent "http://127.0.0.1:$lb_port/" >/dev/null && break
+    sleep 1
+  done
+done
+
+# least_conn: drive A busy via /slow in the background, wait (via /metrics'
+# own magnus_upstream_active_requests gauge) until magnus itself has
+# actually counted that request as in flight against A -- not a fixed
+# sleep -- then two fresh requests must both avoid A, landing on B and C
+# instead.
+port_lc=$((port + 66))
+"$binary" --port "$port_lc" --upstream "127.0.0.1:$portA" \
+  --upstream "127.0.0.1:$portB" --upstream "127.0.0.1:$portC" \
+  --lb-policy least_conn 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_lc/healthz" >/dev/null && break
+  sleep 1
+done
+slow_body="$web_root/lb-slow-body"
+curl --silent --output "$slow_body" "http://127.0.0.1:$port_lc/proxy/slow" &
+slow_curl_pid=$!
+busy=0
+for attempt in $(seq 1 30); do
+  if curl --fail --silent "http://127.0.0.1:$port_lc/metrics" \
+      | grep -qE "^magnus_upstream_active_requests\{endpoint=\"127\.0\.0\.1:$portA\"\} [1-9]"; then
+    busy=1
+    break
+  fi
+  sleep 0.1
+done
+test "$busy" = 1
+first=$(curl --fail --silent "http://127.0.0.1:$port_lc/proxy/")
+second=$(curl --fail --silent "http://127.0.0.1:$port_lc/proxy/")
+test "$first" != "A"
+test "$second" != "A"
+case "$first" in B|C) : ;; *) exit 1 ;; esac
+case "$second" in B|C) : ;; *) exit 1 ;; esac
+wait "$slow_curl_pid"
+test "$(cat "$slow_body")" = "A"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# ip_hash: fresh (no MAGNUS_AFFINITY cookie, since each curl invocation
+# here is cookie-jar-free) selections from the same source IP must all
+# land on the same endpoint, consistently across both HTTP/1.1 and
+# HTTP/2 -- one shared rendezvous-hash decision, not one per protocol.
+port_ih=$((port + 67))
+"$binary" --port "$port_ih" --upstream "127.0.0.1:$portA" \
+  --upstream "127.0.0.1:$portB" --upstream "127.0.0.1:$portC" \
+  --lb-policy ip_hash 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_ih/healthz" >/dev/null && break
+  sleep 1
+done
+ih_h1a=$(curl --fail --silent "http://127.0.0.1:$port_ih/proxy/1")
+ih_h1b=$(curl --fail --silent "http://127.0.0.1:$port_ih/proxy/2")
+ih_h2a=$(curl --http2-prior-knowledge --fail --silent "http://127.0.0.1:$port_ih/proxy/3")
+ih_h2b=$(curl --http2-prior-knowledge --fail --silent "http://127.0.0.1:$port_ih/proxy/4")
+test "$ih_h1a" = "$ih_h1b"
+test "$ih_h1a" = "$ih_h2a"
+test "$ih_h1a" = "$ih_h2b"
+case "$ih_h1a" in A|B|C) : ;; *) exit 1 ;; esac
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+kill -TERM "$backend7_pid" 2>/dev/null
+wait "$backend7_pid" 2>/dev/null || true
+backend7_pid=
+kill -TERM "$backend8_pid" 2>/dev/null
+wait "$backend8_pid" 2>/dev/null || true
+backend8_pid=
+kill -TERM "$backend9_pid" 2>/dev/null
+wait "$backend9_pid" 2>/dev/null || true
+backend9_pid=
+echo "lb: least_conn/ip_hash ok"

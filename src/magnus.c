@@ -37,7 +37,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.18.0"
+#define MAGNUS_VERSION "1.19.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -309,6 +309,15 @@ typedef struct {
     time_t proxy_connect_started;
     time_t proxy_last_activity;
     size_t proxy_endpoint_index;
+    /* Advanced load balancing (roadmap 2e-1): true from the moment
+     * magnus_proxy_attach_upstream() successfully attaches this
+     * connection's proxy attempt to proxy_endpoint_index, until whichever
+     * of magnus_proxy_teardown_upstream()/the pool-checkin branch of
+     * magnus_proxy_flush() releases it -- see magnus_cluster_endpoint_begin()/
+     * _end()'s own comment. Guards against a double-release (the two
+     * release sites are mutually exclusive in practice, but this makes
+     * that a guarantee rather than an assumption). */
+    bool proxy_endpoint_counted;
     unsigned proxy_attempt;
     char proxy_affinity_key[64];
     bool proxy_issue_affinity_cookie;
@@ -1184,6 +1193,12 @@ magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
     connection->proxy_ws_active = false;
     connection->proxy_upstream_requests_served = requests_served;
     connection->proxy_endpoint_index = endpoint_index;
+    /* Advanced load balancing (roadmap 2e-1): the one point every h1
+     * proxy attempt -- fresh or retried, websocket or not -- always
+     * passes through on a successful attach, so this is the one place
+     * magnus_cluster_endpoint_begin() needs calling at all. */
+    magnus_cluster_endpoint_begin(&magnus_cluster, endpoint_index);
+    connection->proxy_endpoint_counted = true;
     connection->proxy_connect_started = time(NULL);
     connection->proxy_last_activity = connection->proxy_connect_started;
     /* Provisional; magnus_proxy_receive_headers() corrects this once the
@@ -1510,7 +1525,7 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
         connection->proxy_issue_affinity_cookie = false;
         for (;;) {
             int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
-                                                 NULL);
+                                                 NULL, connection->client_address);
             if (endpoint < 0) return -1;
             connection->proxy_attempt++;
             if (magnus_proxy_connect_endpoint(epoll_fd, connection,
@@ -1637,8 +1652,10 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
     for (;;) {
         int endpoint = sticky
             ? magnus_cluster_select_sticky(&magnus_cluster, magnus_now_ms(),
-                                           preferred_index)
-            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL);
+                                           preferred_index,
+                                           connection->client_address)
+            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL,
+                                    connection->client_address);
         if (endpoint < 0) return -1;
         if (sticky) {
             sticky = false;
@@ -1675,6 +1692,18 @@ magnus_proxy_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
         connection->upstream_fd = -1;
     }
     connection->proxy_active = false;
+    /* Advanced load balancing (roadmap 2e-1): released here for every
+     * abnormal/non-poolable ending this attempt can have (fail/abort, a
+     * connect that never completed, a non-poolable clean completion) --
+     * the poolable clean-completion case releases inline at
+     * magnus_proxy_flush()'s own pool-checkin instead, since that path
+     * never reaches here at all; either way this is guarded so it is
+     * always exactly one release per magnus_proxy_attach_upstream()'s own
+     * begin, regardless of which path actually fires. */
+    if (connection->proxy_endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_cluster, connection->proxy_endpoint_index);
+        connection->proxy_endpoint_counted = false;
+    }
     free(connection->proxy_buffer);
     connection->proxy_buffer = NULL;
     free(connection->proxy_header_out);
@@ -1753,7 +1782,7 @@ magnus_proxy_connect_failed(int epoll_fd, magnus_connection_t *connection,
          * insisting on the original (just-failed) preferred endpoint again
          * would only waste the remaining attempt budget on it. */
         int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
-                                             NULL);
+                                             NULL, connection->client_address);
         if (endpoint >= 0) {
             connection->proxy_attempt++;
             if (magnus_proxy_connect_endpoint(epoll_fd, connection,
@@ -1880,6 +1909,14 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
             connection->upstream_fd = -1;
             magnus_pool_checkin(connection->proxy_endpoint_index, fd,
                 connection->proxy_upstream_requests_served + 1);
+            /* Advanced load balancing (roadmap 2e-1): the one release
+             * site magnus_proxy_teardown_upstream()'s own does not cover
+             * -- see that function's own comment. */
+            if (connection->proxy_endpoint_counted) {
+                magnus_cluster_endpoint_end(&magnus_cluster,
+                                            connection->proxy_endpoint_index);
+                connection->proxy_endpoint_counted = false;
+            }
         } else {
             magnus_proxy_teardown_upstream(epoll_fd, connection);
         }
@@ -2006,6 +2043,14 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             connection->upstream_fd = -1;
             magnus_pool_checkin(connection->proxy_endpoint_index, fd,
                 connection->proxy_upstream_requests_served + 1);
+            /* Advanced load balancing (roadmap 2e-1): same release-site
+             * gap as magnus_proxy_flush()'s own pool-checkin branch --
+             * see that one's own comment. */
+            if (connection->proxy_endpoint_counted) {
+                magnus_cluster_endpoint_end(&magnus_cluster,
+                                            connection->proxy_endpoint_index);
+                connection->proxy_endpoint_counted = false;
+            }
             connection->proxy_active = false;
             free(connection->proxy_buffer);
             connection->proxy_buffer = NULL;
@@ -2744,6 +2789,12 @@ struct magnus_h2_stream {
     bool upstream_connected;
     bool upstream_headers_sent;
     size_t endpoint_index;
+    /* Advanced load balancing (roadmap 2e-1) -- the h2 analogue of
+     * magnus_connection_t's own identically-named field; see that one's
+     * comment. Only ever set for an is_proxy stream (gRPC streams never
+     * touch magnus_cluster at all -- they have their own separate
+     * magnus_grpc_cluster, out of scope for this increment). */
+    bool cluster_endpoint_counted;
     unsigned attempt;
     unsigned upstream_requests_served;
     time_t connect_started;
@@ -2982,6 +3033,15 @@ magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
         magnus_h2_upstream_owner[stream->upstream_fd] = NULL;
         close(stream->upstream_fd);
         stream->upstream_fd = -1;
+    }
+    /* Advanced load balancing (roadmap 2e-1): released here for every
+     * abnormal/non-poolable ending an is_proxy stream's own attempt can
+     * have -- see magnus_proxy_teardown_upstream()'s own identical
+     * comment. Naturally a no-op for a gRPC stream (cluster_endpoint_counted
+     * is never set true for one in the first place). */
+    if (stream->cluster_endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_cluster, stream->endpoint_index);
+        stream->cluster_endpoint_counted = false;
     }
     /* Reverse-proxy cache (roadmap 2d-1): whatever this one attempt had
      * captured toward a possible cache store never outlives the attempt
@@ -3887,6 +3947,11 @@ magnus_h2_proxy_attach_upstream(magnus_connection_t *connection,
     stream->upstream_connected = connected;
     stream->upstream_requests_served = requests_served;
     stream->endpoint_index = endpoint_index;
+    /* Advanced load balancing (roadmap 2e-1) -- see
+     * magnus_proxy_attach_upstream()'s own identical comment on why this
+     * one function is the single right place for it. */
+    magnus_cluster_endpoint_begin(&magnus_cluster, endpoint_index);
+    stream->cluster_endpoint_counted = true;
     stream->connect_started = time(NULL);
     stream->last_activity = stream->connect_started;
     magnus_h2_upstream_owner[fd] = stream;
@@ -3955,7 +4020,7 @@ magnus_h2_proxy_connect_failed(magnus_connection_t *connection,
     magnus_h2_stream_teardown_upstream(stream);
     if (stream->attempt < MAGNUS_PROXY_MAX_ATTEMPTS) {
         int endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms(),
-                                             NULL);
+                                             NULL, stream->effective_client_address);
         if (endpoint >= 0) {
             stream->attempt++;
             if (magnus_h2_proxy_connect_endpoint(connection, stream,
@@ -4138,8 +4203,10 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
     for (;;) {
         int endpoint = sticky
             ? magnus_cluster_select_sticky(&magnus_cluster, magnus_now_ms(),
-                                           preferred_index)
-            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL);
+                                           preferred_index,
+                                           stream->effective_client_address)
+            : magnus_cluster_select(&magnus_cluster, magnus_now_ms(), NULL,
+                                    stream->effective_client_address);
         if (endpoint < 0) {
             magnus_h2_proxy_fail(connection, stream, "502");
             return;
@@ -4495,6 +4562,13 @@ magnus_h2_proxy_maybe_complete(struct magnus_h2_stream *stream)
         stream->upstream_fd = -1;
         magnus_pool_checkin(stream->endpoint_index, fd,
                             stream->upstream_requests_served + 1);
+        /* Advanced load balancing (roadmap 2e-1): the one release site
+         * magnus_h2_stream_teardown_upstream()'s own does not cover --
+         * see magnus_proxy_flush()'s own identical HTTP/1.1 comment. */
+        if (stream->cluster_endpoint_counted) {
+            magnus_cluster_endpoint_end(&magnus_cluster, stream->endpoint_index);
+            stream->cluster_endpoint_counted = false;
+        }
     } else {
         magnus_h2_stream_teardown_upstream(stream);
     }
@@ -4591,6 +4665,14 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
             stream->upstream_fd = -1;
             magnus_pool_checkin(stream->endpoint_index, fd,
                 stream->upstream_requests_served + 1);
+            /* Advanced load balancing (roadmap 2e-1): same release-site
+             * gap as magnus_h2_proxy_maybe_complete()'s own pool-checkin
+             * branch -- see that one's own comment. */
+            if (stream->cluster_endpoint_counted) {
+                magnus_cluster_endpoint_end(&magnus_cluster,
+                                            stream->endpoint_index);
+                stream->cluster_endpoint_counted = false;
+            }
         } else {
             magnus_h2_stream_teardown_upstream(stream);
         }
@@ -6200,9 +6282,10 @@ magnus_h2_grpc_start(magnus_connection_t *connection,
     for (;;) {
         int endpoint = sticky
             ? magnus_cluster_select_sticky(&magnus_grpc_cluster,
-                                           magnus_now_ms(), preferred_index)
+                                           magnus_now_ms(), preferred_index,
+                                           stream->effective_client_address)
             : magnus_cluster_select(&magnus_grpc_cluster, magnus_now_ms(),
-                                    NULL);
+                                    NULL, stream->effective_client_address);
         magnus_grpc_conn_t *conn;
         if (endpoint < 0) {
             magnus_h2_grpc_fail(connection, stream, "14",
@@ -6393,6 +6476,27 @@ magnus_build_metrics(char *out, size_t out_capacity)
             magnus_cluster.endpoints[index].address,
             magnus_cluster.endpoints[index].port,
             magnus_cluster.endpoints[index].healthy ? 1 : 0);
+        if (line < 0 || (size_t) line >= out_capacity - written) return;
+        written += (size_t) line;
+    }
+    /* Advanced load balancing (roadmap 2e-1): live per-endpoint in-flight
+     * count -- what MAGNUS_LB_LEAST_CONN itself reads to decide, and
+     * useful observability regardless of which policy is configured
+     * (always maintained by the h1/h2 proxy dispatch paths; see
+     * magnus_cluster_endpoint_begin()'s own comment). */
+    if (written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "# TYPE magnus_upstream_active_requests gauge\n");
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+    }
+    for (size_t index = 0; index < magnus_cluster.count
+         && written < out_capacity; index++) {
+        int line = snprintf(out + written, out_capacity - written,
+            "magnus_upstream_active_requests{endpoint=\"%s:%u\"} %u\n",
+            magnus_cluster.endpoints[index].address,
+            magnus_cluster.endpoints[index].port,
+            magnus_cluster.endpoints[index].active_requests);
         if (line < 0 || (size_t) line >= out_capacity - written) return;
         written += (size_t) line;
     }
@@ -7854,7 +7958,7 @@ magnus_apply_config(const magnus_config_t *config)
         magnus_h2_configure_alpn(new_tls_context);
     }
     magnus_cluster_init(&new_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS);
+                        MAGNUS_CLUSTER_COOLDOWN_MS, config->lb_policy);
     for (index = 0; index < config->upstream_count; index++) {
         if (magnus_cluster_add(&new_cluster, config->upstreams[index].address,
                                config->upstreams[index].port,
@@ -7864,8 +7968,16 @@ magnus_apply_config(const magnus_config_t *config)
             return -1;
         }
     }
+    /* The gRPC cluster's own policy is never exposed to config/CLI in
+     * this increment (roadmap 2e-1 is scoped to the h1/h2 proxy dispatch
+     * paths' own shared `magnus_cluster` only -- see
+     * magnus_cluster_endpoint_begin()'s own comment on why the gRPC
+     * cluster does not participate in MAGNUS_LB_LEAST_CONN's live
+     * counting at all, which MAGNUS_LB_IP_HASH does not strictly need but
+     * is left equally out of scope here for the same reason: a distinct
+     * future increment, not silently half-done). */
     magnus_cluster_init(&new_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS);
+                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     for (index = 0; index < config->grpc_upstream_count; index++) {
         if (magnus_cluster_add(&new_grpc_cluster,
                                config->grpc_upstreams[index].address,
@@ -8000,9 +8112,11 @@ magnus_parse_options(int argc, char **argv)
     const char *certificate = NULL;
     const char *private_key = NULL;
     magnus_cluster_init(&magnus_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS);
+                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
+    /* The gRPC cluster's own policy is never exposed to config/CLI in
+     * this increment -- see magnus_apply_config()'s own comment on why. */
     magnus_cluster_init(&magnus_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
-                        MAGNUS_CLUSTER_COOLDOWN_MS);
+                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     for (index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) break;
         if (strcmp(argv[index], "--port") == 0) {
@@ -8132,6 +8246,16 @@ magnus_parse_options(int argc, char **argv)
                 magnus_access_log_enabled = true;
             } else if (strcmp(argv[index + 1], "off") == 0) {
                 magnus_access_log_enabled = false;
+            } else {
+                break;
+            }
+        } else if (strcmp(argv[index], "--lb-policy") == 0) {
+            if (strcmp(argv[index + 1], "round_robin") == 0) {
+                magnus_cluster.policy = MAGNUS_LB_ROUND_ROBIN;
+            } else if (strcmp(argv[index + 1], "least_conn") == 0) {
+                magnus_cluster.policy = MAGNUS_LB_LEAST_CONN;
+            } else if (strcmp(argv[index + 1], "ip_hash") == 0) {
+                magnus_cluster.policy = MAGNUS_LB_IP_HASH;
             } else {
                 break;
             }

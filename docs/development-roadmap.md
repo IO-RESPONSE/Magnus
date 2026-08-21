@@ -561,8 +561,7 @@ connection-pool and common-request-model decisions).
     paths (one cache, keyed on host+target -- a response stored via one
     protocol is servable to the other). Applied only to a route that
     explicitly opts in via a new `cache=on|off` route modifier
-    (`action=proxy; cache=on`) -- never a global default, the same
-    discipline nginx's own `proxy_cache` directive uses, since caching a
+    (`action=proxy; cache=on`) -- never a global default, since caching a
     response the origin never intended to be shared would be a
     correctness bug, not just a missed optimization. Cacheability follows
     RFC 7234's core rules, narrowed for this increment: only a GET request
@@ -605,6 +604,44 @@ connection-pool and common-request-model decisions).
     relying on the existing single, safe push each call path already
     performs once, after the whole callback chain has fully unwound. See
     `CHANGELOG.md` 1.18.0 for the full detail.
+  - **Advanced load balancing 2e-1 — least-connections and IP-hash
+    policies, rendezvous-hashed affinity. Shipped in 1.19.0.** New
+    `magnus_lb_policy_t` (`round_robin` [default, unchanged], `least_conn`,
+    `ip_hash`), configured once per `magnus_cluster_t` via a new
+    `lb_policy=` config key / `--lb-policy` CLI flag (mirrors
+    `access_log=`'s own on/off validation pattern) -- a client's own
+    `MAGNUS_AFFINITY` cookie, when present, still always wins over
+    whichever policy is configured; the policy only governs a *fresh*
+    selection. `least_conn` picks the healthy endpoint with the fewest
+    requests currently in flight, tracked live via new
+    `magnus_cluster_endpoint_begin()`/`_end()` calls at every h1/h2 proxy
+    attach/teardown point (four distinct completion paths per protocol --
+    normal teardown, and an inline pool-checkin branch that bypasses it,
+    for both a fresh response and a 304-revalidation completion -- each
+    guarded by a new idempotent `proxy_endpoint_counted`/
+    `cluster_endpoint_counted` flag so a begin is released exactly once no
+    matter which path an attempt ends through). `ip_hash` and the
+    pre-existing cookie-affinity mechanism both now share one rendezvous
+    (highest-random-weight) hashing primitive in place of the old naive
+    `hash(key) % count` + linear-probe scheme: score = an FNV-1a hash of
+    the selection key (client IP bytes, or the affinity cookie token)
+    combined with each endpoint's own `"address:port"` identity, highest
+    score wins -- the property this buys over modulo hashing is that
+    adding or removing one endpoint only remaps the traffic that
+    endpoint's own score was responsible for, never a wholesale reshuffle
+    of every other endpoint's clients. `/metrics` gained a per-endpoint
+    `magnus_upstream_active_requests` gauge alongside the pre-existing
+    `magnus_upstream_healthy`. Deliberately out of scope: the separate
+    `magnus_grpc_cluster` (its own connection-pooling lifecycle from
+    2c-5) does not get a configurable policy or live least-conn counting
+    in this increment -- it stays hardcoded at `round_robin`. Verified
+    against real concurrent/asymmetric-delay backends under ASan+UBSan:
+    `least_conn` correctly avoided a backend held busy by an in-flight
+    request (confirmed busy via `/metrics`' own gauge, not a fixed sleep)
+    for two concurrent follow-up requests; `ip_hash` deterministically
+    routed the same client IP to the same endpoint across both HTTP/1.1
+    and HTTP/2 requests against one shared cluster. See `CHANGELOG.md`
+    1.19.0 for the full detail.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section
@@ -612,7 +649,7 @@ connection-pool and common-request-model decisions).
   during it.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
-  (e.g. an nginx-QUIC-style OpenSSL-integrated stack vs. quiche vs. msquic)
+  (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)
   in Section 5's dependency framework before any code.
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,

@@ -53,6 +53,7 @@ main(void)
     assert(config.access_log_enabled);
     assert(config.access_log_sample == 1);
     assert(!config.has_admin_socket);
+    assert(config.lb_policy == MAGNUS_LB_ROUND_ROBIN);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -70,6 +71,7 @@ main(void)
             "rate_limit_burst = 100\n"
             "access_log = off\n"
             "access_log_sample = 20\n"
+            "lb_policy = least_conn\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -93,6 +95,21 @@ main(void)
     assert(config.has_rate_limit);
     assert(config.rate_limit_rps == 50.0);
     assert(config.rate_limit_burst == 100.0);
+    assert(config.lb_policy == MAGNUS_LB_LEAST_CONN);
+
+    /* lb_policy: every recognized value, and an invalid one rejected. */
+    write_file(config_path, "port = 8080\nlb_policy = round_robin\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.lb_policy == MAGNUS_LB_ROUND_ROBIN);
+    write_file(config_path, "port = 8080\nlb_policy = ip_hash\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.lb_policy == MAGNUS_LB_IP_HASH);
+    write_file(config_path, "port = 8080\nlb_policy = fastest\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "lb_policy") != NULL);
 
     /* missing port */
     write_file(config_path, "root = /tmp\n");

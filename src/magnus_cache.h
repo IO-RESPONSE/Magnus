@@ -9,8 +9,7 @@
  * LRU-evicted store of upstream GET responses for routes that opt in via
  * `action=proxy; cache=on` (magnus_route_t's own `cache_enabled` field,
  * parsed by magnus_route_parse()) -- never applied automatically to every
- * `action=proxy` route, the same opt-in-per-location discipline nginx's
- * own `proxy_cache` directive uses. Caching a response the origin never
+ * `action=proxy` route. Caching a response the origin never
  * actually intended to be shared across clients (one that simply forgot
  * to mark itself private/no-store) would be a correctness bug, not just
  * a missed optimization, so this stays an explicit choice per route

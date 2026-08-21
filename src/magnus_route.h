@@ -72,9 +72,11 @@ typedef struct {
      * by magnus_route_parse(), consumed by magnus_proxy_pick_and_start()/
      * magnus_h2_proxy_start() in magnus.c. Defaults to false (every route
      * that never mentions `cache=` at all): caching is never applied to a
-     * proxy route automatically, the same discipline nginx's own
-     * proxy_cache directive uses -- see magnus_cache.h's own top comment
-     * on why an explicit opt-in matters here, not just convenience. */
+     * proxy route automatically -- caching a route that assumes every
+     * response is unique (session-bound APIs, mutating endpoints, etc.)
+     * would be a correctness bug, not just a missed optimization, so it
+     * requires a deliberate opt-in; see magnus_cache.h's own top comment
+     * on why explicit opt-in matters here, not just convenience. */
     bool cache_enabled;
 } magnus_route_t;
 

@@ -1,6 +1,7 @@
 #ifndef MAGNUS_CONFIG_H
 #define MAGNUS_CONFIG_H
 
+#include "magnus_policy.h"
 #include "magnus_route.h"
 
 #include <stdbool.h>
@@ -48,6 +49,14 @@ typedef struct {
     char tls_key[MAGNUS_CONFIG_PATH_MAX];
     size_t upstream_count;
     magnus_config_upstream_t upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
+    /* Advanced load balancing (roadmap 2e-1) for the `upstream` cluster
+     * above only -- the separate `grpc_upstream` cluster keeps its own
+     * pre-existing weighted round-robin unconditionally (see
+     * magnus_apply_config()'s own comment on why). Defaults to
+     * MAGNUS_LB_ROUND_ROBIN (value 0) via magnus_config_load()'s own
+     * memset(), so a config that never mentions `lb_policy` at all keeps
+     * this codebase's original behavior unchanged. */
+    magnus_lb_policy_t lb_policy;
     /* gRPC upstream cluster (roadmap 2c-1): same ipv4:port[:weight] shape
      * and validation as `upstreams` above (magnus_config_parse_upstream()
      * is reused as-is), but a hostname entry is rejected here -- DNS
@@ -84,9 +93,12 @@ typedef enum {
  *     file existence for root/tls_cert/tls_key, tls_cert and tls_key must
  *     be given together, rate_limit_burst requires rate_limit_rps,
  *     access_log is 'on'/'off', access_log_sample is a positive integer,
- *     route is a valid magnus_route_parse() spec -- see magnus_route.h)
+ *     route is a valid magnus_route_parse() spec -- see magnus_route.h,
+ *     lb_policy is 'round_robin'/'least_conn'/'ip_hash' -- see
+ *     magnus_policy.h's own magnus_lb_policy_t)
  *   - `port` is required; access_log defaults to "on" and
- *     access_log_sample defaults to 1 (log every request) when omitted
+ *     access_log_sample defaults to 1 (log every request) when omitted;
+ *     lb_policy defaults to "round_robin" when omitted
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason
