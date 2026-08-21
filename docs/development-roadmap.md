@@ -553,6 +553,58 @@ connection-pool and common-request-model decisions).
       after its own initial SETTINGS, indistinguishable from a hung
       connection without instrumenting nghttp2's own call sequence to
       notice).
+  - **Reverse-proxy cache 2d-1 — bounded in-memory cache with revalidation,
+    opt-in per route. Shipped in 1.18.0.** New module `magnus_cache.c`/`.h`:
+    a fixed-capacity (`MAGNUS_CACHE_MAX_ENTRIES`, 512), byte-budgeted
+    (`MAGNUS_CACHE_MAX_BYTES`, 64MiB; `MAGNUS_CACHE_MAX_ENTRY_BYTES`, 8MiB),
+    LRU-evicted store shared by both the HTTP/1.1 and HTTP/2 proxy dispatch
+    paths (one cache, keyed on host+target -- a response stored via one
+    protocol is servable to the other). Applied only to a route that
+    explicitly opts in via a new `cache=on|off` route modifier
+    (`action=proxy; cache=on`) -- never a global default, the same
+    discipline nginx's own `proxy_cache` directive uses, since caching a
+    response the origin never intended to be shared would be a
+    correctness bug, not just a missed optimization. Cacheability follows
+    RFC 7234's core rules, narrowed for this increment: only a GET request
+    and a `200` response with an explicit freshness signal (`Cache-Control:
+    max-age` or `Expires`) is ever stored; `no-store`/`private`, a response
+    carrying `Set-Cookie`, or a `Vary` other than (absent or) `Accept-
+    Encoding` are excluded outright. A fresh hit is served entirely
+    without touching the upstream (`X-Cache: HIT`); a stale entry that
+    still carries an `ETag`/`Last-Modified` validator is revalidated via a
+    conditional GET (`If-None-Match`/`If-Modified-Since`) rather than
+    re-fetched in full -- a confirming `304` refreshes freshness and is
+    answered from the *cached* body with no second body transfer
+    (`X-Cache: REVALIDATED`); an origin that instead sends fresh content
+    on that same conditional GET is treated as an ordinary fetch,
+    replacing the stale entry. `/metrics` gained
+    `magnus_cache_hits_total`/`_misses_total`/`_revalidated_total` and
+    entry-count/byte-usage gauges. Deliberately out of scope: heuristic
+    freshness (no fallback when neither header is present), Vary-keyed
+    multi-variant storage, an explicit purge API (the whole cache is
+    flushed wholesale on config reload or shutdown instead), and dogpile/
+    request-coalescing protection for a concurrent stampede on a still-
+    uncached URL. Verified against a real Python `http.server` origin
+    across both protocols and every rule above (hit/miss/no-store/Set-
+    Cookie/Vary exclusion/revalidation-confirmed/revalidation-superseded/
+    cross-protocol sharing/per-route opt-out), under ASan+UBSan -- which
+    caught two real bugs found only through that live testing, not code
+    review: (1) the HTTP/1.1 completion path referenced
+    `connection->proxy_header_out` for the stored header prefix, not
+    realizing that buffer is freed the moment its own bytes finish
+    reaching the client -- typically well before the body, and therefore
+    this cache store, complete -- fixed by copying the storable prefix out
+    into its own persisted field at header time instead (the h2 path
+    already had to do this, having no persisted raw-text buffer at all,
+    which is what surfaced the h1 analogue as a real gap by comparison);
+    (2) an HTTP/2 cache-hit/revalidation response called
+    `magnus_h2_push()` immediately after submitting, which can drive
+    nghttp2 far enough to close and free the very stream the *caller*
+    (already inside `nghttp2_session_mem_recv2()`'s own callback stack)
+    still needed afterward -- fixed by removing the premature push and
+    relying on the existing single, safe push each call path already
+    performs once, after the whole callback chain has fully unwound. See
+    `CHANGELOG.md` 1.18.0 for the full detail.
 - **Phase 3 — L4 TCP/UDP, TLS passthrough, PROXY protocol.** Architecturally
   distinct from the L7 phases: a new listener type that doesn't go through
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section

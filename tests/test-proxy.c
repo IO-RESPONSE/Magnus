@@ -32,7 +32,7 @@ main(void)
         "X-Debug: value\r\n"
         "\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info);
+        sizeof(out), NULL, false, &info, NULL);
     assert(written > 0);
     assert(info.status == 200);
     assert(!info.has_content_length);
@@ -55,19 +55,19 @@ main(void)
 
     strcpy(raw, "not-a-status-line\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info) == -1);
+        sizeof(out), NULL, false, &info, NULL) == -1);
 
     strcpy(raw, "HTTP/1.1 abc OK\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info) == -1);
+        sizeof(out), NULL, false, &info, NULL) == -1);
 
     strcpy(raw, "HTTP/1.1 200 OK\r\nX-Long: value\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out, 8,
-        NULL, false, &info) == -1);
+        NULL, false, &info, NULL) == -1);
 
     strcpy(raw, "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), "sess-token-abc", false, &info);
+        sizeof(out), "sess-token-abc", false, &info, NULL);
     assert(written > 0);
     assert(strstr(out, "Set-Cookie: MAGNUS_AFFINITY=sess-token-abc; "
                        "Path=/; HttpOnly; SameSite=Lax\r\n") != NULL);
@@ -77,7 +77,7 @@ main(void)
      * to stay open. */
     strcpy(raw, "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info);
+        sizeof(out), NULL, false, &info, NULL);
     assert(written > 0);
     assert(info.has_content_length);
     assert(info.content_length == 42);
@@ -90,7 +90,7 @@ main(void)
      * the client leg must not claim keep-alive. */
     strcpy(raw, "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, true, &info);
+        sizeof(out), NULL, true, &info, NULL);
     assert(written > 0);
     assert(info.has_content_length);
     assert(info.upstream_poolable);
@@ -106,7 +106,7 @@ main(void)
     strcpy(raw,
         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n");
     written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info);
+        sizeof(out), NULL, false, &info, NULL);
     assert(written > 0);
     assert(info.has_content_length);
     assert(!info.upstream_poolable);
@@ -118,13 +118,71 @@ main(void)
     strcpy(raw,
         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info) == -1);
+        sizeof(out), NULL, false, &info, NULL) == -1);
 
     /* A malformed Content-Length is likewise rejected, not silently
      * ignored or misparsed. */
     strcpy(raw, "HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n");
     assert(magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
-        sizeof(out), NULL, false, &info) == -1);
+        sizeof(out), NULL, false, &info, NULL) == -1);
+
+    /* Reverse-proxy cache support (roadmap 2d-1): Cache-Control/Expires/
+     * ETag/Last-Modified/Vary are captured (still forwarded to the client
+     * normally, same as any other non-hop-by-hop header) and Set-Cookie's
+     * mere presence is flagged. out_cacheable_prefix_length marks the end
+     * of the pass-through headers, strictly before the affinity
+     * Set-Cookie/Connection/X-Magnus-Via lines this function itself
+     * appends -- none of the cache-relevant captures above appear after
+     * it, so a cache entry storing only that prefix still has everything
+     * it needs. */
+    {
+        size_t prefix_length = 0;
+        strcpy(raw,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 5\r\n"
+            "Cache-Control: max-age=60\r\n"
+            "Expires: Sun, 06 Nov 1994 08:49:37 GMT\r\n"
+            "ETag: \"abc123\"\r\n"
+            "Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n"
+            "Vary: Accept-Encoding\r\n"
+            "Set-Cookie: session=xyz\r\n"
+            "\r\n");
+        written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
+            sizeof(out), "sess-token-abc", false, &info, &prefix_length);
+        assert(written > 0);
+        assert(info.has_set_cookie);
+        assert(strcmp(info.cache_control, "max-age=60") == 0);
+        assert(strcmp(info.expires, "Sun, 06 Nov 1994 08:49:37 GMT") == 0);
+        assert(strcmp(info.etag, "\"abc123\"") == 0);
+        assert(strcmp(info.last_modified,
+                      "Mon, 01 Jan 2024 00:00:00 GMT") == 0);
+        assert(strcmp(info.vary, "Accept-Encoding") == 0);
+        assert(prefix_length > 0 && prefix_length < (size_t) written);
+        assert(strstr(out, "Set-Cookie: session=xyz\r\n") != NULL);
+        /* The prefix itself carries every pass-through header this
+         * response had, verbatim, and nothing added afterward. */
+        assert(memmem(out, prefix_length, "Cache-Control: max-age=60",
+                     strlen("Cache-Control: max-age=60")) != NULL);
+        assert(memmem(out, prefix_length, "Set-Cookie: session=xyz",
+                     strlen("Set-Cookie: session=xyz")) != NULL);
+        assert(memmem(out, prefix_length, "MAGNUS_AFFINITY",
+                     strlen("MAGNUS_AFFINITY")) == NULL);
+        assert(memmem(out, prefix_length, "X-Magnus-Via",
+                     strlen("X-Magnus-Via")) == NULL);
+    }
+
+    /* Headers this response never carried leave the corresponding info
+     * field empty, not garbage/uninitialized. */
+    strcpy(raw, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
+        sizeof(out), NULL, false, &info, NULL);
+    assert(written > 0);
+    assert(!info.has_set_cookie);
+    assert(strcmp(info.cache_control, "") == 0);
+    assert(strcmp(info.expires, "") == 0);
+    assert(strcmp(info.etag, "") == 0);
+    assert(strcmp(info.last_modified, "") == 0);
+    assert(strcmp(info.vary, "") == 0);
 
     return 0;
 }

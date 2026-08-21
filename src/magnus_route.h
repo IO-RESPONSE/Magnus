@@ -67,12 +67,23 @@ typedef struct {
     magnus_route_condition_t conditions[MAGNUS_ROUTE_MAX_CONDITIONS];
     size_t condition_count;
     magnus_route_action_t action;
+    /* Reverse-proxy response cache (roadmap 2d-1), opt-in per route via a
+     * `cache=on` modifier -- parsed and validated (requires action=proxy)
+     * by magnus_route_parse(), consumed by magnus_proxy_pick_and_start()/
+     * magnus_h2_proxy_start() in magnus.c. Defaults to false (every route
+     * that never mentions `cache=` at all): caching is never applied to a
+     * proxy route automatically, the same discipline nginx's own
+     * proxy_cache directive uses -- see magnus_cache.h's own top comment
+     * on why an explicit opt-in matters here, not just convenience. */
+    bool cache_enabled;
 } magnus_route_t;
 
 /* Parses one `route = ...` config value into `out`: semicolon-separated
  * conditions (each `key=value`, or `key:subkey=value` for header/
  * header_prefix/cookie/query, which need a field name as well as an
- * expected value) plus exactly one `action=proxy|deny|static|grpc`, in
+ * expected value) plus exactly one `action=proxy|deny|static|grpc`, plus
+ * an optional `cache=on|off` modifier (roadmap 2d-1; only valid alongside
+ * `action=proxy` -- see magnus_route_t's own `cache_enabled` field), in
  * any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with
  * zero conditions is valid and matches every request -- a deliberate
  * catch-all, e.g. for a route whose only job is to be an explicit
@@ -87,7 +98,8 @@ typedef struct {
  * Returns true on success with `out` fully populated. Returns false on
  * any malformed token, an unrecognized key, a value that overflows the
  * fixed field it would be stored in, more than MAGNUS_ROUTE_MAX_CONDITIONS
- * conditions, or a missing/duplicate/invalid action -- writing a
+ * conditions, a missing/duplicate/invalid action, a duplicate/invalid
+ * `cache=`, or `cache=on` without `action=proxy` -- writing a
  * human-readable reason into `error` (if non-NULL and error_capacity > 0)
  * in every failure case. */
 bool magnus_route_parse(const char *value, magnus_route_t *out, char *error,

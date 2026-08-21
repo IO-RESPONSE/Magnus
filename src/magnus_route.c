@@ -77,6 +77,7 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
     char *saveptr = NULL;
     char *token;
     bool action_seen = false;
+    bool cache_seen = false;
 
     memset(out, 0, sizeof(*out));
     if (strlen(value) >= sizeof(buffer)) {
@@ -126,6 +127,28 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
                 return false;
             }
             action_seen = true;
+            continue;
+        }
+
+        if (colon == NULL && strncmp(cursor, "cache", (size_t) (equals - cursor)) == 0
+            && (size_t) (equals - cursor) == 5) {
+            char *cache_value = equals + 1;
+            if (cache_seen) {
+                if (error != NULL && error_capacity > 0)
+                    snprintf(error, error_capacity, "duplicate 'cache'");
+                return false;
+            }
+            if (strcmp(cache_value, "on") == 0)
+                out->cache_enabled = true;
+            else if (strcmp(cache_value, "off") == 0)
+                out->cache_enabled = false;
+            else {
+                if (error != NULL && error_capacity > 0)
+                    snprintf(error, error_capacity,
+                            "'cache' must be on or off, got '%s'", cache_value);
+                return false;
+            }
+            cache_seen = true;
             continue;
         }
 
@@ -225,6 +248,12 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
     if (!action_seen) {
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity, "route is missing 'action'");
+        return false;
+    }
+    if (out->cache_enabled && out->action != MAGNUS_ROUTE_ACTION_PROXY) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity,
+                    "'cache=on' requires 'action=proxy'");
         return false;
     }
     return true;

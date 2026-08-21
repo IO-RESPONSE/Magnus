@@ -169,5 +169,33 @@ main(void)
     assert(magnus_route_parse("action=deny", &route, error, sizeof(error)));
     assert(magnus_route_matches(&route, &request, ip));
 
+    /* cache=on (roadmap 2d-1): defaults off, opts in only alongside
+     * action=proxy, order-independent with action=, rejected everywhere
+     * else. */
+    assert(magnus_route_parse("path_prefix=/; action=proxy", &route, error,
+                              sizeof(error)));
+    assert(!route.cache_enabled);
+    assert(magnus_route_parse("path_prefix=/; action=proxy; cache=on",
+                              &route, error, sizeof(error)));
+    assert(route.cache_enabled);
+    /* order-independent: cache= before action= too. */
+    assert(magnus_route_parse("cache=on; path_prefix=/; action=proxy",
+                              &route, error, sizeof(error)));
+    assert(route.cache_enabled);
+    assert(magnus_route_parse("path_prefix=/; action=proxy; cache=off",
+                              &route, error, sizeof(error)));
+    assert(!route.cache_enabled);
+    assert(!magnus_route_parse("path_prefix=/; action=proxy; cache=maybe",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse(
+        "path_prefix=/; action=proxy; cache=on; cache=on", &route, error,
+        sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=static; cache=on",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=deny; cache=on",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=grpc; cache=on",
+                               &route, error, sizeof(error)));
+
     return 0;
 }

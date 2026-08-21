@@ -1,5 +1,114 @@
 # Changelog
 
+## 1.18.0
+
+### Added
+
+- **Reverse-proxy response cache (roadmap 2d-1): a bounded, in-memory,
+  LRU-evicted cache shared by both the HTTP/1.1 and HTTP/2 proxy dispatch
+  paths, opt-in per route.** New module `magnus_cache.c`/`.h`; new route
+  DSL modifier `cache=on|off` (`action=proxy; cache=on`), parsed and
+  validated by `magnus_route_parse()` (rejects `cache=on` without
+  `action=proxy`).
+- Cacheability follows RFC 7234's core rules, narrowed for this
+  increment: only `GET` and a `200` response with an explicit freshness
+  signal (`Cache-Control: max-age` or `Expires`, `Expires` converted from
+  its wall-clock `Date`-relative deadline onto this module's own
+  monotonic clock) is ever stored. Excluded outright: `no-store`/
+  `private`, a response carrying `Set-Cookie` (a shared cache must never
+  serve one client's session state to another), and a `Vary` other than
+  (absent or) `Accept-Encoding` (this proxy's own outbound request never
+  sends one, so every cached response is always the identity encoding
+  regardless of what any given real client asked for -- see
+  `magnus_cache_compute_freshness()`'s own comment). `Cache-Control:
+  no-cache` still stores the response but marks it immediately stale, so
+  every future hit revalidates first rather than serving straight from
+  cache.
+- A fresh hit is served entirely without touching the upstream, with a
+  new `X-Cache: HIT` response header. A stale entry that still carries an
+  `ETag`/`Last-Modified` validator triggers a conditional GET
+  (`If-None-Match`/`If-Modified-Since` added to the fixed outbound proxy
+  request) instead of an unconditional re-fetch; a confirming `304`
+  refreshes the entry's freshness window and is answered from the
+  *cached* body with no second body transfer at all (`X-Cache:
+  REVALIDATED`); an origin that instead sends fresh content on that same
+  conditional GET is treated as an ordinary fetch, replacing the stale
+  entry (`magnus_cache_store()`'s own replace-in-place behavior).
+- Storage: a fixed grid of `MAGNUS_CACHE_MAX_ENTRIES` (512) slots, a
+  separate-chaining hash table for lookup, and an intrusive LRU list for
+  eviction under either entry-count or byte-budget
+  (`MAGNUS_CACHE_MAX_BYTES`, 64MiB) pressure; a single entry over
+  `MAGNUS_CACHE_MAX_ENTRY_BYTES` (8MiB) is declined outright, never
+  stored truncated. `magnus_cache_store()` always strips any
+  `Content-Length` line from the header block it is given -- a stored
+  entry's own `Content-Length` is *always* recomputed fresh from the
+  actual stored body length at serve time, never replayed from whatever
+  the original response claimed, so a caller can never accidentally
+  duplicate the header.
+- `/metrics` gained `magnus_cache_hits_total`/`_misses_total`/
+  `_revalidated_total` (counters) and `magnus_cache_entries`/
+  `magnus_cache_bytes` (gauges), always emitted (all zero when no route
+  ever enables caching, same as every other counter here starts at zero).
+  The whole cache is flushed unconditionally on a config reload (a
+  route's own `cache=on`/off, or the cluster a cached host+target would
+  now resolve against, may have changed meaning) and at shutdown.
+- Deliberately out of scope for this increment: heuristic freshness (no
+  fallback when neither `Cache-Control` nor `Expires` is present),
+  Vary-keyed multi-variant storage, an explicit purge API, and dogpile/
+  request-coalescing protection for a concurrent stampede on a still-
+  uncached URL.
+
+### Fixed
+
+Both found only through live testing against a real origin under
+ASan+UBSan, not by code review:
+
+- The HTTP/1.1 completion path initially referenced
+  `connection->proxy_header_out` (the sanitized response header block) to
+  find the cache-storable prefix, on the mistaken assumption that buffer
+  stays allocated until the proxy attempt's own teardown. It does not --
+  `magnus_proxy_flush()` frees it the moment its own bytes finish
+  reaching the client, typically well before the body (and therefore this
+  cache store, which only happens at true response completion) does,
+  producing a reliably reproducible null-pointer read/crash on the very
+  first cacheable response. Fixed by copying the storable header prefix
+  out into its own persisted `cache_pending_headers` field at header
+  time, mirroring what the HTTP/2 path already had to do (it never had a
+  persisted raw-text buffer to defer to in the first place, which is what
+  surfaced the HTTP/1.1 analogue as a real gap once compared side by
+  side).
+- An HTTP/2 cache-hit (and revalidation) response called
+  `magnus_h2_push()` immediately after submitting it, mirroring a pattern
+  used elsewhere for a mid-stream gRPC submit. Unlike that case,
+  `magnus_h2_proxy_start()`/`magnus_h2_proxy_receive_headers()` are always
+  reached from *inside* `nghttp2_session_mem_recv2()`'s own callback
+  stack, and their own callers still read the stream after they return --
+  pushing early can drive `nghttp2_session_mem_send2()` far enough to
+  close and free that same stream out from under the caller, a genuine
+  heap-use-after-free confirmed under ASan. Fixed by removing the
+  premature push entirely: every call path already performs exactly one
+  safe push of its own, after the whole callback chain has fully unwound
+  (`magnus_h2_service()`'s own post-recv drain, `magnus_h2c_activate()`'s
+  own tail, or `magnus_h2_handle_upstream()`'s own tail for the
+  upstream-triggered revalidation case).
+
+Verified against a real Python `http.server` origin, across both HTTP/1.1
+and HTTP/2 clients, under ASan+UBSan: fresh-miss-then-hit with byte-
+identical bodies; cross-protocol sharing in both directions (stored via
+one protocol, hit via the other); `no-store` and a `Set-Cookie`-carrying
+response each independently confirmed to never cache (every repeated call
+still reaching the origin, verified via a request counter the fake origin
+itself maintains); revalidation confirmed via `304` (old body preserved,
+`X-Cache: REVALIDATED`) and superseded via a fresh `200` (new body
+replaces the old, next hit serves the new one); a route with no `cache=`
+at all confirmed to never touch the cache regardless of an otherwise
+identical upstream/path. New permanent regression coverage in
+`tests/test-core.sh` (a `http.server`-based fake origin with a plain
+byte-counter file proving zero additional origin round-trips on a hit/
+revalidation, matching this project's existing precedent for that style
+of upstream fixture). `make clean && make test` and `make sanitize`
+(ASan+UBSan) both green. Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.17.0
 
 ### Added

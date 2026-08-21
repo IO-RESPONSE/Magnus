@@ -38,6 +38,10 @@ cleanup() {
     kill -TERM "$backend5_pid" >/dev/null 2>&1 || true
     wait "$backend5_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend6_pid:-}" ]; then
+    kill -TERM "$backend6_pid" >/dev/null 2>&1 || true
+    wait "$backend6_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -2621,3 +2625,208 @@ kill -TERM "$backend_pid" 2>/dev/null
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
 echo "grpc: ok"
+
+# Reverse-proxy cache (roadmap 2d-1): opt-in per route via
+# `action=proxy; cache=on`. hits.txt below is a plain byte-counter file
+# the fake upstream appends to on every request it actually receives --
+# the simplest possible way to prove a HIT/REVALIDATED response never
+# touched the upstream at all, without needing a stateful protocol of its
+# own.
+port_cache=$((port + 60))
+upstream_cache=$((port + 61))
+port_cache_off=$((port + 62))
+hits_file="$web_root/cache-hits.txt"
+: > "$hits_file"
+python3 -c "
+import http.server, threading
+
+HITS_FILE = '$hits_file'
+STATE = {'body': b'hello-v1', 'changed': False}
+LOCK = threading.Lock()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def _record(self):
+        with LOCK, open(HITS_FILE, 'a') as f:
+            f.write('x')
+
+    def do_GET(self):
+        self._record()
+        with LOCK:
+            body = STATE['body']
+            changed = STATE['changed']
+        if self.path == '/cacheable':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'max-age=60')
+            self.send_header('ETag', '\"v1\"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/no-store':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/with-cookie':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'max-age=60')
+            self.send_header('Set-Cookie', 'sess=abc')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/revalidate':
+            inm = self.headers.get('If-None-Match')
+            if changed:
+                newbody = b'hello-v2'
+                self.send_response(200)
+                self.send_header('Cache-Control', 'max-age=60')
+                self.send_header('ETag', '\"v2\"')
+                self.send_header('Content-Length', str(len(newbody)))
+                self.end_headers()
+                self.wfile.write(newbody)
+            elif inm == '\"v1\"':
+                self.send_response(304)
+                self.send_header('Cache-Control', 'max-age=1')
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header('Cache-Control', 'max-age=1')
+                self.send_header('ETag', '\"v1\"')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        elif self.path == '/change':
+            with LOCK:
+                STATE['changed'] = True
+            self.send_response(200)
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'ok')
+        else:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $upstream_cache), Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend6_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$upstream_cache/cacheable" >/dev/null && break
+  sleep 1
+done
+
+"$binary" --port "$port_cache" --upstream "127.0.0.1:$upstream_cache" \
+  --route "path_prefix=/; action=proxy; cache=on" \
+  --access-log on 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --http2-prior-knowledge --fail --silent \
+    "http://127.0.0.1:$port_cache/healthz" >/dev/null && break
+  sleep 1
+done
+
+# A fresh GET goes to the upstream and gets stored; a repeat GET is
+# answered entirely from the cache -- X-Cache: HIT, identical body, and
+# critically zero additional bytes in hits_file (the fake upstream's own
+# per-request marker).
+cache_body1="$web_root/cache-body1"
+cache_hdrs1="$web_root/cache-hdrs1"
+curl --silent --dump-header "$cache_hdrs1" --output "$cache_body1" \
+  "http://127.0.0.1:$port_cache/cacheable"
+grep -qi '^HTTP/1.1 200' "$cache_hdrs1"
+! grep -qi '^X-Cache:' "$cache_hdrs1"
+hits_after_first=$(wc -c < "$hits_file")
+
+cache_body2="$web_root/cache-body2"
+cache_hdrs2="$web_root/cache-hdrs2"
+curl --silent --dump-header "$cache_hdrs2" --output "$cache_body2" \
+  "http://127.0.0.1:$port_cache/cacheable"
+grep -qi '^X-Cache: HIT' "$cache_hdrs2"
+diff "$cache_body1" "$cache_body2"
+test "$(wc -c < "$hits_file")" = "$hits_after_first"
+
+# Same entry served to an HTTP/2 client too -- one shared cache, not one
+# per protocol.
+h2_hdrs="$web_root/cache-h2-hdrs"
+h2_body="$web_root/cache-h2-body"
+curl --http2-prior-knowledge --silent --dump-header "$h2_hdrs" \
+  --output "$h2_body" "http://127.0.0.1:$port_cache/cacheable"
+grep -qi '^x-cache: HIT' "$h2_hdrs"
+diff "$cache_body1" "$h2_body"
+test "$(wc -c < "$hits_file")" = "$hits_after_first"
+
+# no-store, and a response carrying Set-Cookie, are never cached even
+# though both are otherwise ordinary 200s -- every call reaches the
+# upstream.
+before=$(wc -c < "$hits_file")
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/no-store"
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/no-store"
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/with-cookie"
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/with-cookie"
+test "$(wc -c < "$hits_file")" = "$((before + 4))"
+
+# Revalidation: a stale entry with an ETag is revalidated via a
+# conditional GET (If-None-Match) rather than re-fetched in full -- a 304
+# from the origin refreshes freshness and is answered from the *cached*
+# body (X-Cache: REVALIDATED), never a second full transfer.
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/revalidate"
+sleep 1.2
+reval_hdrs="$web_root/cache-reval-hdrs"
+reval_body="$web_root/cache-reval-body"
+curl --silent --dump-header "$reval_hdrs" --output "$reval_body" \
+  "http://127.0.0.1:$port_cache/revalidate"
+grep -qi '^X-Cache: REVALIDATED' "$reval_hdrs"
+test "$(cat "$reval_body")" = "hello-v1"
+
+# If the origin decides to send fresh content instead of confirming a
+# 304, that is treated as an ordinary fetch -- the new content replaces
+# the stale entry, and a follow-up call now hits the *new* body.
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/change"
+sleep 1.2
+curl --silent --output /dev/null "http://127.0.0.1:$port_cache/revalidate"
+changed_hdrs="$web_root/cache-changed-hdrs"
+changed_body="$web_root/cache-changed-body"
+curl --silent --dump-header "$changed_hdrs" --output "$changed_body" \
+  "http://127.0.0.1:$port_cache/revalidate"
+grep -qi '^X-Cache: HIT' "$changed_hdrs"
+test "$(cat "$changed_body")" = "hello-v2"
+
+# /metrics reports real hit/miss/revalidation counters.
+cache_metrics=$(curl --silent "http://127.0.0.1:$port_cache/metrics")
+echo "$cache_metrics" | grep -qE '^magnus_cache_hits_total [1-9][0-9]*$'
+echo "$cache_metrics" | grep -qE '^magnus_cache_revalidated_total [1-9][0-9]*$'
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# A route that never opts in (no cache= at all) never touches the cache,
+# even for an otherwise-identical upstream/path -- opt-in is per route,
+# never a global default.
+"$binary" --port "$port_cache_off" --upstream "127.0.0.1:$upstream_cache" \
+  --route "path_prefix=/; action=proxy" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_cache_off/healthz" >/dev/null && break
+  sleep 1
+done
+before=$(wc -c < "$hits_file")
+off_hdrs="$web_root/cache-off-hdrs"
+curl --silent --dump-header "$off_hdrs" --output /dev/null \
+  "http://127.0.0.1:$port_cache_off/cacheable"
+curl --silent --dump-header "$off_hdrs" --output /dev/null \
+  "http://127.0.0.1:$port_cache_off/cacheable"
+! grep -qi '^X-Cache:' "$off_hdrs"
+test "$(wc -c < "$hits_file")" = "$((before + 2))"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend6_pid" 2>/dev/null
+wait "$backend6_pid" 2>/dev/null || true
+backend6_pid=
+echo "cache: hit/miss/revalidate/opt-in ok"

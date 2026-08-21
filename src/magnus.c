@@ -1,5 +1,6 @@
 #include "magnus_phase.h"
 #include "magnus_base64.h"
+#include "magnus_cache.h"
 #include "magnus_config.h"
 #include "magnus_compression.h"
 #include "magnus_http.h"
@@ -36,7 +37,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.17.0"
+#define MAGNUS_VERSION "1.18.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -317,6 +318,82 @@ typedef struct {
      * still report what the client actually asked for. */
     char proxy_log_method[8];
     char proxy_log_target[256];
+    /* Reverse-proxy cache (roadmap 2d-1) -- see magnus_cache.h's own top
+     * comment. `cache_enabled` is this dispatch's own route opt-in
+     * (magnus_route_t's cache_enabled), captured once at dispatch time so
+     * the rest of this async, multi-step flow (connect -> request ->
+     * headers -> body -> complete) never needs the route table again.
+     * `cache_host`/`cache_target` are the lookup/store key, likewise
+     * copied at dispatch time since the client's own magnus_http_request_t
+     * is stack-local and does not survive the asynchronous upstream
+     * fetch. `cache_revalidating` is true exactly while the in-flight
+     * upstream attempt is a conditional GET against an existing stale
+     * entry (magnus_proxy_pick_and_start() set cache_validator_etag/
+     * _last_modified from that entry to send); a plain miss/refetch
+     * leaves it false. `cache_this_response_cacheable`/`cache_freshness`
+     * are decided once response headers are known
+     * (magnus_proxy_receive_headers()) and acted on once the body is
+     * fully relayed (magnus_proxy_flush()'s own "response complete"
+     * branch). `cache_capture`/_length/_capacity/_overflowed mirror the
+     * gRPC pool's own io_buffer growth pattern (roadmap 2c-1/2c-2) to
+     * accumulate the response body being relayed, bounded by
+     * MAGNUS_CACHE_MAX_ENTRY_BYTES, purely as a side observation -- the
+     * normal client-facing relay through proxy_buffer is entirely
+     * unaffected by capture succeeding, failing, or never being
+     * attempted at all. */
+    bool cache_enabled;
+    bool cache_revalidating;
+    char cache_host[256];
+    char cache_target[256];
+    char cache_validator_etag[128];
+    char cache_validator_last_modified[64];
+    bool cache_this_response_cacheable;
+    magnus_cache_freshness_t cache_freshness;
+    /* Copied out of `sanitized` verbatim at header time (the cache-
+     * storable prefix -- status line + pass-through headers, before
+     * Connection/X-Magnus-Via/the affinity Set-Cookie; see
+     * magnus_proxy_sanitize_response_headers()'s own
+     * out_cacheable_prefix_length parameter) rather than remembered by
+     * offset into proxy_header_out: that buffer is freed the moment its
+     * own bytes finish reaching the client (magnus_proxy_flush()'s own
+     * header-flush phase), typically well before the body -- and
+     * therefore this cache store, at true response completion -- is
+     * ever reached. Same shape as the h2 path's own
+     * cache_pending_headers, for the identical reason (there, nothing
+     * ever persists the raw text at all). */
+    char cache_pending_headers[MAGNUS_PROXY_SANITIZED_LIMIT];
+    size_t cache_pending_headers_length;
+    /* This response's own ETag/Last-Modified (if any), captured at header
+     * time for magnus_cache_store() to use once the body completes --
+     * distinct from cache_validator_etag/_last_modified above, which
+     * instead hold the *stale entry's* validators sent *out* on a
+     * revalidation request; these are what comes *back*. */
+    char cache_response_etag[128];
+    char cache_response_last_modified[64];
+    char *cache_capture;
+    size_t cache_capture_length;
+    size_t cache_capture_capacity;
+    bool cache_capture_overflowed;
+    /* Serving a cache HIT (or a successful revalidation) directly to the
+     * client, entirely bypassing the upstream -- the cache-hit analogue
+     * of compressed_body above (same "malloc'd buffer, sent via
+     * magnus_handle_write(), freed once fully sent" shape, kept as its
+     * own separate field rather than reusing compressed_body itself so
+     * neither purpose's own lifecycle comments have to account for the
+     * other). cache_serve_headers holds the freshly-assembled status
+     * line + headers block (Content-Length/Connection/X-Cache recomputed
+     * for *this* client/response, never replayed verbatim from what a
+     * different client's own request happened to produce); cache_serve_body
+     * is a copy of the entry's own stored body, copied rather than
+     * referenced directly so this client's own slow-consumer pace can
+     * never be blocked on (or, worse, outlive) the cache entry itself
+     * being evicted/replaced mid-flight. */
+    char *cache_serve_headers;
+    size_t cache_serve_headers_length;
+    size_t cache_serve_headers_sent;
+    char *cache_serve_body;
+    size_t cache_serve_body_length;
+    size_t cache_serve_body_sent;
     struct in_addr client_address;
     struct in_addr raw_peer_address;
     bool proxy_proto_done;
@@ -796,6 +873,7 @@ static void magnus_prepare_response(magnus_connection_t *connection,
                                     magnus_request_t *request);
 static char *magnus_find_header_end(char *buffer, size_t length);
 static int magnus_process_input(int epoll_fd, magnus_connection_t *connection);
+static int magnus_handle_write(int epoll_fd, magnus_connection_t *connection);
 static int magnus_ws_update_interest(int epoll_fd, magnus_connection_t *connection);
 static int magnus_ws_service(int epoll_fd, magnus_connection_t *connection);
 static int magnus_h2_session_create(magnus_connection_t *connection);
@@ -803,7 +881,12 @@ static int magnus_h2_service(int epoll_fd, magnus_connection_t *connection);
 static void magnus_h2_close(magnus_connection_t *connection);
 static void magnus_h2_proxy_start(magnus_connection_t *connection,
                                   struct magnus_h2_stream *stream,
-                                  const char *forward_path);
+                                  const char *forward_path,
+                                  bool cache_route_enabled);
+static void magnus_h2_submit_cached_response(magnus_connection_t *connection,
+                                             struct magnus_h2_stream *stream,
+                                             magnus_cache_entry_t *entry,
+                                             const char *x_cache_value);
 static void magnus_h2_grpc_start(magnus_connection_t *connection,
                                  struct magnus_h2_stream *stream);
 static int magnus_h2_handle_upstream(struct magnus_h2_stream *stream,
@@ -830,11 +913,12 @@ static void magnus_build_metrics(char *out, size_t out_capacity);
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
-                                       const magnus_request_t *request,
+                                       magnus_request_t *request,
                                        const magnus_http_request_t *parsed,
                                        const char *forward_path,
                                        const char *client_affinity_key,
-                                       bool client_wants_close);
+                                       bool client_wants_close,
+                                       bool cache_route_enabled);
 
 static void
 magnus_signal_handler(int signal_number)
@@ -903,6 +987,9 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->compressed_body);
     free(connection->proxy_buffer);
     free(connection->proxy_header_out);
+    free(connection->cache_capture);
+    free(connection->cache_serve_headers);
+    free(connection->cache_serve_body);
     free(connection->ws_buffer);
     magnus_h2_close(connection);
     /* Safety net: normally already freed by magnus_free_body_if_unowned()
@@ -1186,12 +1273,149 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
     snprintf(out, out_capacity, "%02zx-%s", endpoint_index, token);
 }
 
+/* Appends `data`/`len` to connection->cache_capture (growable, doubling,
+ * same shape as the gRPC pool's own io_buffer growth -- see
+ * magnus_h2_grpc_client_on_data_chunk_recv()'s own comment on that
+ * precedent), bounded by MAGNUS_CACHE_MAX_ENTRY_BYTES. A no-op once
+ * cache_capture_overflowed is already true (or on this call's own
+ * allocation failure, which sets it) -- capture is always a pure,
+ * silently-declinable side observation of a response magnus is relaying
+ * to the client regardless, so its failure must never affect (or even be
+ * visible to) the normal relay path at all. */
+static void
+magnus_proxy_cache_capture(magnus_connection_t *connection, const char *data,
+                           size_t len)
+{
+    if (!connection->cache_enabled || connection->cache_capture_overflowed
+        || len == 0)
+        return;
+    if (connection->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+        connection->cache_capture_overflowed = true;
+        return;
+    }
+    if (connection->cache_capture_length + len
+        > connection->cache_capture_capacity) {
+        size_t new_capacity = connection->cache_capture_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : connection->cache_capture_capacity * 2;
+        char *grown;
+        while (new_capacity < connection->cache_capture_length + len)
+            new_capacity *= 2;
+        grown = realloc(connection->cache_capture, new_capacity);
+        if (grown == NULL) {
+            connection->cache_capture_overflowed = true;
+            return;
+        }
+        connection->cache_capture = grown;
+        connection->cache_capture_capacity = new_capacity;
+    }
+    memcpy(connection->cache_capture + connection->cache_capture_length, data,
+          len);
+    connection->cache_capture_length += len;
+}
+
+/* Serves a stored magnus_cache_entry_t directly to the client -- a cold
+ * HIT, or a successful revalidation (a 304 from the upstream) -- entirely
+ * bypassing the upstream for this one request. `x_cache_value` names
+ * which of those this was ("HIT" or "REVALIDATED"), reported back to the
+ * client via a new X-Cache response header, the same observability
+ * marker nginx/Varnish both already use.
+ *
+ * Synthesizes a *fresh* status-line-plus-headers block for cache_serve_headers
+ * -- the entry's own stored pass-through headers, followed by a newly
+ * computed Content-Length/Connection/X-Cache/X-Magnus-Via -- never the
+ * verbatim framing whichever earlier response happened to produce this
+ * entry used, since Content-Length must match *this* cached body's own
+ * length regardless of what the origin originally sent (already true by
+ * construction, but recomputing it fresh here does not depend on that),
+ * and Connection depends on *this* client's own request, not whichever
+ * client's request first populated the entry. cache_serve_body is a
+ * private copy of the entry's own stored body -- copied, not referenced,
+ * so this client's own slow-consumer pace can never be coupled to (or,
+ * worse, outlive) the cache entry itself being evicted/replaced by an
+ * unrelated request mid-flight; see cache_serve_body's own struct
+ * comment. Mirrors magnus_prepare_response()'s own counters/phase-hook
+ * side effects so a cache-served response is indistinguishable from any
+ * other synchronous dispatch to everything downstream of it (metrics,
+ * the PHASE_RESPONSE hook, the common access-log tail in
+ * magnus_dispatch_request()).
+ *
+ * Returns 0 on success (the response is now queued; magnus_handle_write()'s
+ * existing cache_serve_* drain, mirroring compressed_body's own, picks it
+ * up from here). Returns -1 on allocation failure, in which case nothing
+ * was queued and the caller must fall back to an ordinary upstream fetch
+ * instead -- a cache-serve failure is never a client-visible error on its
+ * own, only ever a missed optimization. */
+static int
+magnus_serve_cached_response(magnus_connection_t *connection,
+                             magnus_cache_entry_t *entry,
+                             bool client_wants_close,
+                             const char *x_cache_value,
+                             magnus_request_t *request)
+{
+    const char *headers, *body, *etag, *last_modified;
+    size_t headers_length, body_length;
+    char *header_block;
+    int written;
+    bool keep_alive = !client_wants_close;
+    (void) etag;
+    (void) last_modified;
+
+    magnus_cache_entry_data(entry, &headers, &headers_length, &body,
+                            &body_length, &etag, &last_modified);
+
+    /* +192 is generous headroom for the trailer this call appends below
+     * (Content-Length/Connection/X-Cache/X-Magnus-Via/blank line) --
+     * comparable in spirit to MAGNUS_PROXY_SANITIZED_LIMIT's own margin
+     * over MAGNUS_PROXY_HEADER_LIMIT for the same kind of appended
+     * trailer. */
+    header_block = malloc(headers_length + 192);
+    if (header_block == NULL) return -1;
+    memcpy(header_block, headers, headers_length);
+    written = snprintf(header_block + headers_length, 192,
+        "Content-Length: %zu\r\nConnection: %s\r\nX-Cache: %s\r\n"
+        "X-Magnus-Via: magnus-proxy/0.1\r\n\r\n",
+        body_length, keep_alive ? "keep-alive" : "close", x_cache_value);
+    if (written < 0 || (size_t) written >= 192) {
+        free(header_block);
+        return -1;
+    }
+
+    if (body_length > 0) {
+        connection->cache_serve_body = malloc(body_length);
+        if (connection->cache_serve_body == NULL) {
+            free(header_block);
+            return -1;
+        }
+        memcpy(connection->cache_serve_body, body, body_length);
+    }
+    connection->cache_serve_headers = header_block;
+    connection->cache_serve_headers_length = headers_length + (size_t) written;
+    connection->cache_serve_headers_sent = 0;
+    connection->cache_serve_body_length = body_length;
+    connection->cache_serve_body_sent = 0;
+    connection->close_after_write = !keep_alive;
+
+    request->status = (unsigned) magnus_cache_entry_status(entry);
+    magnus_requests_total++;
+    (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_RESPONSE, request);
+    return 0;
+}
+
 /* Builds the outbound proxy request once, then selects a healthy cluster
  * endpoint and connects to it, retrying against a different endpoint -- up
  * to MAGNUS_PROXY_MAX_ATTEMPTS total attempts -- if the connect itself
  * fails immediately. Returns 0 if an attempt is now in flight (client
- * interest already updated to watch for abort), -1 if no healthy endpoint
- * was available or the retry budget was exhausted.
+ * interest already updated to watch for abort), 2 if the request was
+ * answered synchronously and completely from the reverse-proxy cache
+ * (roadmap 2d-1, `cache_route_enabled` -- a GET with a fresh stored entry;
+ * see magnus_serve_cached_response()) with no upstream ever touched, or -1
+ * if no healthy endpoint was available or the retry budget was exhausted.
+ * A stale-but-still-revalidatable entry (has an ETag/Last-Modified but its
+ * freshness window has passed) is neither of those: it still returns 0
+ * like an ordinary fetch, just with conditional If-None-Match/
+ * If-Modified-Since headers added to the outbound request -- see
+ * `cache_revalidating`'s own struct comment for how the eventual 304-or-
+ * not outcome is handled once headers come back.
  *
  * `forward_path` is what actually goes out on the wire as the upstream
  * request's target: request->path with the literal "/proxy" prefix
@@ -1215,11 +1439,11 @@ magnus_encode_affinity_cookie(char *out, size_t out_capacity,
  * arrive) whenever the client did not already carry a usable one. */
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
-                            const magnus_request_t *request,
+                            magnus_request_t *request,
                             const magnus_http_request_t *parsed,
                             const char *forward_path,
                             const char *client_affinity_cookie,
-                            bool client_wants_close)
+                            bool client_wants_close, bool cache_route_enabled)
 {
     int written;
     size_t preferred_index;
@@ -1298,6 +1522,59 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
         }
     }
 
+    /* Reverse-proxy cache (roadmap 2d-1): only ever consulted for a GET
+     * on a route that opted in (cache_route_enabled -- action=proxy;
+     * cache=on). A fresh hit answers the request right here, with no
+     * upstream ever touched; a stale hit that still carries a validator
+     * switches this attempt into a conditional GET instead (below), so a
+     * confirming 304 can refresh the entry without re-transferring its
+     * body; anything else (no entry, or stale with no validator) is an
+     * ordinary miss and falls straight through to the plain fetch this
+     * function has always done. */
+    connection->cache_enabled = cache_route_enabled;
+    connection->cache_revalidating = false;
+    connection->cache_this_response_cacheable = false;
+    connection->cache_capture_overflowed = false;
+    if (cache_route_enabled && strcmp(request->method, "GET") == 0) {
+        strncpy(connection->cache_host, parsed->host,
+               sizeof(connection->cache_host) - 1);
+        connection->cache_host[sizeof(connection->cache_host) - 1] = '\0';
+        strncpy(connection->cache_target, forward_path,
+               sizeof(connection->cache_target) - 1);
+        connection->cache_target[sizeof(connection->cache_target) - 1] = '\0';
+
+        magnus_cache_entry_t *entry
+            = magnus_cache_lookup(connection->cache_host, connection->cache_target);
+        if (entry != NULL
+            && magnus_cache_entry_is_fresh(entry, magnus_cache_now_ms())) {
+            if (magnus_serve_cached_response(connection, entry, client_wants_close,
+                                             "HIT", request) == 0)
+                return 2;
+            /* Allocation failure serving from cache: never a client-visible
+             * error on its own (see magnus_serve_cached_response()'s own
+             * comment) -- falls through to an ordinary upstream fetch
+             * instead, exactly as if this had been a miss. */
+        } else if (entry != NULL && magnus_cache_entry_has_validator(entry)) {
+            const char *h, *b, *etag, *last_modified;
+            size_t hl, bl;
+            magnus_cache_entry_data(entry, &h, &hl, &b, &bl, &etag,
+                                    &last_modified);
+            connection->cache_revalidating = true;
+            strncpy(connection->cache_validator_etag, etag,
+                   sizeof(connection->cache_validator_etag) - 1);
+            connection->cache_validator_etag[
+                sizeof(connection->cache_validator_etag) - 1] = '\0';
+            strncpy(connection->cache_validator_last_modified, last_modified,
+                   sizeof(connection->cache_validator_last_modified) - 1);
+            connection->cache_validator_last_modified[
+                sizeof(connection->cache_validator_last_modified) - 1] = '\0';
+        }
+        /* else: no entry at all, or a stale one with no validator to
+         * revalidate against -- an ordinary miss, indistinguishable from
+         * here on out from a route that just enabled caching for the
+         * first time. */
+    }
+
     /* connection->body/body_length carry whatever request body was
      * buffered before dispatch reached here (empty for GET/HEAD and any
      * other request that had none). Relaying it is magnus_handle_upstream's
@@ -1310,7 +1587,30 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
      * this request. Worst case the upstream ignores it and closes anyway,
      * exactly like before this pool existed: MAGNUS_PROXY_READ_TIMEOUT_SECONDS
      * still bounds how long a response with neither Content-Length nor a
-     * closed connection can stay unresolved. */
+     * closed connection can stay unresolved.
+     *
+     * cache_revalidating (roadmap 2d-1) adds If-None-Match/If-Modified-
+     * Since, built once into a small fragment first rather than juggling
+     * conditional format strings -- only ever reachable for a bodyless
+     * GET (see the cache lookup above, which only ever sets it for a GET,
+     * and a cacheable request is never one this codebase attaches a body
+     * to), so only the body_length==0 branch below needs it. */
+    char conditional_headers[300] = "";
+    if (connection->cache_revalidating) {
+        size_t off = 0;
+        int w;
+        if (connection->cache_validator_etag[0] != '\0') {
+            w = snprintf(conditional_headers + off, sizeof(conditional_headers) - off,
+                        "If-None-Match: %s\r\n", connection->cache_validator_etag);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off) off += (size_t) w;
+        }
+        if (connection->cache_validator_last_modified[0] != '\0') {
+            w = snprintf(conditional_headers + off, sizeof(conditional_headers) - off,
+                        "If-Modified-Since: %s\r\n",
+                        connection->cache_validator_last_modified);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off) off += (size_t) w;
+        }
+    }
     written = connection->body_length > 0
         ? snprintf(connection->proxy_request, sizeof(connection->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
@@ -1320,8 +1620,9 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                    connection->body_length, request->request_id)
         : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-                   request->method, forward_path, request->request_id);
+                   "Connection: keep-alive\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
+                   request->method, forward_path, conditional_headers,
+                   request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
         return -1;
     connection->proxy_request_length = (size_t) written;
@@ -1378,6 +1679,18 @@ magnus_proxy_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
     connection->proxy_buffer = NULL;
     free(connection->proxy_header_out);
     connection->proxy_header_out = NULL;
+    /* Whatever this one attempt had captured toward a possible cache
+     * store (roadmap 2d-1) never outlives the attempt: a retry's fresh
+     * response must not be prefixed by a failed attempt's partial bytes,
+     * and a successful, cacheable completion has already handed this
+     * buffer's contents to magnus_cache_store() before ever reaching here
+     * -- see magnus_proxy_flush()'s own "response complete" branch, which
+     * always stores (if applicable) first and tears down after. */
+    free(connection->cache_capture);
+    connection->cache_capture = NULL;
+    connection->cache_capture_length = 0;
+    connection->cache_capture_capacity = 0;
+    connection->cache_capture_overflowed = false;
 }
 
 /* Ends an in-flight proxy attempt before any response bytes have reached
@@ -1536,6 +1849,23 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
             return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
         }
 
+        /* Reverse-proxy cache (roadmap 2d-1): commits the captured body
+         * (if capturing was ever attempted and never overflowed) now that
+         * the whole response is known complete -- before either upstream-
+         * leg outcome below, both of which can free cache_capture (the
+         * pool-checkin branch does not touch it, but
+         * magnus_proxy_teardown_upstream() does, and this must not race
+         * that). */
+        if (connection->cache_this_response_cacheable
+            && !connection->cache_capture_overflowed) {
+            magnus_cache_store(connection->cache_host, connection->cache_target,
+                200, connection->cache_pending_headers,
+                connection->cache_pending_headers_length, connection->cache_capture,
+                connection->cache_capture_length, connection->cache_response_etag,
+                connection->cache_response_last_modified,
+                &connection->cache_freshness);
+        }
+
         /* Response complete. The upstream leg either goes back into the
          * pool (cleanly length-framed, and not asked to close -- see
          * magnus_proxy_receive_headers()) or gets torn down exactly as
@@ -1584,6 +1914,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
     int sanitized_length;
+    size_t cacheable_prefix_length = 0;
 
     while (connection->proxy_header_accum < MAGNUS_PROXY_BUFFER) {
         ssize_t received = recv(connection->upstream_fd,
@@ -1649,10 +1980,81 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
         header_length, sanitized, sizeof(sanitized),
         connection->proxy_issue_affinity_cookie
             ? connection->proxy_affinity_key : NULL,
-        connection->proxy_client_wants_close, &info);
+        connection->proxy_client_wants_close, &info, &cacheable_prefix_length);
     if (sanitized_length < 0)
         return magnus_proxy_connect_failed(epoll_fd, connection, 502,
                                            "Bad Gateway");
+
+    /* Reverse-proxy cache (roadmap 2d-1): a successful revalidation -- the
+     * one outcome this attempt was actually sent as a conditional GET for
+     * (see magnus_proxy_pick_and_start()'s own cache_revalidating branch).
+     * A 304 carries no body by definition (RFC 9110 15.4.5), so this
+     * upstream leg is already fully "received" the moment its headers
+     * are -- finished off directly here (pool-checkin or teardown, same
+     * decision magnus_proxy_flush()'s own completion branch makes) rather
+     * than through the normal buffered body-relay path below, which has
+     * nothing of this response's own to relay: the *cached* body is what
+     * actually goes to the client, via the exact same
+     * magnus_serve_cached_response() a cold HIT uses, just with a
+     * different X-Cache value. */
+    if (connection->cache_revalidating && info.status == 304) {
+        magnus_cache_entry_t *entry;
+        if (info.upstream_poolable && connection->upstream_fd >= 0) {
+            int fd = connection->upstream_fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            magnus_upstream_owner[fd] = NULL;
+            connection->upstream_fd = -1;
+            magnus_pool_checkin(connection->proxy_endpoint_index, fd,
+                connection->proxy_upstream_requests_served + 1);
+            connection->proxy_active = false;
+            free(connection->proxy_buffer);
+            connection->proxy_buffer = NULL;
+            free(connection->proxy_header_out);
+            connection->proxy_header_out = NULL;
+        } else {
+            magnus_proxy_teardown_upstream(epoll_fd, connection);
+        }
+
+        entry = magnus_cache_lookup(connection->cache_host, connection->cache_target);
+        if (entry != NULL) {
+            magnus_cache_freshness_t freshness;
+            magnus_cache_compute_freshness(
+                info.cache_control[0] != '\0' ? info.cache_control : NULL,
+                info.expires[0] != '\0' ? info.expires : NULL, NULL, false,
+                magnus_cache_now_ms(), &freshness);
+            magnus_cache_revalidated(entry, &freshness);
+            {
+                magnus_request_t log_request = {0};
+                memcpy(log_request.request_id, connection->proxy_request_id,
+                      sizeof(log_request.request_id));
+                if (magnus_serve_cached_response(connection, entry,
+                        connection->proxy_client_wants_close, "REVALIDATED",
+                        &log_request) == 0) {
+                    double latency_ms = (double) (magnus_now_ms()
+                                                  - connection->request_started_ms);
+                    magnus_record_latency(latency_ms);
+                    magnus_access_log(connection->proxy_request_id,
+                                      connection->client_address,
+                                      connection->proxy_log_method,
+                                      connection->proxy_log_target,
+                                      log_request.status, latency_ms, -1);
+                    (void) magnus_update_interest(epoll_fd, connection,
+                                                  EPOLLOUT | EPOLLRDHUP);
+                    return magnus_handle_write(epoll_fd, connection);
+                }
+            }
+        }
+        /* The entry vanished between this attempt starting and the 304
+         * arriving (evicted by unrelated cache pressure elsewhere -- a
+         * narrow, honest-to-admit race, not a bug: this module never
+         * promised an entry survives an async round trip -- see
+         * magnus_cache_entry_data()'s own comment), or serving it failed
+         * outright. Either way there is nothing left to honestly answer
+         * with (a 304 carries no body of its own to fall back to), so
+         * this is treated like any other upstream response this codebase
+         * cannot make sense of. */
+        return magnus_proxy_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
 
     /* A WebSocket upgrade attempt that the upstream actually confirmed
      * (101): relay every header as-is, not the sanitized/hop-by-hop-
@@ -1722,6 +2124,42 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
      * buffered, here. */
     if (info.has_content_length && leftover > info.content_length)
         leftover = info.content_length;
+
+    /* Reverse-proxy cache (roadmap 2d-1): decided once, right here, the
+     * moment headers (and therefore Cache-Control/Expires/Vary/Set-Cookie/
+     * status) are known -- only ever true for a route that opted in
+     * (cache_enabled) and a 200 response (the only status this increment
+     * ever caches; see magnus_cache.h's own top comment). A response that
+     * arrived as a revalidation attempt but turned out *not* to be a 304
+     * (the origin decided to send fresh content instead -- handled
+     * entirely above, before this point, when it *is* a 304) is judged by
+     * exactly the same rule as any ordinary fetch: this simply overwrites
+     * whatever stale entry prompted the revalidation once the body
+     * completes, same as magnus_cache_store()'s own replace-in-place
+     * behavior already does for any repeat store. Body bytes are captured
+     * from here on (this leftover chunk now, every subsequent
+     * magnus_handle_upstream() recv() later) purely as a side observation
+     * -- see magnus_proxy_cache_capture()'s own comment on why its
+     * failure can never affect the normal relay below. */
+    connection->cache_this_response_cacheable = false;
+    if (connection->cache_enabled && info.status == 200) {
+        magnus_cache_compute_freshness(
+            info.cache_control[0] != '\0' ? info.cache_control : NULL,
+            info.expires[0] != '\0' ? info.expires : NULL,
+            info.vary[0] != '\0' ? info.vary : NULL, info.has_set_cookie,
+            magnus_cache_now_ms(), &connection->cache_freshness);
+        connection->cache_this_response_cacheable
+            = connection->cache_freshness.cacheable;
+    }
+    if (connection->cache_this_response_cacheable) {
+        memcpy(connection->cache_pending_headers, sanitized,
+              cacheable_prefix_length);
+        connection->cache_pending_headers_length = cacheable_prefix_length;
+        strcpy(connection->cache_response_etag, info.etag);
+        strcpy(connection->cache_response_last_modified, info.last_modified);
+        magnus_proxy_cache_capture(connection, body_start, leftover);
+    }
+
     memmove(connection->proxy_buffer, body_start, leftover);
     connection->proxy_buffer_length = leftover;
     connection->proxy_buffer_sent = 0;
@@ -1971,6 +2409,9 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
             connection->proxy_response_received += (size_t) received;
             connection->last_active = time(NULL);
             connection->proxy_last_activity = connection->last_active;
+            if (connection->cache_this_response_cacheable)
+                magnus_proxy_cache_capture(connection, connection->proxy_buffer,
+                    (size_t) received);
         } else if (want == 0) {
             /* Already have every declared body byte -- nothing left to
              * read, and treating a want-0 recv()'s return as EOF would be
@@ -2313,6 +2754,37 @@ struct magnus_h2_stream {
     char log_target[256];
     char affinity_key[64];
     bool issue_affinity_cookie;
+    /* Reverse-proxy cache (roadmap 2d-1) -- the h2 analogue of
+     * magnus_connection_t's own identically-named fields; see those for
+     * the full rationale. No cache_serve_* here at all: an h2 cache-hit
+     * response reuses stream->io_buffer/magnus_h2_read_io_buffer()
+     * directly (see magnus_h2_submit_cached_response()), the same
+     * whole-body-known-upfront plumbing magnus_h2_submit_text() already
+     * established for /healthz//metrics -- h2 never needed a second,
+     * dedicated buffer the way HTTP/1.1's own separate proxy-flush vs.
+     * synchronous-write code paths did. */
+    bool cache_enabled;
+    bool cache_revalidating;
+    char cache_host[256];
+    char cache_target[256];
+    char cache_validator_etag[128];
+    char cache_validator_last_modified[64];
+    bool cache_this_response_cacheable;
+    magnus_cache_freshness_t cache_freshness;
+    /* h2 has no persisted raw sanitized-text buffer to defer to the way
+     * HTTP/1.1's own connection->proxy_header_out stays around until
+     * teardown (magnus_h2_proxy_submit_response() tokenizes the sanitized
+     * block into nghttp2 name/value pairs and its own text is stack-
+     * local) -- so the cacheable prefix is copied out here, verbatim, at
+     * header time instead of remembered by reference/offset. */
+    char cache_pending_headers[MAGNUS_PROXY_SANITIZED_LIMIT];
+    size_t cache_pending_headers_length;
+    char cache_response_etag[128];
+    char cache_response_last_modified[64];
+    char *cache_capture;
+    size_t cache_capture_length;
+    size_t cache_capture_capacity;
+    bool cache_capture_overflowed;
     /* Built once at proxy start: "METHOD target HTTP/1.0\r\nHost: ...
      * \r\n...\r\n\r\n", sent to the upstream ahead of any request body. */
     char proxy_request[512];
@@ -2511,6 +2983,15 @@ magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
         close(stream->upstream_fd);
         stream->upstream_fd = -1;
     }
+    /* Reverse-proxy cache (roadmap 2d-1): whatever this one attempt had
+     * captured toward a possible cache store never outlives the attempt
+     * -- see magnus_proxy_teardown_upstream()'s own identical comment for
+     * the HTTP/1.1 path. */
+    free(stream->cache_capture);
+    stream->cache_capture = NULL;
+    stream->cache_capture_length = 0;
+    stream->cache_capture_capacity = 0;
+    stream->cache_capture_overflowed = false;
     /* gRPC (2c-1, pooled/multiplexed since 2c-5): the fd/session this
      * stream's RPC was relayed through belong to the *pool*, not this
      * stream, and must never be closed/deleted just because this one RPC
@@ -2566,6 +3047,7 @@ magnus_h2_stream_free(struct magnus_h2_stream *stream)
     magnus_h2_stream_teardown_upstream(stream);
     free(stream->body);
     free(stream->io_buffer);
+    free(stream->cache_capture);
     free(stream);
 }
 
@@ -2732,6 +3214,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     bool is_proxy_route;
     bool is_grpc_route = false;
     bool route_denied = false;
+    bool cache_route_enabled = false;
     bool is_healthz_path;
     bool is_metrics_path;
     bool head_only;
@@ -2780,6 +3263,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
             is_proxy_route = true;
             forward_path = stream->parsed.target;
+            cache_route_enabled = magnus_routes[r].cache_enabled;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
             route_denied = true;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
@@ -2859,7 +3343,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
             magnus_h2_submit_status(session, stream->stream_id, "413");
             return;
         }
-        magnus_h2_proxy_start(connection, stream, forward_path);
+        magnus_h2_proxy_start(connection, stream, forward_path, cache_route_enabled);
         return;
     }
     magnus_h2_dispatch_static(connection, stream);
@@ -3489,6 +3973,38 @@ magnus_h2_proxy_connect_failed(magnus_connection_t *connection,
     magnus_h2_proxy_fail(connection, stream, give_up_status);
 }
 
+/* The h2 analogue of magnus_proxy_cache_capture() -- see that function's
+ * own comment for the full rationale, identical here except operating on
+ * stream->cache_capture* instead of connection->cache_capture*. */
+static void
+magnus_h2_proxy_cache_capture(struct magnus_h2_stream *stream,
+                              const char *data, size_t len)
+{
+    if (!stream->cache_enabled || stream->cache_capture_overflowed
+        || len == 0)
+        return;
+    if (stream->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+        stream->cache_capture_overflowed = true;
+        return;
+    }
+    if (stream->cache_capture_length + len > stream->cache_capture_capacity) {
+        size_t new_capacity = stream->cache_capture_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : stream->cache_capture_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->cache_capture_length + len)
+            new_capacity *= 2;
+        grown = realloc(stream->cache_capture, new_capacity);
+        if (grown == NULL) {
+            stream->cache_capture_overflowed = true;
+            return;
+        }
+        stream->cache_capture = grown;
+        stream->cache_capture_capacity = new_capacity;
+    }
+    memcpy(stream->cache_capture + stream->cache_capture_length, data, len);
+    stream->cache_capture_length += len;
+}
+
 /* Entry point from magnus_h2_dispatch(): builds the outbound proxy
  * request (an h2 analogue of magnus_proxy_pick_and_start(), minus the
  * WebSocket branch -- see this block's own top-of-section comment for
@@ -3503,10 +4019,12 @@ magnus_h2_proxy_connect_failed(magnus_connection_t *connection,
  * request's "cookie" header is preferred for the first attempt only. */
 static void
 magnus_h2_proxy_start(magnus_connection_t *connection,
-                      struct magnus_h2_stream *stream, const char *forward_path)
+                      struct magnus_h2_stream *stream, const char *forward_path,
+                      bool cache_route_enabled)
 {
     const char *cookie_header = magnus_http_header_find(&stream->parsed, "cookie");
     char client_affinity[64] = "";
+    char conditional_headers[300] = "";
     bool sticky;
     size_t preferred_index;
     int written;
@@ -3519,6 +4037,75 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
            sizeof(stream->log_target) - 1);
     stream->log_target[sizeof(stream->log_target) - 1] = '\0';
 
+    /* Reverse-proxy cache (roadmap 2d-1) -- see magnus_proxy_pick_and_start()'s
+     * own identical logic for the full rationale; a fresh HIT here submits
+     * the response directly and returns, never touching the upstream at
+     * all. */
+    stream->cache_enabled = cache_route_enabled;
+    stream->cache_revalidating = false;
+    stream->cache_this_response_cacheable = false;
+    stream->cache_capture_overflowed = false;
+    if (cache_route_enabled && strcmp(stream->parsed.method, "GET") == 0) {
+        strncpy(stream->cache_host, stream->parsed.host,
+               sizeof(stream->cache_host) - 1);
+        stream->cache_host[sizeof(stream->cache_host) - 1] = '\0';
+        strncpy(stream->cache_target, forward_path,
+               sizeof(stream->cache_target) - 1);
+        stream->cache_target[sizeof(stream->cache_target) - 1] = '\0';
+
+        magnus_cache_entry_t *entry
+            = magnus_cache_lookup(stream->cache_host, stream->cache_target);
+        if (entry != NULL
+            && magnus_cache_entry_is_fresh(entry, magnus_cache_now_ms())) {
+            /* Deliberately no magnus_h2_push() here (unlike, say,
+             * magnus_h2_grpc_client_on_frame_recv()'s own immediate push
+             * after a mid-stream submit): magnus_h2_proxy_start() is
+             * always reached from inside nghttp2_session_mem_recv2()'s own
+             * callback stack (magnus_h2_on_frame_recv() -> magnus_h2_dispatch(),
+             * or the synthetic h2c-upgrade dispatch in
+             * magnus_h2c_activate()) -- pushing here can drive
+             * nghttp2_session_mem_send2() far enough to close this stream
+             * and free it out from under the caller, which still needs
+             * `stream` after this function returns (found the hard way:
+             * a real heap-use-after-free under ASan). The existing outer
+             * driving loop already pushes exactly once, safely, after
+             * everything here has finished with `stream` -- see
+             * magnus_h2_service()'s own post-recv magnus_h2_drain_send()
+             * call, and magnus_h2c_activate()'s own tail. */
+            magnus_h2_submit_cached_response(connection, stream, entry, "HIT");
+            return;
+        } else if (entry != NULL && magnus_cache_entry_has_validator(entry)) {
+            const char *h, *b, *etag, *last_modified;
+            size_t hl, bl;
+            magnus_cache_entry_data(entry, &h, &hl, &b, &bl, &etag,
+                                    &last_modified);
+            stream->cache_revalidating = true;
+            strncpy(stream->cache_validator_etag, etag,
+                   sizeof(stream->cache_validator_etag) - 1);
+            stream->cache_validator_etag[
+                sizeof(stream->cache_validator_etag) - 1] = '\0';
+            strncpy(stream->cache_validator_last_modified, last_modified,
+                   sizeof(stream->cache_validator_last_modified) - 1);
+            stream->cache_validator_last_modified[
+                sizeof(stream->cache_validator_last_modified) - 1] = '\0';
+        }
+    }
+    if (stream->cache_revalidating) {
+        size_t off = 0;
+        int w;
+        if (stream->cache_validator_etag[0] != '\0') {
+            w = snprintf(conditional_headers + off, sizeof(conditional_headers) - off,
+                        "If-None-Match: %s\r\n", stream->cache_validator_etag);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off) off += (size_t) w;
+        }
+        if (stream->cache_validator_last_modified[0] != '\0') {
+            w = snprintf(conditional_headers + off, sizeof(conditional_headers) - off,
+                        "If-Modified-Since: %s\r\n",
+                        stream->cache_validator_last_modified);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off) off += (size_t) w;
+        }
+    }
+
     written = stream->body_length > 0
         ? snprintf(stream->proxy_request, sizeof(stream->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
@@ -3528,8 +4115,9 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
                    stream->request_id)
         : snprintf(stream->proxy_request, sizeof(stream->proxy_request),
                    "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\nX-Magnus-Request-Id: %s\r\n\r\n",
-                   stream->parsed.method, forward_path, stream->request_id);
+                   "Connection: keep-alive\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
+                   stream->parsed.method, forward_path, conditional_headers,
+                   stream->request_id);
     if (written < 0 || (size_t) written >= sizeof(stream->proxy_request)) {
         magnus_h2_proxy_fail(connection, stream, "502");
         return;
@@ -3734,6 +4322,137 @@ magnus_h2_proxy_submit_response(magnus_connection_t *connection,
     }
 }
 
+/* Serves a stored magnus_cache_entry_t directly to an h2 stream -- the h2
+ * analogue of magnus_serve_cached_response() -- a cold HIT, or a
+ * successful revalidation (a 304 from the upstream), entirely bypassing
+ * the upstream for this one stream. Reuses stream->io_buffer/
+ * magnus_h2_read_io_buffer() exactly like magnus_h2_submit_text() already
+ * does for /healthz//metrics: the whole body is copied in and
+ * response_complete set to true from the very start, since (like those)
+ * there is no upstream, or anything else asynchronous, left to wait on.
+ * The entry's own stored headers (status line + pass-through fields,
+ * Content-Length already excluded by magnus_cache_store() -- see that
+ * function's own comment) are lowercased/tokenized exactly like
+ * magnus_h2_proxy_submit_response()'s own pass-through loop (h2 field
+ * names must be lowercase; the entry's own stored casing is not
+ * guaranteed to already be, since it came from an HTTP/1.x upstream
+ * response), then a fresh content-length/x-cache are added -- `Connection`
+ * is dropped entirely, same as magnus_h2_proxy_submit_response() already
+ * does, since it is forbidden in h2 (RFC 9113 8.2.2) and meaningless
+ * there regardless. `x_cache_value` names which of those this was ("HIT"
+ * or "REVALIDATED"). */
+static void
+magnus_h2_submit_cached_response(magnus_connection_t *connection,
+                                 struct magnus_h2_stream *stream,
+                                 magnus_cache_entry_t *entry,
+                                 const char *x_cache_value)
+{
+    const char *entry_headers, *entry_body, *etag, *last_modified;
+    size_t entry_headers_length, entry_body_length;
+    nghttp2_nv headers[24];
+    char name_storage[24][64];
+    size_t count = 0;
+    char status_text[8];
+    char content_length_text[32];
+    char *copy;
+    char *saveptr = NULL;
+    char *line;
+
+    magnus_cache_entry_data(entry, &entry_headers, &entry_headers_length,
+                            &entry_body, &entry_body_length, &etag,
+                            &last_modified);
+    (void) etag;
+    (void) last_modified;
+
+    copy = malloc(entry_headers_length + 1);
+    if (copy == NULL) {
+        magnus_h2_submit_status(connection->h2_session, stream->stream_id, "500");
+        return;
+    }
+    memcpy(copy, entry_headers, entry_headers_length);
+    copy[entry_headers_length] = '\0';
+
+    snprintf(status_text, sizeof(status_text), "%u",
+            magnus_cache_entry_status(entry));
+    headers[count] = magnus_h2_nv(":status", status_text);
+    count++;
+
+    strtok_r(copy, "\r\n", &saveptr); /* status line, already captured above */
+    for (line = strtok_r(NULL, "\r\n", &saveptr);
+         line != NULL && count < sizeof(headers) / sizeof(headers[0]);
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
+        char *colon = strchr(line, ':');
+        char *value;
+        size_t name_length;
+        if (colon == NULL) continue;
+        name_length = (size_t) (colon - line);
+        if (name_length == 0 || name_length >= sizeof(name_storage[0]))
+            continue;
+        memcpy(name_storage[count], line, name_length);
+        name_storage[count][name_length] = '\0';
+        for (size_t i = 0; i < name_length; i++)
+            name_storage[count][i]
+                = (char) tolower((unsigned char) name_storage[count][i]);
+        if (strcmp(name_storage[count], "connection") == 0) continue;
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        headers[count] = magnus_h2_nv(name_storage[count], value);
+        count++;
+    }
+    /* NOT freed here: each header's *value* (unlike its name, already
+     * copied into name_storage) is still a pointer straight into `copy`
+     * (magnus_h2_nv() copies neither -- see its own comment on
+     * NGHTTP2_NV_FLAG_NONE), so `copy` must outlive
+     * nghttp2_submit_response2() itself, which is what actually copies
+     * every name/value pair into its own storage. Freed once that call
+     * has returned, below. */
+
+    if (count < sizeof(headers) / sizeof(headers[0])) {
+        snprintf(content_length_text, sizeof(content_length_text), "%zu",
+                entry_body_length);
+        headers[count] = magnus_h2_nv("content-length", content_length_text);
+        count++;
+    }
+    if (count < sizeof(headers) / sizeof(headers[0])) {
+        headers[count] = magnus_h2_nv("x-cache", x_cache_value);
+        count++;
+    }
+
+    if (entry_body_length > 0) {
+        stream->io_buffer = malloc(entry_body_length);
+        if (stream->io_buffer == NULL) {
+            free(copy);
+            magnus_h2_submit_status(connection->h2_session, stream->stream_id,
+                                    "500");
+            return;
+        }
+        memcpy(stream->io_buffer, entry_body, entry_body_length);
+    }
+    stream->io_length = entry_body_length;
+    stream->io_sent = 0;
+    stream->response_complete = true;
+    stream->response_headers_submitted = true;
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_read_io_buffer,
+        };
+        (void) nghttp2_submit_response2(connection->h2_session,
+                                        stream->stream_id, headers, count,
+                                        &data_provider);
+    }
+    free(copy);
+
+    magnus_requests_total++;
+    {
+        double latency_ms = (double) (magnus_now_ms() - stream->started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(stream->request_id, stream->effective_client_address,
+                          stream->log_method, stream->log_target,
+                          magnus_cache_entry_status(entry), latency_ms, -1);
+    }
+}
+
 /* Once the response is known to be fully received from the upstream
  * (Content-Length reached, or the upstream closed), decides -- exactly
  * like the tail of magnus_proxy_flush() for HTTP/1.1 -- whether the
@@ -3747,6 +4466,27 @@ magnus_h2_proxy_maybe_complete(struct magnus_h2_stream *stream)
         && stream->response_received >= stream->response_length;
     if (!stream->upstream_eof && !complete_by_length) return;
     stream->response_complete = true;
+    /* Reverse-proxy cache (roadmap 2d-1): commits the captured body now
+     * that the whole response is known complete -- before either upstream
+     * -leg outcome below, both of which can free stream->cache_capture
+     * (the pool-checkin branch does not touch it, but
+     * magnus_h2_stream_teardown_upstream() does) -- see
+     * magnus_proxy_flush()'s own identical HTTP/1.1 comment. Unlike
+     * HTTP/1.1 (which still has connection->proxy_header_out, the raw
+     * sanitized text block, sitting around until its own teardown), h2
+     * never keeps one -- magnus_h2_proxy_submit_response() tokenizes it
+     * into nghttp2 name/value pairs and the text itself was stack-local --
+     * so the cacheable prefix had to be copied out into
+     * stream->cache_pending_headers at header time instead of remembered
+     * by reference; see magnus_h2_proxy_receive_headers()'s own comment. */
+    if (stream->cache_this_response_cacheable
+        && !stream->cache_capture_overflowed) {
+        magnus_cache_store(stream->cache_host, stream->cache_target, 200,
+            stream->cache_pending_headers, stream->cache_pending_headers_length,
+            stream->cache_capture, stream->cache_capture_length,
+            stream->cache_response_etag, stream->cache_response_last_modified,
+            &stream->cache_freshness);
+    }
     if (complete_by_length && stream->upstream_poolable
         && stream->upstream_fd >= 0) {
         int fd = stream->upstream_fd;
@@ -3781,6 +4521,7 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
     int sanitized_length;
+    size_t cacheable_prefix_length = 0;
 
     while (stream->header_accum < MAGNUS_PROXY_BUFFER) {
         ssize_t received = recv(stream->upstream_fd,
@@ -3827,14 +4568,82 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
         stream->issue_affinity_cookie ? stream->affinity_key : NULL,
         true /* client_wants_close: N/A for h2 -- see magnus_h2_proxy_submit_response()'s
               * own comment on why the Connection header this produces is
-              * dropped rather than forwarded either way */, &info);
+              * dropped rather than forwarded either way */, &info,
+        &cacheable_prefix_length);
     if (sanitized_length < 0) {
         magnus_h2_proxy_connect_failed(connection, stream, "502");
         return true;
     }
 
+    /* Reverse-proxy cache (roadmap 2d-1): a successful revalidation -- see
+     * magnus_proxy_receive_headers()'s own identical HTTP/1.1 handling for
+     * the full rationale (a 304 carries no body by definition, so this
+     * upstream leg is already fully "received" the moment its headers
+     * are; the *cached* body is what actually goes to the client, via
+     * magnus_h2_submit_cached_response(), never the raw 304 this stream
+     * itself would otherwise have submitted). */
+    if (stream->cache_revalidating && info.status == 304) {
+        magnus_cache_entry_t *entry;
+        if (info.upstream_poolable && stream->upstream_fd >= 0) {
+            int fd = stream->upstream_fd;
+            epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            magnus_h2_upstream_owner[fd] = NULL;
+            stream->upstream_fd = -1;
+            magnus_pool_checkin(stream->endpoint_index, fd,
+                stream->upstream_requests_served + 1);
+        } else {
+            magnus_h2_stream_teardown_upstream(stream);
+        }
+
+        entry = magnus_cache_lookup(stream->cache_host, stream->cache_target);
+        if (entry != NULL) {
+            magnus_cache_freshness_t freshness;
+            magnus_cache_compute_freshness(
+                info.cache_control[0] != '\0' ? info.cache_control : NULL,
+                info.expires[0] != '\0' ? info.expires : NULL, NULL, false,
+                magnus_cache_now_ms(), &freshness);
+            magnus_cache_revalidated(entry, &freshness);
+            /* Deliberately no magnus_h2_push() here -- see
+             * magnus_h2_proxy_start()'s own identical comment on why
+             * (found via the exact same heap-use-after-free under ASan):
+             * this function's own caller, magnus_h2_handle_upstream(),
+             * still reads `stream` after this call returns and only then
+             * pushes, once, at its own tail. */
+            magnus_h2_submit_cached_response(connection, stream, entry,
+                                             "REVALIDATED");
+            return true;
+        }
+        /* The entry vanished between this attempt starting and the 304
+         * arriving, or serving it failed outright -- see the HTTP/1.1
+         * path's own identical comment. Nothing left to honestly answer
+         * with. */
+        magnus_h2_proxy_fail(connection, stream, "502");
+        return true;
+    }
+
+    /* Decided once, right here, the moment headers (and therefore
+     * Cache-Control/Expires/Vary/Set-Cookie/status) are known -- see
+     * magnus_proxy_receive_headers()'s own identical comment. */
+    stream->cache_this_response_cacheable = false;
+    if (stream->cache_enabled && info.status == 200) {
+        magnus_cache_compute_freshness(
+            info.cache_control[0] != '\0' ? info.cache_control : NULL,
+            info.expires[0] != '\0' ? info.expires : NULL,
+            info.vary[0] != '\0' ? info.vary : NULL, info.has_set_cookie,
+            magnus_cache_now_ms(), &stream->cache_freshness);
+        stream->cache_this_response_cacheable = stream->cache_freshness.cacheable;
+    }
+    if (stream->cache_this_response_cacheable) {
+        memcpy(stream->cache_pending_headers, sanitized, cacheable_prefix_length);
+        stream->cache_pending_headers_length = cacheable_prefix_length;
+        strcpy(stream->cache_response_etag, info.etag);
+        strcpy(stream->cache_response_last_modified, info.last_modified);
+    }
+
     if (info.has_content_length && leftover > info.content_length)
         leftover = info.content_length;
+    if (stream->cache_this_response_cacheable)
+        magnus_h2_proxy_cache_capture(stream, body_start, leftover);
     memmove(stream->io_buffer, body_start, leftover);
     stream->io_length = leftover;
     stream->io_sent = 0;
@@ -3891,6 +4700,9 @@ magnus_h2_proxy_stream_response(struct magnus_h2_stream *stream)
         stream->io_sent = 0;
         stream->response_received += (size_t) received;
         stream->last_activity = time(NULL);
+        if (stream->cache_this_response_cacheable)
+            magnus_h2_proxy_cache_capture(stream, stream->io_buffer,
+                                          (size_t) received);
         magnus_h2_proxy_maybe_complete(stream);
         return;
     }
@@ -5632,6 +6444,31 @@ magnus_build_metrics(char *out, size_t out_capacity)
             written += (size_t) line2;
         }
     }
+
+    /* Reverse-proxy cache (roadmap 2d-1) -- always emitted (like the
+     * connections/requests counters above), not gated on any route
+     * actually having cache=on: the values are simply all zero when
+     * nothing ever does, same as every other counter here starts at
+     * zero. */
+    if (written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "# TYPE magnus_cache_hits_total counter\n"
+            "magnus_cache_hits_total %llu\n"
+            "# TYPE magnus_cache_misses_total counter\n"
+            "magnus_cache_misses_total %llu\n"
+            "# TYPE magnus_cache_revalidated_total counter\n"
+            "magnus_cache_revalidated_total %llu\n"
+            "# TYPE magnus_cache_entries gauge\n"
+            "magnus_cache_entries %zu\n"
+            "# TYPE magnus_cache_bytes gauge\n"
+            "magnus_cache_bytes %zu\n",
+            (unsigned long long) magnus_cache_hits_total(),
+            (unsigned long long) magnus_cache_misses_total(),
+            (unsigned long long) magnus_cache_revalidated_total(),
+            magnus_cache_entries_count(), magnus_cache_bytes_used());
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+    }
 }
 
 /* Runs the already-parsed request through ingress/route, rate limiting,
@@ -5655,6 +6492,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     bool is_grpc_route = false;
     bool literal_proxy_prefix;
     bool route_denied = false;
+    bool cache_route_enabled = false;
     const char *proxy_forward_path;
 
     memcpy(request.method, parsed->method, sizeof(request.method));
@@ -5702,6 +6540,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
             if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
                 is_proxy_route = true;
                 proxy_forward_path = request.path;
+                cache_route_enabled = magnus_routes[r].cache_enabled;
             } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
                 route_denied = true;
             } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
@@ -5783,10 +6622,13 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "h2c)\n", head_only, close_connection,
                                 &request);
     } else if (is_proxy_route) {
-        if (magnus_proxy_pick_and_start(epoll_fd, connection, &request, parsed,
-                                        proxy_forward_path,
-                                        parsed->affinity_key,
-                                        close_connection) == 0) {
+        int start_result = magnus_proxy_pick_and_start(epoll_fd, connection,
+                                                        &request, parsed,
+                                                        proxy_forward_path,
+                                                        parsed->affinity_key,
+                                                        close_connection,
+                                                        cache_route_enabled);
+        if (start_result == 0) {
             /* No access-log line here: the request has not completed yet
              * (that happens later, asynchronously, once the upstream
              * responds -- see magnus_proxy_receive_headers/_fail). Just
@@ -5801,9 +6643,15 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
             connection->proxy_log_target[
                 sizeof(connection->proxy_log_target) - 1] = '\0';
             return 1;
+        } else if (start_result != 2) {
+            magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
+                                    "bad gateway\n", head_only, true, &request);
         }
-        magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
-                                "bad gateway\n", head_only, true, &request);
+        /* start_result == 2: answered synchronously and completely from
+         * the reverse-proxy cache (roadmap 2d-1) -- request.status was
+         * already set by magnus_serve_cached_response(), so this falls
+         * through to the same common access-log tail below every other
+         * synchronous dispatch in this function already uses. */
     } else if (strcmp(request.path, "/") == 0) {
         magnus_prepare_response(connection, 200, "OK", "application/json",
                                 "{\"name\":\"Magnus\",\"engine\":\"native-c17\",\"status\":\"ready\"}\n",
@@ -6411,6 +7259,46 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         return -1;
     }
+    /* Reverse-proxy cache (roadmap 2d-1): a cache-served response's own
+     * headers, then body -- see magnus_serve_cached_response()'s own
+     * comment on why these are two dedicated fields rather than reusing
+     * output/compressed_body above (same shape, kept separate so neither
+     * purpose's lifecycle has to account for the other). Mutually
+     * exclusive with the file_fd-driven blocks below by construction: a
+     * cache-serve response never sets file_fd. */
+    while (connection->cache_serve_headers != NULL
+           && connection->cache_serve_headers_sent
+              < connection->cache_serve_headers_length) {
+        sent = magnus_socket_write(connection,
+            connection->cache_serve_headers + connection->cache_serve_headers_sent,
+            connection->cache_serve_headers_length
+                - connection->cache_serve_headers_sent);
+        if (sent > 0) {
+            connection->cache_serve_headers_sent += (size_t) sent;
+            magnus_bytes_sent += (uint64_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    while (connection->cache_serve_body_sent
+           < connection->cache_serve_body_length) {
+        sent = magnus_socket_write(connection,
+            connection->cache_serve_body + connection->cache_serve_body_sent,
+            connection->cache_serve_body_length
+                - connection->cache_serve_body_sent);
+        if (sent > 0) {
+            connection->cache_serve_body_sent += (size_t) sent;
+            magnus_bytes_sent += (uint64_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
     while (connection->tls == NULL && connection->file_fd >= 0
            && connection->file_offset < connection->file_length) {
         sent = sendfile(connection->fd, connection->file_fd,
@@ -6460,6 +7348,14 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
     connection->compressed_body = NULL;
     connection->compressed_body_length = 0;
     connection->compressed_body_sent = 0;
+    free(connection->cache_serve_headers);
+    connection->cache_serve_headers = NULL;
+    connection->cache_serve_headers_length = 0;
+    connection->cache_serve_headers_sent = 0;
+    free(connection->cache_serve_body);
+    connection->cache_serve_body = NULL;
+    connection->cache_serve_body_length = 0;
+    connection->cache_serve_body_sent = 0;
     if (connection->close_after_write) {
         return -1;
     }
@@ -7003,6 +7899,13 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_grpc_pool_close_all();
     magnus_grpc_cluster = new_grpc_cluster;
     magnus_grpc_upstream_enabled = new_grpc_cluster.count > 0;
+    /* Reverse-proxy cache (roadmap 2d-1): a reload can change which
+     * routes have cache=on at all, or the cluster a cached response's
+     * host+target combination would now hit -- flushed unconditionally,
+     * same conservative "never let a config generation see stale-by-
+     * meaning state" precedent as the two pools above, rather than trying
+     * to reason about which entries are still safe to keep. */
+    magnus_cache_purge_all();
     memcpy(magnus_routes, config->routes, sizeof(magnus_routes));
     magnus_route_count = config->route_count;
     memcpy(magnus_trusted_proxies, config->trusted_proxies,
@@ -7570,6 +8473,7 @@ main(int argc, char **argv)
             magnus_expire_idle(epoll_fd, now);
             magnus_pool_expire_idle(now);
             magnus_grpc_pool_expire(now);
+            magnus_cache_expire_sweep(magnus_cache_now_ms());
             magnus_dns_tick(now);
             magnus_health_tick(epoll_fd, now);
             magnus_access_log_flush();
@@ -7608,6 +8512,7 @@ main(int argc, char **argv)
     }
     magnus_pool_close_all();
     magnus_grpc_pool_close_all();
+    magnus_cache_purge_all();
     magnus_dns_stop();
     close(epoll_fd);
     close(listener);

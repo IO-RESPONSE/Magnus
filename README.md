@@ -31,7 +31,8 @@ independently by IORESPONSE.
 - Advanced routing: repeatable `route` rules (host/path-prefix/method/
   header/header-prefix/cookie/query/source-CIDR, combinable with AND,
   first match wins) ahead of the built-in dispatch, actioned as
-  proxy/deny/static/grpc
+  proxy/deny/static/grpc; a `action=proxy` route may also opt into the
+  reverse-proxy cache via `cache=on`
 - DNS-resolved upstreams: an `upstream` entry may be a hostname,
   resolved asynchronously on a dedicated background thread (this
   codebase's first thread) so the event loop never blocks; fixed-interval
@@ -108,6 +109,19 @@ independently by IORESPONSE.
   TCP+h2 handshake per RPC -- pool for parallelism, multiplex for
   overflow once the pool is warm; a connection recycles gracefully after
   a request-count/idle budget or on GOAWAY/a fatal I/O error
+- Reverse-proxy response cache: a bounded, in-memory, LRU-evicted cache
+  shared by both the HTTP/1.1 and HTTP/2 proxy dispatch paths (one cache;
+  a response stored via one protocol is servable to the other), opt-in
+  per route via a new `cache=on` route modifier
+  (`action=proxy; cache=on` -- never a global default). Only a GET with an
+  explicit freshness signal (`Cache-Control: max-age` or `Expires`) is
+  ever stored; `no-store`/`private`, a response carrying `Set-Cookie`, or
+  a `Vary` other than (absent or) `Accept-Encoding` are excluded outright.
+  A fresh hit is served without touching the upstream at all
+  (`X-Cache: HIT`); a stale entry with an `ETag`/`Last-Modified` is
+  revalidated via a conditional GET instead of a full re-fetch, and a
+  confirming `304` is answered from the cached body with no second
+  transfer (`X-Cache: REVALIDATED`)
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

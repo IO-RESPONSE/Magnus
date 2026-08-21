@@ -51,7 +51,8 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                        char *out, size_t out_capacity,
                                        const char *affinity_cookie_value,
                                        bool client_wants_close,
-                                       magnus_proxy_response_info_t *info)
+                                       magnus_proxy_response_info_t *info,
+                                       size_t *out_cacheable_prefix_length)
 {
     char *saveptr = NULL;
     char *line;
@@ -64,6 +65,12 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     bool transfer_encoding_seen = false;
     bool upstream_wants_close = false;
     unsigned long content_length = 0;
+    bool has_set_cookie = false;
+    char cache_control[sizeof(info->cache_control)] = "";
+    char expires[sizeof(info->expires)] = "";
+    char etag[sizeof(info->etag)] = "";
+    char last_modified[sizeof(info->last_modified)] = "";
+    char vary[sizeof(info->vary)] = "";
 
     (void) header_length;
     line = strtok_r(raw, "\r\n", &saveptr);
@@ -120,6 +127,23 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                         content_length = parsed;
                 }
             }
+        } else if (strcasecmp(name, "set-cookie") == 0) {
+            /* Presence alone matters for cacheability (see
+             * magnus_proxy_response_info_t's own comment) -- the value
+             * itself is still relayed to *this* client normally below,
+             * just never stored in a shared cache entry other clients
+             * would also receive it from. */
+            has_set_cookie = true;
+        } else if (strcasecmp(name, "cache-control") == 0) {
+            strncpy(cache_control, value, sizeof(cache_control) - 1);
+        } else if (strcasecmp(name, "expires") == 0) {
+            strncpy(expires, value, sizeof(expires) - 1);
+        } else if (strcasecmp(name, "etag") == 0) {
+            strncpy(etag, value, sizeof(etag) - 1);
+        } else if (strcasecmp(name, "last-modified") == 0) {
+            strncpy(last_modified, value, sizeof(last_modified) - 1);
+        } else if (strcasecmp(name, "vary") == 0) {
+            strncpy(vary, value, sizeof(vary) - 1);
         }
 
         if (magnus_proxy_is_hop_by_hop(name)) continue;
@@ -130,6 +154,14 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     }
 
     if (content_length_seen && !content_length_valid) return -1;
+
+    /* Everything above this point -- status line plus every pass-through
+     * header field -- is what a cache entry may store; everything below
+     * (the affinity Set-Cookie, then Connection/X-Magnus-Via) is specific
+     * to *this* relay and must never be replayed to a different client
+     * from a stored entry -- see this function's own doc comment on
+     * out_cacheable_prefix_length. */
+    if (out_cacheable_prefix_length != NULL) *out_cacheable_prefix_length = total;
 
     if (affinity_cookie_value != NULL) {
         written = snprintf(out + total, out_capacity - total,
@@ -145,6 +177,12 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     info->content_length = info->has_content_length ? content_length : 0;
     info->upstream_poolable = info->has_content_length && !upstream_wants_close;
     info->keep_client_alive = !client_wants_close && info->has_content_length;
+    info->has_set_cookie = has_set_cookie;
+    strcpy(info->cache_control, cache_control);
+    strcpy(info->expires, expires);
+    strcpy(info->etag, etag);
+    strcpy(info->last_modified, last_modified);
+    strcpy(info->vary, vary);
 
     written = snprintf(out + total, out_capacity - total,
                        "Connection: %s\r\nX-Magnus-Via: magnus-proxy/0.1\r\n\r\n",

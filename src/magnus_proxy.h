@@ -35,6 +35,21 @@ typedef struct {
      * the upstream ever closes its end. */
     bool has_content_length;
     unsigned long content_length;
+    /* Reverse-proxy cache support (roadmap 2d-1) -- captured while the
+     * same header pass already walks every upstream response header for
+     * framing purposes, so magnus_cache_compute_freshness()'s caller
+     * never needs a second pass over the raw response. Each string is ""
+     * (never NULL) when that header was absent; `has_set_cookie` is a
+     * plain bool since only presence, not the cookie's own value, matters
+     * for cacheability (a shared cache must never serve one client's
+     * session state to another -- see magnus_cache.h's own top
+     * comment). */
+    bool has_set_cookie;
+    char cache_control[256];
+    char expires[64];
+    char etag[128];
+    char last_modified[64];
+    char vary[128];
 } magnus_proxy_response_info_t;
 
 /* Parses a raw upstream HTTP response header block (a status line followed
@@ -56,6 +71,17 @@ typedef struct {
  * requests; pass NULL when the client already carries a valid affinity
  * cookie. `info` is filled in on success (unspecified on failure).
  *
+ * `out_cacheable_prefix_length` (roadmap 2d-1), if non-NULL, receives how
+ * many bytes at the start of `out` are the status line plus every
+ * pass-through header field this call forwarded -- i.e. everything
+ * *before* the affinity Set-Cookie/Connection/X-Magnus-Via lines this
+ * function itself appends, which a cache entry must never store verbatim
+ * (Connection depends on each future client's own preference; Content-
+ * Length gets recomputed from the cached body's own length; the affinity
+ * Set-Cookie is specific to the client that produced this one response,
+ * not safe to hand to every other client a shared cache entry serves).
+ * magnus_cache_store()'s own `headers_block` is exactly `out[0..*out_cacheable_prefix_length)`.
+ *
  * Returns the number of bytes written to `out` (excluding the NUL
  * terminator) on success, or -1 if the status line is malformed, a
  * Content-Length was malformed or duplicated, or `out` is too small to
@@ -64,6 +90,7 @@ int magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                            char *out, size_t out_capacity,
                                            const char *affinity_cookie_value,
                                            bool client_wants_close,
-                                           magnus_proxy_response_info_t *info);
+                                           magnus_proxy_response_info_t *info,
+                                           size_t *out_cacheable_prefix_length);
 
 #endif
