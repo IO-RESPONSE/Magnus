@@ -64,6 +64,11 @@ main(void)
     assert(config.stream_upstream_count == 0);
     assert(config.stream_lb_policy == MAGNUS_LB_ROUND_ROBIN);
     assert(config.sni_route_count == 0);
+    assert(!config.has_udp_listen);
+    assert(config.udp_upstream_count == 0);
+    assert(config.udp_lb_policy == MAGNUS_LB_ROUND_ROBIN);
+    assert(config.udp_session_idle_seconds == 30);
+    assert(config.udp_max_sessions == 1024);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -95,6 +100,12 @@ main(void)
             "stream_sni_route = a.example.com 10.0.2.1:7000\n"
             "stream_sni_route = a.example.com 10.0.2.2:7000\n"
             "stream_sni_route = *.b.example.com 10.0.2.3:7000:3\n"
+            "udp_listen = 9092\n"
+            "udp_upstream = 10.0.3.1:9000:2\n"
+            "udp_upstream = 10.0.3.2:9000\n"
+            "udp_lb_policy = least_conn\n"
+            "udp_session_idle_seconds = 60\n"
+            "udp_max_sessions = 256\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -142,6 +153,16 @@ main(void)
     assert(strcmp(config.sni_routes[1].pattern, "*.b.example.com") == 0);
     assert(config.sni_routes[1].upstream_count == 1);
     assert(config.sni_routes[1].upstreams[0].weight == 3);
+    assert(config.has_udp_listen);
+    assert(config.udp_listen_port == 9092);
+    assert(config.udp_upstream_count == 2);
+    assert(strcmp(config.udp_upstreams[0].address, "10.0.3.1") == 0);
+    assert(config.udp_upstreams[0].port == 9000);
+    assert(config.udp_upstreams[0].weight == 2);
+    assert(config.udp_upstreams[1].weight == 1);
+    assert(config.udp_lb_policy == MAGNUS_LB_LEAST_CONN);
+    assert(config.udp_session_idle_seconds == 60);
+    assert(config.udp_max_sessions == 256);
 
     /* stream_listen/stream_upstream: each requires the other, the port
      * must differ from the main listener, a hostname is rejected (same
@@ -225,6 +246,59 @@ main(void)
     assert(config.sni_routes[0].upstream_count == 2);
     assert(strcmp(config.sni_routes[1].pattern, "*.example.com") == 0);
     assert(config.sni_routes[1].upstream_count == 1);
+
+    /* udp_listen/udp_upstream: each requires the other (no "must differ
+     * from port" restriction, unlike stream_listen -- UDP and TCP share
+     * no port namespace), a hostname endpoint is rejected, and
+     * udp_lb_policy/udp_session_idle_seconds/udp_max_sessions each
+     * validate their own range. */
+    write_file(config_path, "port = 8080\nudp_listen = 9092\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "udp_listen") != NULL);
+    write_file(config_path, "port = 8080\nudp_upstream = 10.0.0.1:9000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "udp_upstream") != NULL);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 8080\nudp_upstream = 10.0.0.1:9000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.udp_listen_port == 8080);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = backend.internal:9000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = 10.0.0.1:9000\nudp_lb_policy = ip_hash\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.udp_lb_policy == MAGNUS_LB_IP_HASH);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = 10.0.0.1:9000\nudp_lb_policy = fastest\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "udp_lb_policy") != NULL);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = 10.0.0.1:9000\nudp_session_idle_seconds = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "udp_session_idle_seconds") != NULL);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "udp_max_sessions") != NULL);
+    write_file(config_path,
+        "port = 8080\nudp_listen = 9092\n"
+        "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 4097\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
 
     /* health_check_*: malformed/out-of-range values rejected. */
     write_file(config_path, "port = 8080\nhealth_check_path = no-leading-slash\n");

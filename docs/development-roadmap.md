@@ -811,6 +811,61 @@ connection-pool and common-request-model decisions).
     ClientHello as a seed, not just hand-built ones) and new permanent
     regression coverage in `tests/test-core.sh`. See `CHANGELOG.md`
     1.22.0 for the full detail.
+  - **UDP passthrough 3d — a fourth, independent listener, NAT-style
+    session tracking, no HTTP/TCP machinery involved at all. Shipped in
+    1.23.0 -- closes out Phase 3.** New `udp_listen`/`udp_upstream`/
+    `udp_lb_policy`/`udp_session_idle_seconds`/`udp_max_sessions` config
+    keys and matching `--udp-*` CLI flags. Plain `SOCK_DGRAM`, no
+    `accept()`/handshake of any kind (UDP has neither) -- one NAT-style
+    `magnus_udp_session_t` per distinct (source IP, source port) tuple the
+    listener has ever seen recently, each owning its own dedicated
+    `connect()`ed UDP socket to whichever backend `magnus_udp_cluster`
+    picked for that tuple, the same "one socket per active flow" pattern
+    every other cluster in this file already uses for TCP -- reusing
+    `round_robin`/`least_conn`/`ip_hash` (`ip_hash` keyed on source IP
+    alone, so unrelated source ports from the same client still land on
+    the same backend) and the exact same `magnus_cluster_endpoint_begin()`/
+    `_end()` live-count mechanism roadmap 2e-1 already built, here
+    repurposed as "sessions currently pinned to this endpoint" rather than
+    "requests". **The "Section 12" memory bound the roadmap itself
+    flagged needing a real answer before implementation, not discovered
+    mid-implementation**: `udp_max_sessions` (default 1024, hard ceiling
+    `MAGNUS_UDP_MAX_SESSIONS_CEILING` = 4096, a fixed array, no dynamic
+    allocation) is enforced by simply dropping a new tuple's packet once
+    full -- deliberately never evicting an existing session to make room,
+    since UDP's trivially spoofable source address would otherwise turn
+    eviction itself into a denial-of-service primitive against whichever
+    legitimate client got evicted. No health tracking of any kind, active
+    or passive: a `connect()`ed UDP socket's own `connect()` call succeeds
+    locally almost unconditionally regardless of whether the backend
+    actually exists (no handshake to fail the way TCP's SYN/ACK would),
+    so it carries none of the passive signal `magnus_cluster_result()`
+    relies on elsewhere in this file -- the same scope-cut precedent
+    `stream_sni_route`'s own clusters (roadmap 3b) already set, for the
+    same underlying reason. A hard read error on a session's own backend
+    socket (most notably `ECONNREFUSED`, which Linux can surface on a
+    `connect()`ed UDP socket from a matching ICMP port-unreachable -- the
+    one real liveness signal UDP offers at all) tears that session down
+    immediately rather than waiting out the idle timeout. `udp_listen`
+    deliberately carries no "must differ from `port`/`stream_listen`"
+    restriction, unlike `stream_listen` itself -- UDP and TCP occupy
+    independent port namespaces at the OS level, so there is no actual
+    conflict to guard against. `/metrics` gained
+    `magnus_udp_sessions_total`/`_active`,
+    `magnus_udp_bytes_total{direction=...}`, and
+    `magnus_udp_upstream_active_sessions{endpoint=...}` -- no
+    healthy/unhealthy gauge, since exposing one that could only ever read
+    "always healthy" would be actively misleading rather than merely
+    unused. Verified live under ASan+UBSan against real UDP backends:
+    `round_robin` alternation across distinct clients plus per-session
+    stickiness for repeated messages from the same client; `ip_hash`
+    routing separate sockets sharing one source IP to the same endpoint;
+    the session cap dropping exactly the packets past the configured
+    ceiling while leaving already-active sessions untouched; a session
+    pointed at a genuinely unreachable backend torn down within
+    ~1.5s via the ICMP-triggered `ECONNREFUSED` path rather than sitting
+    out its full idle timeout. New permanent regression coverage in
+    `tests/test-core.sh`. See `CHANGELOG.md` 1.23.0 for the full detail.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
   (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)

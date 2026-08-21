@@ -38,7 +38,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.22.0"
+#define MAGNUS_VERSION "1.23.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -510,6 +510,72 @@ typedef struct {
 
 static magnus_sni_cluster_t magnus_sni_clusters[MAGNUS_CONFIG_MAX_SNI_ROUTES];
 static size_t magnus_sni_cluster_count;
+
+/* UDP passthrough (roadmap 3d): a fourth, independent listener -- plain
+ * SOCK_DGRAM, no `accept()`/handshake of any kind, since UDP has neither.
+ * One magnus_udp_session_t per distinct (source IP, source port) tuple
+ * the listener has ever seen recently, each owning its own dedicated
+ * connect()ed UDP socket to whichever backend magnus_udp_cluster.policy
+ * picked for that tuple -- the same "one socket per active flow,
+ * connect() fixes the peer so replies route back unambiguously" pattern
+ * every other cluster in this file already uses for TCP, just with
+ * SOCK_DGRAM sockets that never actually handshake. Capped at
+ * magnus_udp_max_sessions (<= MAGNUS_UDP_MAX_SESSIONS_CEILING, the fixed
+ * array size actually allocated) -- the "Section 12" memory bound the
+ * roadmap itself flagged needing a real answer before implementation,
+ * not discovered mid-implementation: once full, a new (source IP,
+ * source port) tuple's packet is simply dropped, never evicting an
+ * existing session to make room (an already-active session's own client
+ * would silently lose its return traffic for a stranger's benefit,
+ * which -- combined with how trivially spoofable a UDP source address
+ * is -- would turn eviction itself into a denial-of-service primitive
+ * rather than a safety valve). No health tracking of any kind, active
+ * or passive: a connect()ed UDP socket's own connect() call succeeds
+ * locally almost unconditionally regardless of whether the backend
+ * actually exists (there is no handshake to fail the way TCP's SYN/ACK
+ * would), so it carries none of the passive signal
+ * magnus_cluster_result() relies on elsewhere in this file; a genuine
+ * UDP-level health probe is a distinct, not-yet-built future increment,
+ * matching the same scope-cut precedent stream_sni_route's own clusters
+ * (roadmap 3b) already set. least_conn is still meaningful without a
+ * health signal -- it reads live session counts via the same
+ * magnus_cluster_endpoint_begin()/_end() every other cluster's own
+ * `active_requests` field already tracks, reused here unmodified for
+ * "sessions currently pinned to this endpoint" instead of "requests". */
+#define MAGNUS_UDP_MAX_SESSIONS_CEILING 4096
+#define MAGNUS_UDP_DATAGRAM_MAX MAGNUS_PROXY_BUFFER
+
+static magnus_cluster_t magnus_udp_cluster;
+static bool magnus_udp_enabled;
+static unsigned magnus_udp_port;
+static int magnus_udp_listener = -1;
+static unsigned magnus_udp_session_idle_seconds = 30;
+static unsigned magnus_udp_max_sessions = 1024;
+
+typedef struct {
+    bool in_use;
+    struct in_addr client_addr;
+    in_port_t client_port;
+    int upstream_fd;
+    size_t endpoint_index;
+    bool endpoint_counted;
+    time_t last_active;
+} magnus_udp_session_t;
+
+static magnus_udp_session_t magnus_udp_sessions[MAGNUS_UDP_MAX_SESSIONS_CEILING];
+static size_t magnus_udp_session_count;
+/* fd -> session, for O(1) reply routing once a session's own backend
+ * socket becomes readable -- the forward direction (an arriving client
+ * datagram on the single shared listener) has no fd of its own to index
+ * by and instead linear-scans magnus_udp_sessions[], bounded by
+ * magnus_udp_max_sessions; a hash index there would be the natural next
+ * optimization if real deployments ever need more than this increment's
+ * own modest default ceiling, the same honest, explicitly-scoped
+ * trade-off magnus_rate_table's own linear scan already makes. */
+static magnus_udp_session_t *magnus_udp_upstream_owner[MAGNUS_MAX_FDS];
+static uint64_t magnus_udp_sessions_total;
+static uint64_t magnus_udp_bytes_c2u_total;
+static uint64_t magnus_udp_bytes_u2c_total;
 
 /* One direction of a stream connection's byte relay: `buffer[sent..length)`
  * is buffered-but-not-yet-written to the destination fd. `source_eof` is
@@ -6842,6 +6908,43 @@ magnus_build_metrics(char *out, size_t out_capacity)
         }
     }
 
+    /* UDP passthrough (roadmap 3d) -- gated on magnus_udp_enabled, same
+     * reasoning as the stream block above. No healthy/unhealthy gauge:
+     * this cluster tracks no health signal at all (see
+     * magnus_udp_session_t's own comment on why) -- exposing one that
+     * could only ever read "always healthy" would be actively
+     * misleading rather than merely unused. active_sessions is the real
+     * per-endpoint load signal this cluster does have, reusing
+     * magnus_endpoint_t's own active_requests field (see
+     * magnus_udp_create_session()'s own comment on the reuse). */
+    if (magnus_udp_enabled && written < out_capacity) {
+        int line = snprintf(out + written, out_capacity - written,
+            "# TYPE magnus_udp_sessions_total counter\n"
+            "magnus_udp_sessions_total %llu\n"
+            "# TYPE magnus_udp_sessions_active gauge\n"
+            "magnus_udp_sessions_active %zu\n"
+            "# TYPE magnus_udp_bytes_total counter\n"
+            "magnus_udp_bytes_total{direction=\"client_to_upstream\"} %llu\n"
+            "magnus_udp_bytes_total{direction=\"upstream_to_client\"} %llu\n"
+            "# TYPE magnus_udp_upstream_active_sessions gauge\n",
+            (unsigned long long) magnus_udp_sessions_total,
+            magnus_udp_session_count,
+            (unsigned long long) magnus_udp_bytes_c2u_total,
+            (unsigned long long) magnus_udp_bytes_u2c_total);
+        if (line > 0 && (size_t) line < out_capacity - written)
+            written += (size_t) line;
+        for (size_t index = 0; index < magnus_udp_cluster.count
+             && written < out_capacity; index++) {
+            int line2 = snprintf(out + written, out_capacity - written,
+                "magnus_udp_upstream_active_sessions{endpoint=\"%s:%u\"} %u\n",
+                magnus_udp_cluster.endpoints[index].address,
+                magnus_udp_cluster.endpoints[index].port,
+                magnus_udp_cluster.endpoints[index].active_requests);
+            if (line2 < 0 || (size_t) line2 >= out_capacity - written) return;
+            written += (size_t) line2;
+        }
+    }
+
     /* Reverse-proxy cache (roadmap 2d-1) -- always emitted (like the
      * connections/requests counters above), not gated on any route
      * actually having cache=on: the values are simply all zero when
@@ -8850,6 +8953,208 @@ magnus_stream_expire_idle(int epoll_fd, time_t now)
     }
 }
 
+/* UDP passthrough (roadmap 3d): see magnus_udp_session_t's own comment
+ * for the full session-lifecycle design. Linear scan, bounded by
+ * magnus_udp_max_sessions -- see magnus_udp_upstream_owner's own comment
+ * on why. */
+static magnus_udp_session_t *
+magnus_udp_find_session(struct in_addr client_addr, in_port_t client_port)
+{
+    for (size_t index = 0; index < magnus_udp_max_sessions; index++) {
+        magnus_udp_session_t *session = &magnus_udp_sessions[index];
+        if (session->in_use
+            && session->client_addr.s_addr == client_addr.s_addr
+            && session->client_port == client_port)
+            return session;
+    }
+    return NULL;
+}
+
+static void
+magnus_udp_close_session(int epoll_fd, magnus_udp_session_t *session)
+{
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, session->upstream_fd, NULL);
+    magnus_udp_upstream_owner[session->upstream_fd] = NULL;
+    close(session->upstream_fd);
+    if (session->endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_udp_cluster, session->endpoint_index);
+        session->endpoint_counted = false;
+    }
+    session->in_use = false;
+    session->upstream_fd = -1;
+    if (magnus_udp_session_count > 0) magnus_udp_session_count--;
+}
+
+/* Picks an endpoint (magnus_udp_cluster.policy; no cookie-based affinity,
+ * same reasoning as the TCP stream cluster -- there is no HTTP-level
+ * cookie at this layer either) and opens a fresh connect()ed UDP socket
+ * to it for a (source IP, source port) tuple never seen before. Returns
+ * NULL (caller drops the triggering packet) if the session cap has
+ * already been reached, no endpoint is configured, or the socket/
+ * epoll_ctl setup itself fails -- deliberately never blocks waiting for
+ * anything, since UDP has no connection handshake to wait on in the
+ * first place; the very next packet from the same client tries again
+ * from scratch. */
+static magnus_udp_session_t *
+magnus_udp_create_session(int epoll_fd, struct in_addr client_addr,
+                          in_port_t client_port)
+{
+    struct sockaddr_in upstream_address;
+    int upstream_fd;
+    int selected;
+    magnus_udp_session_t *session = NULL;
+    struct epoll_event event;
+
+    if (magnus_udp_session_count >= magnus_udp_max_sessions) return NULL;
+    selected = magnus_cluster_select(&magnus_udp_cluster, magnus_now_ms(), NULL,
+                                     client_addr);
+    if (selected < 0
+        || !magnus_cluster_endpoint_sockaddr(&magnus_udp_cluster,
+                                             (size_t) selected, &upstream_address))
+        return NULL;
+    upstream_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (upstream_fd < 0 || upstream_fd >= MAGNUS_MAX_FDS) {
+        if (upstream_fd >= 0) close(upstream_fd);
+        return NULL;
+    }
+    /* connect() on a UDP socket never handshakes -- it only fixes the
+     * default peer address locally, letting send()/recv() stand in for
+     * sendto()/recvfrom() and (the real reason it matters here) giving
+     * this session's own reply traffic a distinct fd to arrive on. Its
+     * success here says nothing about whether the backend actually
+     * exists -- see magnus_udp_session_t's own comment on why this
+     * cluster tracks no health signal at all. */
+    if (connect(upstream_fd, (struct sockaddr *) &upstream_address,
+               sizeof(upstream_address)) < 0) {
+        close(upstream_fd);
+        return NULL;
+    }
+    for (size_t index = 0; index < magnus_udp_max_sessions; index++) {
+        if (!magnus_udp_sessions[index].in_use) {
+            session = &magnus_udp_sessions[index];
+            break;
+        }
+    }
+    if (session == NULL) {
+        /* Should not happen given the count check above; defensive only. */
+        close(upstream_fd);
+        return NULL;
+    }
+    event = (struct epoll_event) { .events = EPOLLIN, .data.fd = upstream_fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, upstream_fd, &event) < 0) {
+        close(upstream_fd);
+        return NULL;
+    }
+    session->in_use = true;
+    session->client_addr = client_addr;
+    session->client_port = client_port;
+    session->upstream_fd = upstream_fd;
+    session->endpoint_index = (size_t) selected;
+    session->last_active = time(NULL);
+    magnus_cluster_endpoint_begin(&magnus_udp_cluster, session->endpoint_index);
+    session->endpoint_counted = true;
+    magnus_udp_upstream_owner[upstream_fd] = session;
+    magnus_udp_session_count++;
+    magnus_udp_sessions_total++;
+    return session;
+}
+
+/* The single shared UDP listener becoming readable: one arriving
+ * datagram is one client packet, read via recvfrom() (never accept() --
+ * UDP has no such concept) so the source (IP, port) tuple is known
+ * before anything else happens. An existing session for that tuple gets
+ * the packet relayed on its own dedicated backend socket; a new tuple
+ * gets a fresh magnus_udp_create_session() attempt, and (cap reached, no
+ * endpoint available, or the connect() itself failing) the packet is
+ * simply dropped -- UDP itself already offers no delivery guarantee, so
+ * a dropped packet here is well within the protocol's own contract, not
+ * a magnus-specific failure mode needing a client-visible signal. */
+static void
+magnus_udp_listener_service(int epoll_fd)
+{
+    for (;;) {
+        char buffer[MAGNUS_UDP_DATAGRAM_MAX];
+        struct sockaddr_in client_address;
+        socklen_t address_length = sizeof(client_address);
+        ssize_t received;
+        magnus_udp_session_t *session;
+
+        received = recvfrom(magnus_udp_listener, buffer, sizeof(buffer), 0,
+                            (struct sockaddr *) &client_address, &address_length);
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            if (errno == EINTR) continue;
+            return;
+        }
+        session = magnus_udp_find_session(client_address.sin_addr,
+                                          client_address.sin_port);
+        if (session == NULL) {
+            session = magnus_udp_create_session(epoll_fd, client_address.sin_addr,
+                                                client_address.sin_port);
+            if (session == NULL) continue;
+        }
+        session->last_active = time(NULL);
+        if (send(session->upstream_fd, buffer, (size_t) received, 0) >= 0) {
+            magnus_udp_bytes_c2u_total += (uint64_t) received;
+        }
+    }
+}
+
+/* A session's own dedicated backend socket becoming readable: relay the
+ * reply datagram back to exactly the client that session belongs to
+ * (sendto(), since the shared listener socket itself is never
+ * connect()ed and has no fixed peer of its own). A hard read error
+ * (most notably ECONNREFUSED, which Linux can surface on a connect()ed
+ * UDP socket from a matching ICMP port-unreachable -- the one real
+ * liveness signal UDP offers at all) tears the session down immediately
+ * rather than waiting out the idle timeout, freeing its fd right away;
+ * the client's own next packet starts a fresh session (and a fresh
+ * endpoint pick) from scratch. */
+static void
+magnus_udp_session_service(int epoll_fd, magnus_udp_session_t *session)
+{
+    for (;;) {
+        char buffer[MAGNUS_UDP_DATAGRAM_MAX];
+        struct sockaddr_in client_address;
+        ssize_t received = recv(session->upstream_fd, buffer, sizeof(buffer), 0);
+
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            magnus_udp_close_session(epoll_fd, session);
+            return;
+        }
+        session->last_active = time(NULL);
+        client_address = (struct sockaddr_in) {
+            .sin_family = AF_INET,
+            .sin_addr = session->client_addr,
+            .sin_port = session->client_port
+        };
+        if (sendto(magnus_udp_listener, buffer, (size_t) received, 0,
+                  (struct sockaddr *) &client_address,
+                  sizeof(client_address)) >= 0) {
+            magnus_udp_bytes_u2c_total += (uint64_t) received;
+        }
+    }
+}
+
+/* 1Hz sweep companion to magnus_stream_expire_idle(): a UDP session with
+ * no datagram in either direction for magnus_udp_session_idle_seconds is
+ * closed -- the only way a session's fd/slot is ever reclaimed short of
+ * a hard read error, since UDP itself carries no equivalent of a TCP
+ * FIN/RST to signal "this flow is over". */
+static void
+magnus_udp_expire_idle(int epoll_fd, time_t now)
+{
+    for (size_t index = 0; index < magnus_udp_max_sessions; index++) {
+        magnus_udp_session_t *session = &magnus_udp_sessions[index];
+        if (!session->in_use) continue;
+        if ((unsigned) (now - session->last_active)
+            > magnus_udp_session_idle_seconds) {
+            magnus_udp_close_session(epoll_fd, session);
+        }
+    }
+}
+
 static int
 magnus_create_listener(unsigned port)
 {
@@ -8871,6 +9176,37 @@ magnus_create_listener(unsigned port)
     address.sin_port = htons((uint16_t) port);
     if (bind(listener, (struct sockaddr *) &address, sizeof(address)) < 0
         || listen(listener, SOMAXCONN) < 0) {
+        close(listener);
+        return -1;
+    }
+    return listener;
+}
+
+/* UDP passthrough (roadmap 3d): same shape as magnus_create_listener()
+ * above, but SOCK_DGRAM and no listen() -- UDP has no connection
+ * backlog to configure, since it has no connections to accept in the
+ * first place; every arriving datagram is read directly off this one
+ * socket via recvfrom() in magnus_udp_listener_service(). */
+static int
+magnus_create_udp_listener(unsigned port)
+{
+    int listener;
+    int enabled = 1;
+    struct sockaddr_in address = {0};
+
+    listener = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (listener < 0) {
+        return -1;
+    }
+    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enabled,
+                   sizeof(enabled)) < 0) {
+        close(listener);
+        return -1;
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons((uint16_t) port);
+    if (bind(listener, (struct sockaddr *) &address, sizeof(address)) < 0) {
         close(listener);
         return -1;
     }
@@ -8930,6 +9266,7 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_cluster_t new_grpc_cluster;
     magnus_cluster_t new_stream_cluster;
     magnus_sni_cluster_t new_sni_clusters[MAGNUS_CONFIG_MAX_SNI_ROUTES];
+    magnus_cluster_t new_udp_cluster;
     size_t index;
 
     if (config->has_root) {
@@ -9037,6 +9374,24 @@ magnus_apply_config(const magnus_config_t *config)
             }
         }
     }
+    /* UDP passthrough (roadmap 3d): its own configurable udp_lb_policy,
+     * same reasoning as the stream cluster's own stream_lb_policy above.
+     * failure_threshold/cooldown are passed through for consistency with
+     * every other magnus_cluster_init() call in this function but are
+     * inert here -- magnus_cluster_result() is never called for this
+     * cluster at all (see magnus_udp_session_t's own comment on why). */
+    magnus_cluster_init(&new_udp_cluster, config->health_check_failure_threshold,
+                        (uint64_t) config->health_check_cooldown_seconds
+                        * 1000, config->udp_lb_policy);
+    for (index = 0; index < config->udp_upstream_count; index++) {
+        if (magnus_cluster_add(&new_udp_cluster, config->udp_upstreams[index].address,
+                               config->udp_upstreams[index].port,
+                               config->udp_upstreams[index].weight) != 0) {
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+    }
 
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     magnus_root_fd = new_root_fd;
@@ -9074,6 +9429,16 @@ magnus_apply_config(const magnus_config_t *config)
     for (size_t i = 0; i < config->sni_route_count; i++)
         magnus_sni_clusters[i] = new_sni_clusters[i];
     magnus_sni_cluster_count = config->sni_route_count;
+    /* UDP passthrough (roadmap 3d): no connection pool, no active-health
+     * probe array (see magnus_udp_session_t's own comment on why) -- a
+     * straight overwrite is the whole swap here too. Existing sessions
+     * are left alone (same "in-flight work drains against whatever
+     * generation it started under" precedent as the stream cluster
+     * above); only a *new* client packet after this point sees the new
+     * cluster's endpoints/policy. */
+    magnus_udp_cluster = new_udp_cluster;
+    magnus_udp_session_idle_seconds = config->udp_session_idle_seconds;
+    magnus_udp_max_sessions = config->udp_max_sessions;
     /* Same stale-by-position hazard once more (roadmap 2f): an in-flight
      * active-health probe for old position N belongs to whatever backend
      * used to be there, not necessarily the new cluster's position N.
@@ -9158,6 +9523,13 @@ magnus_handle_reload(void)
                         "requires a restart\n");
         return;
     }
+    if (config.has_udp_listen != magnus_udp_enabled
+        || (config.has_udp_listen
+            && config.udp_listen_port != magnus_udp_port)) {
+        fprintf(stderr, "magnus: reload rejected: changing udp_listen "
+                        "requires a restart\n");
+        return;
+    }
     if (magnus_apply_config(&config) != 0) {
         fprintf(stderr, "magnus: reload rejected: a referenced root/tls "
                         "resource could not be opened\n");
@@ -9211,6 +9583,11 @@ magnus_parse_options(int argc, char **argv)
             magnus_stream_port = config.stream_listen_port;
             magnus_stream_enabled = true;
         }
+        /* UDP listener (roadmap 3d): same restart-only shape once more. */
+        if (config.has_udp_listen) {
+            magnus_udp_port = config.udp_listen_port;
+            magnus_udp_enabled = true;
+        }
         return config.port;
     }
     const char *certificate = NULL;
@@ -9222,6 +9599,8 @@ magnus_parse_options(int argc, char **argv)
     magnus_cluster_init(&magnus_grpc_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     magnus_cluster_init(&magnus_stream_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
+    magnus_cluster_init(&magnus_udp_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     for (index = 1; index < argc; index += 2) {
         if (index + 1 >= argc) break;
@@ -9437,6 +9816,74 @@ magnus_parse_options(int argc, char **argv)
             if (magnus_cluster_add(&route->cluster, address,
                                    (unsigned) upstream_port,
                                    (unsigned) weight) != 0) break;
+        } else if (strcmp(argv[index], "--udp-listen") == 0) {
+            char *end;
+            unsigned long udp_port;
+            errno = 0;
+            udp_port = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || udp_port == 0
+                || udp_port > 65535) break;
+            magnus_udp_port = (unsigned) udp_port;
+            magnus_udp_enabled = true;
+        } else if (strcmp(argv[index], "--udp-upstream") == 0) {
+            /* ipv4:port or ipv4:port:weight; repeatable to build the UDP
+             * cluster. Literal IPv4 only, same restriction and reason as
+             * --grpc-upstream/--stream-upstream above. */
+            char spec[80];
+            char *saveptr = NULL;
+            char *address;
+            char *port_text;
+            char *weight_text;
+            char *end;
+            unsigned long upstream_port;
+            unsigned long weight = 1;
+            struct in_addr probe;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
+            strcpy(spec, argv[index + 1]);
+            address = strtok_r(spec, ":", &saveptr);
+            port_text = strtok_r(NULL, ":", &saveptr);
+            weight_text = strtok_r(NULL, ":", &saveptr);
+            if (address == NULL || port_text == NULL) break;
+            if (inet_pton(AF_INET, address, &probe) != 1) break;
+            errno = 0;
+            upstream_port = strtoul(port_text, &end, 10);
+            if (errno != 0 || *end != '\0' || upstream_port == 0
+                || upstream_port > 65535) break;
+            if (weight_text != NULL) {
+                errno = 0;
+                weight = strtoul(weight_text, &end, 10);
+                if (errno != 0 || *end != '\0' || weight == 0
+                    || weight > 1000) break;
+            }
+            if (magnus_cluster_add(&magnus_udp_cluster, address,
+                                   (unsigned) upstream_port,
+                                   (unsigned) weight) != 0) break;
+        } else if (strcmp(argv[index], "--udp-lb-policy") == 0) {
+            if (strcmp(argv[index + 1], "round_robin") == 0) {
+                magnus_udp_cluster.policy = MAGNUS_LB_ROUND_ROBIN;
+            } else if (strcmp(argv[index + 1], "least_conn") == 0) {
+                magnus_udp_cluster.policy = MAGNUS_LB_LEAST_CONN;
+            } else if (strcmp(argv[index + 1], "ip_hash") == 0) {
+                magnus_udp_cluster.policy = MAGNUS_LB_IP_HASH;
+            } else {
+                break;
+            }
+        } else if (strcmp(argv[index], "--udp-session-idle") == 0) {
+            char *end;
+            unsigned long seconds;
+            errno = 0;
+            seconds = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || seconds == 0 || seconds > 3600)
+                break;
+            magnus_udp_session_idle_seconds = (unsigned) seconds;
+        } else if (strcmp(argv[index], "--udp-max-sessions") == 0) {
+            char *end;
+            unsigned long sessions;
+            errno = 0;
+            sessions = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || sessions == 0
+                || sessions > MAGNUS_UDP_MAX_SESSIONS_CEILING) break;
+            magnus_udp_max_sessions = (unsigned) sessions;
         } else if (strcmp(argv[index], "--rate-limit") == 0) {
             /* requests-per-second, or requests-per-second:burst */
             char spec[32];
@@ -9622,6 +10069,17 @@ magnus_parse_options(int argc, char **argv)
                         "--stream-listen\n");
         exit(2);
     }
+    if (magnus_udp_enabled && magnus_udp_cluster.count == 0) {
+        fprintf(stderr, "magnus: --udp-listen needs at least one "
+                        "--udp-upstream\n");
+        exit(2);
+    }
+    if (!magnus_udp_enabled && magnus_udp_cluster.count > 0) {
+        fprintf(stderr, "magnus: --udp-upstream needs --udp-listen\n");
+        exit(2);
+    }
+    /* Deliberately no "--udp-listen must differ from --port/--stream-
+     * listen" check -- see magnus_config_t's own comment on why. */
     if (index == argc && port != 0
         && ((certificate == NULL && private_key == NULL)
             || (certificate != NULL && private_key != NULL))) {
@@ -9661,6 +10119,11 @@ magnus_parse_options(int argc, char **argv)
                     "[--stream-lb-policy round_robin|least_conn|ip_hash] "
                     "[--stream-sni-route "
                     "'<pattern> <ipv4:port[:weight]>' ...] "
+                    "[--udp-listen <1-65535> --udp-upstream "
+                    "<ipv4:port[:weight]> ...] "
+                    "[--udp-lb-policy round_robin|least_conn|ip_hash] "
+                    "[--udp-session-idle <seconds>] "
+                    "[--udp-max-sessions <n>] "
                     "[--route <spec> ...] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
@@ -9804,6 +10267,30 @@ main(int argc, char **argv)
             return 1;
         }
     }
+    if (magnus_udp_enabled) {
+        struct epoll_event udp_event;
+        magnus_udp_listener = magnus_create_udp_listener(magnus_udp_port);
+        if (magnus_udp_listener < 0) {
+            perror("magnus: udp-listen");
+            if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+            if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+        udp_event = (struct epoll_event) { .events = EPOLLIN,
+                                           .data.fd = magnus_udp_listener };
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, magnus_udp_listener,
+                      &udp_event) < 0) {
+            perror("magnus: udp-listen epoll_ctl");
+            close(magnus_udp_listener);
+            if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+            if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+    }
 
     magnus_phase_init(&magnus_phases);
     if (magnus_phase_register(&magnus_phases, MAGNUS_PHASE_INGRESS, 100,
@@ -9933,6 +10420,15 @@ main(int argc, char **argv)
                                       fd, flags);
                 continue;
             }
+            if (fd == magnus_udp_listener && magnus_udp_listener >= 0) {
+                magnus_udp_listener_service(epoll_fd);
+                continue;
+            }
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_udp_upstream_owner[fd] != NULL) {
+                magnus_udp_session_service(epoll_fd, magnus_udp_upstream_owner[fd]);
+                continue;
+            }
             if (fd < 0 || fd >= MAGNUS_MAX_FDS
                 || (connection = magnus_connections[fd]) == NULL) {
                 continue;
@@ -9969,6 +10465,7 @@ main(int argc, char **argv)
             magnus_expire_proxies(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             magnus_stream_expire_idle(epoll_fd, now);
+            magnus_udp_expire_idle(epoll_fd, now);
             magnus_pool_expire_idle(now);
             magnus_grpc_pool_expire(now);
             magnus_cache_expire_sweep(magnus_cache_now_ms());
@@ -10013,6 +10510,11 @@ main(int argc, char **argv)
             magnus_stream_close(epoll_fd, magnus_stream_owner[fd]);
         }
     }
+    for (size_t index = 0; index < magnus_udp_max_sessions; index++) {
+        if (magnus_udp_sessions[index].in_use) {
+            magnus_udp_close_session(epoll_fd, &magnus_udp_sessions[index]);
+        }
+    }
     magnus_pool_close_all();
     magnus_grpc_pool_close_all();
     magnus_cache_purge_all();
@@ -10024,6 +10526,7 @@ main(int argc, char **argv)
         unlink(magnus_admin_socket_path);
     }
     if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+    if (magnus_udp_listener >= 0) close(magnus_udp_listener);
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
     magnus_access_log_flush();

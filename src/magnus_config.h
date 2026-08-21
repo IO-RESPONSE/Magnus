@@ -114,6 +114,29 @@ typedef struct {
      * per cluster" shape every other cluster here already uses. */
     size_t sni_route_count;
     magnus_config_sni_route_t sni_routes[MAGNUS_CONFIG_MAX_SNI_ROUTES];
+    /* UDP passthrough (roadmap 3d): a fourth, independent listener --
+     * SOCK_DGRAM, no `accept()`/handshake of any kind, one NAT-style
+     * session per distinct (source IP, source port) tuple the listener
+     * ever sees. udp_listen may equal `port` or `stream_listen` without
+     * conflict (UDP and TCP occupy independent port namespaces at the OS
+     * level -- unlike stream_listen vs `port`, which really would
+     * collide since both are TCP), so there is deliberately no
+     * "must differ" check for it, unlike stream_listen's own. Reuses the
+     * same magnus_lb_policy_t selection magnus_cluster_t already
+     * provides (round_robin/least_conn/ip_hash), but -- see
+     * magnus_udp_session_t's own comment -- no health tracking of any
+     * kind: a connect()ed UDP socket's own connect() call almost always
+     * "succeeds" locally regardless of whether anything is actually
+     * listening at the other end, so it carries none of the passive
+     * signal a TCP connect() attempt does, and a real UDP-level health
+     * probe is a distinct, not-yet-built future increment. */
+    bool has_udp_listen;
+    unsigned udp_listen_port;
+    size_t udp_upstream_count;
+    magnus_config_upstream_t udp_upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
+    magnus_lb_policy_t udp_lb_policy;
+    unsigned udp_session_idle_seconds;
+    unsigned udp_max_sessions;
     bool has_rate_limit;
     double rate_limit_rps;
     double rate_limit_burst;
@@ -174,7 +197,11 @@ typedef enum {
  *     stream_sni_route is "<pattern> <ipv4:port[:weight]>" -- pattern is
  *     an exact hostname or a `*.`-prefixed one, endpoint is a literal
  *     IPv4 address same as stream_upstream, and stream_sni_route
- *     requires stream_listen)
+ *     requires stream_listen; udp_upstream must be a literal IPv4
+ *     address, udp_lb_policy is the same enum as lb_policy,
+ *     udp_session_idle_seconds is 1-3600, udp_max_sessions is
+ *     1-MAGNUS_UDP_MAX_SESSIONS_CEILING (magnus.c), udp_listen requires
+ *     at least one udp_upstream and vice versa)
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
  *     lb_policy defaults to "round_robin" when omitted; health_check_path
@@ -184,7 +211,10 @@ typedef enum {
  *     to 5; stream_listen is optional (the L4 passthrough listener does
  *     not exist at all when omitted); stream_lb_policy defaults to
  *     "round_robin" when omitted; stream_sni_route defaults to none (every
- *     stream connection uses the plain stream_upstream cluster)
+ *     stream connection uses the plain stream_upstream cluster); udp_listen
+ *     is optional (the UDP listener does not exist at all when omitted);
+ *     udp_lb_policy defaults to "round_robin"; udp_session_idle_seconds
+ *     defaults to 30; udp_max_sessions defaults to 1024
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

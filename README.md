@@ -167,6 +167,25 @@ independently by IORESPONSE.
   endpoint exactly as received -- genuine passthrough, not a translation.
   `/metrics` gained `magnus_stream_sni_upstream_healthy{pattern=...,
   endpoint=...}`
+- UDP passthrough: a fourth, independent listener, plain `SOCK_DGRAM`
+  with no `accept()`/handshake of any kind (`udp_listen`/`udp_upstream`/
+  `udp_lb_policy`/`udp_session_idle_seconds`/`udp_max_sessions`,
+  `--udp-*`). One NAT-style session per (source IP, source port) tuple,
+  each with its own dedicated `connect()`ed backend socket -- the same
+  load-balancing policies as every other cluster (`ip_hash` keyed on
+  source IP alone), but no health tracking of any kind (a UDP
+  `connect()` cannot fail the way TCP's own does). `udp_max_sessions`
+  (default 1024) is the explicit answer to UDP's own unbounded-session
+  memory risk: once full, a new client's packet is simply dropped, never
+  evicting an existing session (which a trivially source-spoofable
+  protocol would turn into a denial-of-service primitive). A session
+  pointed at a backend that surfaces `ECONNREFUSED` (via a matching ICMP
+  port-unreachable) is torn down immediately rather than waiting out the
+  idle timeout. `udp_listen` may equal `port`/`stream_listen` without
+  conflict -- UDP and TCP occupy independent port namespaces. `/metrics`
+  gained `magnus_udp_sessions_total`/`_active`,
+  `magnus_udp_bytes_total{direction=...}`, and
+  `magnus_udp_upstream_active_sessions{endpoint=...}`
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

@@ -156,6 +156,8 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     config->health_check_timeout_seconds = 2;
     config->health_check_failure_threshold = 3;
     config->health_check_cooldown_seconds = 5;
+    config->udp_session_idle_seconds = 30;
+    config->udp_max_sessions = 1024;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     file = fopen(path, "r");
@@ -424,6 +426,84 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             route->upstreams[route->upstream_count++] = upstream;
+        } else if (strcmp(key, "udp_listen") == 0) {
+            unsigned long udp_port;
+            if (!magnus_config_parse_uint(value, 1, 65535, &udp_port)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_listen' must be 1-65535, "
+                                        "got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->udp_listen_port = (unsigned) udp_port;
+            config->has_udp_listen = true;
+        } else if (strcmp(key, "udp_upstream") == 0) {
+            magnus_config_upstream_t upstream;
+            if (config->udp_upstream_count == MAGNUS_CONFIG_MAX_UPSTREAMS) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'udp_upstream' entries "
+                                        "(max %d)", MAGNUS_CONFIG_MAX_UPSTREAMS);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_parse_upstream(value, &upstream)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_upstream' must be "
+                                        "ipv4:port[:weight], got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (upstream.is_hostname) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_upstream' must be a literal "
+                                        "IPv4 address, not a hostname (got "
+                                        "'%s') -- DNS resolution is not yet "
+                                        "supported for the UDP cluster",
+                                        upstream.address);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->udp_upstreams[config->udp_upstream_count++] = upstream;
+        } else if (strcmp(key, "udp_lb_policy") == 0) {
+            if (strcmp(value, "round_robin") == 0) {
+                config->udp_lb_policy = MAGNUS_LB_ROUND_ROBIN;
+            } else if (strcmp(value, "least_conn") == 0) {
+                config->udp_lb_policy = MAGNUS_LB_LEAST_CONN;
+            } else if (strcmp(value, "ip_hash") == 0) {
+                config->udp_lb_policy = MAGNUS_LB_IP_HASH;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_lb_policy' must be "
+                                        "'round_robin', 'least_conn', or "
+                                        "'ip_hash', got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+        } else if (strcmp(key, "udp_session_idle_seconds") == 0) {
+            unsigned long seconds;
+            if (!magnus_config_parse_uint(value, 1, 3600, &seconds)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_session_idle_seconds' must be "
+                                        "1-3600, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->udp_session_idle_seconds = (unsigned) seconds;
+        } else if (strcmp(key, "udp_max_sessions") == 0) {
+            unsigned long sessions;
+            /* 4096 duplicates MAGNUS_UDP_MAX_SESSIONS_CEILING (magnus.c) --
+             * the fixed session-table array size the runtime actually
+             * allocates -- the same "no shared symbol between magnus.c
+             * and magnus_config.c" precedent every other duplicated
+             * default/bound in this file already follows. */
+            if (!magnus_config_parse_uint(value, 1, 4096, &sessions)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'udp_max_sessions' must be "
+                                        "1-4096, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->udp_max_sessions = (unsigned) sessions;
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,
@@ -674,6 +754,22 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                                 "'stream_sni_route' needs 'stream_listen'");
         return MAGNUS_CONFIG_ERROR;
     }
+    if (config->has_udp_listen && config->udp_upstream_count == 0) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'udp_listen' needs at least one "
+                                "'udp_upstream'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (!config->has_udp_listen && config->udp_upstream_count > 0) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'udp_upstream' needs 'udp_listen'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    /* Deliberately no "udp_listen must differ from port/stream_listen"
+     * check -- see magnus_config_t's own comment on udp_listen for why
+     * that restriction, correct for stream_listen vs port (both TCP),
+     * does not apply here (UDP and TCP occupy independent port
+     * namespaces at the OS level). */
     return MAGNUS_CONFIG_OK;
 }
 

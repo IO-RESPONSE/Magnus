@@ -86,6 +86,14 @@ cleanup() {
     kill -TERM "$backend17_pid" >/dev/null 2>&1 || true
     wait "$backend17_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend18_pid:-}" ]; then
+    kill -TERM "$backend18_pid" >/dev/null 2>&1 || true
+    wait "$backend18_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend19_pid:-}" ]; then
+    kill -TERM "$backend19_pid" >/dev/null 2>&1 || true
+    wait "$backend19_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -3529,3 +3537,157 @@ kill -TERM "$backend17_pid" 2>/dev/null
 wait "$backend17_pid" 2>/dev/null || true
 backend17_pid=
 echo "stream: TLS passthrough / SNI routing ok"
+
+# UDP passthrough (roadmap 3d): a NAT-style session per (source IP,
+# source port) tuple, no HTTP/TCP machinery involved at all. A tiny
+# labelled UDP echo backend (send back "<label>:<payload>") identifies
+# which endpoint served a given exchange, same idea as the TCP stream
+# tests' own labelled_backend, just SOCK_DGRAM.
+udp_backend() {
+  exec python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('127.0.0.1', $1))
+while True:
+    data, addr = s.recvfrom(65536)
+    s.sendto(b'$2:' + data, addr)
+"
+}
+portUdpA=$((port + 89))
+portUdpB=$((port + 90))
+udp_backend "$portUdpA" A >/dev/null 2>&1 &
+backend18_pid=$!
+udp_backend "$portUdpB" B >/dev/null 2>&1 &
+backend19_pid=$!
+for udp_backend_port in "$portUdpA" "$portUdpB"; do
+  for attempt in 1 2 3 4 5; do
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1)
+s.sendto(b'ping', ('127.0.0.1', $udp_backend_port))
+s.recvfrom(4096)
+" 2>/dev/null && break
+    sleep 1
+  done
+done
+
+# round_robin + session stickiness: two distinct clients (separate source
+# ports) land on both endpoints, and repeated messages from the SAME
+# client always land on whichever endpoint its first packet picked.
+port_udp_rr=$((port + 91))
+port_udp_rr_listen=$((port + 92))
+"$binary" --port "$port_udp_rr" --udp-listen "$port_udp_rr_listen" \
+  --udp-upstream "127.0.0.1:$portUdpA" --udp-upstream "127.0.0.1:$portUdpB" \
+  --udp-session-idle 3 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_udp_rr/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket
+
+def roundtrip(sock, payload):
+    sock.settimeout(3)
+    sock.sendto(payload, ('127.0.0.1', $port_udp_rr_listen))
+    data, _ = sock.recvfrom(4096)
+    return data
+
+s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+r1 = roundtrip(s1, b'hello-1')
+r2 = roundtrip(s2, b'hello-2')
+assert {r1, r2} == {b'A:hello-1', b'B:hello-2'}, (r1, r2)
+r1b = roundtrip(s1, b'hello-1b')
+r1c = roundtrip(s1, b'hello-1c')
+label1 = r1.split(b':')[0]
+assert r1b == label1 + b':hello-1b' and r1c == label1 + b':hello-1c', (r1b, r1c)
+s1.close()
+s2.close()
+print('udp: round_robin across clients + per-session stickiness ok')
+"
+curl --fail --silent "http://127.0.0.1:$port_udp_rr/metrics" \
+  | grep -qE '^magnus_udp_sessions_total [1-9][0-9]*$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# ip_hash: fresh sessions (separate sockets, same source IP) all land on
+# the same endpoint -- keyed on client IP alone, same rendezvous-hashing
+# primitive every other cluster in this file already reuses.
+port_udp_ih=$((port + 93))
+port_udp_ih_listen=$((port + 94))
+"$binary" --port "$port_udp_ih" --udp-listen "$port_udp_ih_listen" \
+  --udp-upstream "127.0.0.1:$portUdpA" --udp-upstream "127.0.0.1:$portUdpB" \
+  --udp-lb-policy ip_hash 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_udp_ih/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket
+
+def once():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    s.sendto(b'probe', ('127.0.0.1', $port_udp_ih_listen))
+    data, _ = s.recvfrom(4096)
+    s.close()
+    return data.split(b':')[0]
+
+labels = {once() for _ in range(4)}
+assert len(labels) == 1, labels
+print('udp: ip_hash same-client determinism ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Session cap (roadmap 3d's own "Section 12" memory bound): with
+# udp-max-sessions capped at 2, a 3rd and 4th distinct client are simply
+# dropped -- never evicting an already-active session to make room (see
+# magnus_udp_session_t's own comment on why eviction itself would be a
+# denial-of-service primitive against a trivially source-spoofable
+# protocol).
+port_udp_cap=$((port + 95))
+port_udp_cap_listen=$((port + 96))
+"$binary" --port "$port_udp_cap" --udp-listen "$port_udp_cap_listen" \
+  --udp-upstream "127.0.0.1:$portUdpA" --udp-max-sessions 2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_udp_cap/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket
+
+ok = 0
+dropped = 0
+for i in range(4):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1)
+    s.sendto(f'client{i}'.encode(), ('127.0.0.1', $port_udp_cap_listen))
+    try:
+        s.recvfrom(4096)
+        ok += 1
+    except socket.timeout:
+        dropped += 1
+    s.close()
+assert ok == 2, ok
+assert dropped == 2, dropped
+print('udp: max-sessions cap (drop, never evict) ok')
+"
+curl --fail --silent "http://127.0.0.1:$port_udp_cap/metrics" \
+  | grep -qE '^magnus_udp_sessions_active 2$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend18_pid" 2>/dev/null
+wait "$backend18_pid" 2>/dev/null || true
+backend18_pid=
+kill -TERM "$backend19_pid" 2>/dev/null
+wait "$backend19_pid" 2>/dev/null || true
+backend19_pid=
+echo "udp: UDP passthrough (round_robin/stickiness/ip_hash/session-cap) ok"

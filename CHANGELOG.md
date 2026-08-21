@@ -1,5 +1,79 @@
 # Changelog
 
+## 1.23.0
+
+### Added
+
+- **UDP passthrough (roadmap 3d): a fourth, independent listener, NAT-
+  style session tracking, no HTTP/TCP machinery involved at all --
+  closes out Phase 3.** New `udp_listen`/`udp_upstream`/`udp_lb_policy`/
+  `udp_session_idle_seconds`/`udp_max_sessions` config keys and matching
+  `--udp-listen`/`--udp-upstream`/`--udp-lb-policy`/`--udp-session-idle`/
+  `--udp-max-sessions` CLI flags.
+- Plain `SOCK_DGRAM`, no `accept()`/handshake of any kind (UDP has
+  neither) -- one `magnus_udp_session_t` per distinct (source IP, source
+  port) tuple the listener has ever seen recently, each owning its own
+  dedicated `connect()`ed UDP socket to whichever backend
+  `magnus_udp_cluster` picked for that tuple, the same "one socket per
+  active flow, `connect()` fixes the peer so replies route back
+  unambiguously" pattern every other cluster in this file already uses
+  for TCP. Reuses `round_robin`/`least_conn`/`ip_hash` unmodified
+  (`ip_hash` keyed on source IP alone, so different source ports from
+  the same client still land on the same backend) and the exact same
+  `magnus_cluster_endpoint_begin()`/`_end()` live-count mechanism
+  roadmap 2e-1 already built, here repurposed as "sessions currently
+  pinned to this endpoint" rather than "requests" -- meaningful even
+  with no health signal.
+- **The "Section 12" memory bound the roadmap itself flagged needing a
+  real answer before implementation, not discovered mid-implementation**:
+  `udp_max_sessions` (default 1024, hard ceiling
+  `MAGNUS_UDP_MAX_SESSIONS_CEILING` = 4096, a fixed array, no dynamic
+  allocation) is enforced by simply dropping a new tuple's packet once
+  the table is full -- deliberately never evicting an existing session
+  to make room. An already-active session's own client would otherwise
+  silently lose its return traffic for a stranger's benefit, and
+  combined with how trivially spoofable a UDP source address is, that
+  would turn eviction itself into a denial-of-service primitive rather
+  than a safety valve.
+- No health tracking of any kind, active or passive: a `connect()`ed UDP
+  socket's own `connect()` call succeeds locally almost unconditionally
+  regardless of whether the backend actually exists (there is no
+  handshake to fail the way TCP's SYN/ACK would), so it carries none of
+  the passive signal `magnus_cluster_result()` relies on elsewhere in
+  this file -- the same scope-cut precedent `stream_sni_route`'s own
+  clusters (roadmap 3b) already set, for the same underlying reason. A
+  hard read error on a session's own backend socket (most notably
+  `ECONNREFUSED`, which Linux can surface on a `connect()`ed UDP socket
+  from a matching ICMP port-unreachable -- the one real liveness signal
+  UDP offers at all) tears that session down immediately instead of
+  waiting out the idle timeout, freeing its fd right away.
+- `udp_listen` deliberately carries no "must differ from `port`/
+  `stream_listen`" restriction, unlike `stream_listen` itself -- UDP and
+  TCP occupy independent port namespaces at the OS level, so there is no
+  actual conflict to guard against.
+- `/metrics` gained `magnus_udp_sessions_total`/`_active`,
+  `magnus_udp_bytes_total{direction=...}`, and
+  `magnus_udp_upstream_active_sessions{endpoint=...}` -- deliberately no
+  healthy/unhealthy gauge, since exposing one that could only ever read
+  "always healthy" would be actively misleading rather than merely
+  unused.
+
+### Verified
+
+Live, under ASan+UBSan, against real UDP backends: `round_robin`
+alternation across distinct clients plus per-session stickiness for
+repeated messages from the same client (a session, once picked, never
+re-selects); `ip_hash` routing separate sockets that share one source IP
+to the same endpoint; the session cap dropping exactly the packets past
+the configured ceiling (2 accepted, 2 dropped out of 4 distinct clients
+against `--udp-max-sessions 2`) while leaving the two already-active
+sessions completely untouched; a session pointed at a genuinely
+unreachable backend torn down within roughly 1.5 seconds via the
+ICMP-triggered `ECONNREFUSED` path rather than sitting out its full idle
+timeout. New permanent regression coverage in `tests/test-core.sh`.
+`make clean && make test` and `make sanitize` (ASan+UBSan) both green.
+Image rebuilt, `./scripts/test-image.sh` passes.
+
 ## 1.22.0
 
 ### Added
