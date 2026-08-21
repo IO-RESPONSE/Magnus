@@ -288,6 +288,59 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             config->grpc_upstreams[config->grpc_upstream_count++] = upstream;
+        } else if (strcmp(key, "stream_listen") == 0) {
+            unsigned long stream_port;
+            if (!magnus_config_parse_uint(value, 1, 65535, &stream_port)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_listen' must be 1-65535, "
+                                        "got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->stream_listen_port = (unsigned) stream_port;
+            config->has_stream_listen = true;
+        } else if (strcmp(key, "stream_upstream") == 0) {
+            magnus_config_upstream_t upstream;
+            if (config->stream_upstream_count == MAGNUS_CONFIG_MAX_UPSTREAMS) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'stream_upstream' entries "
+                                        "(max %d)", MAGNUS_CONFIG_MAX_UPSTREAMS);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_parse_upstream(value, &upstream)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_upstream' must be "
+                                        "ipv4:port[:weight], got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (upstream.is_hostname) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_upstream' must be a literal "
+                                        "IPv4 address, not a hostname (got "
+                                        "'%s') -- DNS resolution is not yet "
+                                        "supported for the L4 stream cluster",
+                                        upstream.address);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->stream_upstreams[config->stream_upstream_count++] = upstream;
+        } else if (strcmp(key, "stream_lb_policy") == 0) {
+            if (strcmp(value, "round_robin") == 0) {
+                config->stream_lb_policy = MAGNUS_LB_ROUND_ROBIN;
+            } else if (strcmp(value, "least_conn") == 0) {
+                config->stream_lb_policy = MAGNUS_LB_LEAST_CONN;
+            } else if (strcmp(value, "ip_hash") == 0) {
+                config->stream_lb_policy = MAGNUS_LB_IP_HASH;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'stream_lb_policy' must be "
+                                        "'round_robin', 'least_conn', or "
+                                        "'ip_hash', got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,
@@ -516,6 +569,22 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
         }
+    }
+    if (config->has_stream_listen && config->stream_upstream_count == 0) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'stream_listen' needs at least one "
+                                "'stream_upstream'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (!config->has_stream_listen && config->stream_upstream_count > 0) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'stream_upstream' needs 'stream_listen'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (config->has_stream_listen && config->stream_listen_port == config->port) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'stream_listen' must differ from 'port'");
+        return MAGNUS_CONFIG_ERROR;
     }
     return MAGNUS_CONFIG_OK;
 }

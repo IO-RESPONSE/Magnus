@@ -701,6 +701,62 @@ connection-pool and common-request-model decisions).
   `magnus_http_parse` at all. UDP session tracking's memory bound (Section
   12) needs its design nailed down before implementation, not discovered
   during it.
+  - **TCP passthrough 3a — a second, independent listener with zero HTTP
+    awareness. Shipped in 1.21.0.** New `stream_listen`/`stream_upstream`/
+    `stream_lb_policy` config keys and matching `--stream-listen`/
+    `--stream-upstream`/`--stream-lb-policy` CLI flags stand up a raw
+    bidirectional byte relay between a client and whichever endpoint a
+    dedicated `magnus_stream_cluster` picks -- one listener/cluster for
+    this first increment, deliberately scoped that way (multiple
+    simultaneous stream listeners is a distinct future increment). Reuses
+    the h1/h2 proxy path's existing infrastructure unmodified rather than
+    inventing new load-balancing or health-checking code:
+    round_robin/least_conn/ip_hash (roadmap 2e-1's rendezvous hashing,
+    keyed on client IP since there is no HTTP-level cookie at L4 -- no
+    cookie-based affinity here), the same circuit-breaker
+    trip/cooldown state, and active health checking (roadmap 2f,
+    TCP-connect only -- what is actually flowing over a stream connection
+    is unknown by design, so an HTTP-level probe would be meaningless).
+    A small `magnus_stream_conn_t`/`magnus_stream_pipe_t` pair (kept
+    separate from the much larger HTTP-oriented `magnus_connection_t`,
+    matching this codebase's own precedent of a new protocol surface
+    getting its own lightweight state rather than growing the existing
+    one) drives two independent byte pipes with per-direction epoll-
+    interest backpressure -- a slow destination simply stops its source
+    side being read from until the buffered chunk drains, the same
+    discipline the L7 proxy's own buffered-write path already uses, just
+    without any HTTP framing to track alongside it. A standard half-close
+    (one direction EOFs and is `shutdown()`-propagated while the other
+    keeps flowing) is supported, since an L4 tunnel has no request/
+    response boundary to assume. No retry budget on a connect() failure,
+    unlike the L7 proxy path -- there is no "request" to safely retry
+    once any bytes have moved over an already-in-progress byte stream.
+    `/metrics` gained `magnus_stream_connections_total`/`_active`,
+    `magnus_stream_bytes_total{direction=...}`, and
+    `magnus_stream_upstream_healthy{endpoint=...}`. Verified live under
+    ASan+UBSan against real backends: round_robin alternation and
+    persistent-connection stickiness (the LB decision is made once per
+    connection, never per message); `ip_hash` same-client determinism;
+    a 300KiB payload relayed byte-for-byte across many
+    `MAGNUS_PROXY_BUFFER` (16KiB) refills plus a half-close, verified via
+    SHA-256 rather than a labelled echo (see the bug below); active
+    health check detecting a killed backend, and its recovery, with zero
+    stream traffic sent, mirroring the M3/2f-1 discipline. One real bug
+    found only through this live testing, not code review: `/metrics`'
+    fixed response buffer (`MAGNUS_OUTPUT_LIMIT`, 2048 bytes) was already
+    tight before this increment and this increment's own new gauge block
+    pushed a real multi-cluster deployment's rendered body past it --
+    silently emptying the *entire* HTTP response rather than truncating
+    the body, since the buffer-overflow guard in `magnus_prepare_response()`
+    treats "would not fit" as "send nothing" for safety. Fixed by growing
+    both `MAGNUS_METRICS_BUFFER` (1536 -> 8192) and `MAGNUS_OUTPUT_LIMIT`
+    (2048 -> 9216) with real headroom for a fully-populated deployment
+    (`upstream` + `grpc_upstream` + `stream` clusters all near their max
+    endpoint count, every gRPC status code, every latency bucket) rather
+    than just enough for this increment's own test. Deliberately out of
+    scope: TLS passthrough / SNI routing (3b) and UDP (3d) remain
+    separate future increments, per this section's own scoping. See
+    `CHANGELOG.md` 1.21.0 for the full detail.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
   (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)

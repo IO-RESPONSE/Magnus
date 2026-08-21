@@ -140,6 +140,21 @@ independently by IORESPONSE.
   endpoint only remaps the traffic that endpoint's own score was
   responsible for. A client's own affinity cookie, when present, always
   takes priority over whichever policy is configured
+- L4 TCP passthrough: a second, independent listener with zero HTTP
+  awareness (`stream_listen`/`stream_upstream`/`stream_lb_policy`,
+  `--stream-listen`/`--stream-upstream`/`--stream-lb-policy`) -- raw bytes
+  relayed bidirectionally to whichever endpoint a dedicated stream cluster
+  picks, reusing the same load-balancing policies, circuit-breaker state,
+  and TCP-connect-only active health checking the h1/h2 proxy clusters
+  already have, unmodified. Per-direction backpressure (a slow
+  destination stops its source side being read from until buffered bytes
+  drain) and a standard half-close (one direction finishing while the
+  other keeps flowing) are both supported; no retry budget on a
+  connect() failure, since there is no "request" to safely retry once
+  bytes are already in flight. `/metrics` gained
+  `magnus_stream_connections_total`/`_active`,
+  `magnus_stream_bytes_total{direction=...}`, and
+  `magnus_stream_upstream_healthy{endpoint=...}`
 - `magnusd`/`magnusctl` control plane: a strict config-file schema shared
   by both, SIGHUP hot reload in `magnus` (existing connections drain under
   the old generation, new ones see the new one), automatic health-checked

@@ -64,6 +64,22 @@ typedef struct {
      * ordinary one. Targeted only by a route with action=grpc. */
     size_t grpc_upstream_count;
     magnus_config_upstream_t grpc_upstreams[MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS];
+    /* L4 TCP passthrough (roadmap 3a): a second, independent listener that
+     * never goes through magnus_http_parse() at all -- raw bytes relayed
+     * bidirectionally to whichever endpoint stream_lb_policy picks, with
+     * no protocol awareness of what is actually flowing over it. Optional
+     * (has_stream_listen false when the config never mentions
+     * `stream_listen` at all, the same shape as has_admin_socket); a
+     * hostname stream_upstream is rejected, same restriction as
+     * grpc_upstream and for the same reason (DNS resolution is not wired
+     * up for this cluster). Changing stream_listen itself requires a
+     * restart, exactly like `port`/`admin_socket` -- only stream_upstream/
+     * stream_lb_policy are hot-reloadable. */
+    bool has_stream_listen;
+    unsigned stream_listen_port;
+    size_t stream_upstream_count;
+    magnus_config_upstream_t stream_upstreams[MAGNUS_CONFIG_MAX_UPSTREAMS];
+    magnus_lb_policy_t stream_lb_policy;
     bool has_rate_limit;
     double rate_limit_rps;
     double rate_limit_burst;
@@ -117,14 +133,19 @@ typedef enum {
  *     magnus_policy.h's own magnus_lb_policy_t, health_check_path starts
  *     with '/' and carries no whitespace, health_check_expected_status is
  *     100-599, health_check_interval_seconds/_timeout_seconds/
- *     _failure_threshold/_cooldown_seconds are all positive integers)
+ *     _failure_threshold/_cooldown_seconds are all positive integers,
+ *     stream_upstream must be a literal IPv4 address (not a hostname),
+ *     stream_lb_policy is the same enum as lb_policy, stream_listen
+ *     requires at least one stream_upstream and vice versa)
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
  *     lb_policy defaults to "round_robin" when omitted; health_check_path
  *     defaults to "/", health_check_expected_status to 200,
  *     health_check_interval_seconds to 5, health_check_timeout_seconds to
  *     2, health_check_failure_threshold to 3, health_check_cooldown_seconds
- *     to 5
+ *     to 5; stream_listen is optional (the L4 passthrough listener does
+ *     not exist at all when omitted); stream_lb_policy defaults to
+ *     "round_robin" when omitted
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

@@ -62,6 +62,18 @@ cleanup() {
     kill -TERM "$backend11_pid" >/dev/null 2>&1 || true
     wait "$backend11_pid" 2>/dev/null || true
   fi
+  if [ -n "${backend12_pid:-}" ]; then
+    kill -TERM "$backend12_pid" >/dev/null 2>&1 || true
+    wait "$backend12_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend13_pid:-}" ]; then
+    kill -TERM "$backend13_pid" >/dev/null 2>&1 || true
+    wait "$backend13_pid" 2>/dev/null || true
+  fi
+  if [ -n "${backend14_pid:-}" ]; then
+    kill -TERM "$backend14_pid" >/dev/null 2>&1 || true
+    wait "$backend14_pid" 2>/dev/null || true
+  fi
   rm -f "$log"
   rm -rf "$web_root"
 }
@@ -3108,3 +3120,250 @@ kill -TERM "$backend11_pid" 2>/dev/null
 wait "$backend11_pid" 2>/dev/null || true
 backend11_pid=
 echo "health-check: http-mode/path/expected-status/grpc-coverage ok"
+
+# L4 TCP passthrough (roadmap 3a): a new listener type that never goes
+# through magnus_http_parse() at all. portA/portB run a tiny labelled
+# echo backend (sends "WELCOME:<label>\n" then echoes "<label>:<data>"
+# per chunk received -- good enough to identify which endpoint served a
+# given connection, but NOT byte-exact for a payload split across many
+# chunks, which is what portPlain -- a true byte-for-byte echo, no
+# label -- is for instead).
+portA=$((port + 73))
+portB=$((port + 74))
+portPlain=$((port + 75))
+# A and B are deliberately two separate processes, not two threads in one
+# -- the health-check portion of this test later kills A on its own to
+# simulate a dead backend, which must never take B down with it.
+labelled_backend() {
+  # exec, not a plain call: the health-check portion of this test kills
+  # this backend by PID to simulate it going down, and $! after
+  # backgrounding a function call is the subshell running the function,
+  # not (without this) the python3 process underneath it -- TERM-ing the
+  # subshell alone would leave python3 as an orphaned child still holding
+  # the port open, exactly the kind of gap this test is meant to catch
+  # elsewhere, not fall into itself.
+  exec python3 -c "
+import socket, threading
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $1))
+s.listen(50)
+def handle(conn):
+    conn.sendall(b'WELCOME:$2\n')
+    while True:
+        data = conn.recv(4096)
+        if not data:
+            break
+        conn.sendall(b'$2:' + data)
+    conn.close()
+while True:
+    conn, _ = s.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"
+}
+labelled_backend "$portA" A >/dev/null 2>&1 &
+backend12_pid=$!
+labelled_backend "$portB" B >/dev/null 2>&1 &
+backend13_pid=$!
+python3 -c "
+import socket, threading
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $portPlain))
+s.listen(50)
+def handle(conn):
+    while True:
+        data = conn.recv(65536)
+        if not data:
+            break
+        conn.sendall(data)
+    conn.close()
+while True:
+    conn, _ = s.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+" >/dev/null 2>&1 &
+backend14_pid=$!
+for stream_port in "$portA" "$portB" "$portPlain"; do
+  for attempt in 1 2 3 4 5; do
+    python3 -c "
+import socket
+s = socket.create_connection(('127.0.0.1', $stream_port), timeout=1)
+s.close()
+" 2>/dev/null && break
+    sleep 1
+  done
+done
+
+# round_robin (the default): two fresh connections against a two-endpoint
+# stream cluster land on both endpoints, and a persistent connection stays
+# on the one it was matched to for its whole lifetime (LB decides once
+# per connection, not per message -- there is no per-message routing at
+# L4 the way there is an HTTP request boundary at L7).
+port_rr=$((port + 76))
+port_rr_stream=$((port + 77))
+"$binary" --port "$port_rr" --stream-listen "$port_rr_stream" \
+  --stream-upstream "127.0.0.1:$portA" --stream-upstream "127.0.0.1:$portB" \
+  2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_rr/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket
+
+def welcome(port):
+    s = socket.create_connection(('127.0.0.1', port), timeout=3)
+    s.settimeout(3)
+    label = s.recv(4096).decode().strip().split(':')[1]
+    return s, label
+
+s1, l1 = welcome($port_rr_stream)
+s2, l2 = welcome($port_rr_stream)
+assert {l1, l2} == {'A', 'B'}, (l1, l2)
+# persistent connection: 5 messages all served by the same endpoint
+s1.sendall(b'ping1')
+r1 = s1.recv(4096).decode()
+s1.sendall(b'ping2')
+r2 = s1.recv(4096).decode()
+assert r1.startswith(l1 + ':') and r2.startswith(l1 + ':'), (r1, r2)
+s1.close()
+s2.close()
+print('stream: round_robin alternation + persistent-connection stickiness ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# ip_hash: fresh connections from the same client IP all land on the same
+# endpoint (rendezvous hashing, same primitive roadmap 2e-1 already gave
+# the h1/h2 proxy cluster -- reused unmodified here, no new LB code).
+port_ih=$((port + 78))
+port_ih_stream=$((port + 79))
+"$binary" --port "$port_ih" --stream-listen "$port_ih_stream" \
+  --stream-upstream "127.0.0.1:$portA" --stream-upstream "127.0.0.1:$portB" \
+  --stream-lb-policy ip_hash 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_ih/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket
+
+def welcome(port):
+    s = socket.create_connection(('127.0.0.1', port), timeout=3)
+    s.settimeout(3)
+    label = s.recv(4096).decode().strip().split(':')[1]
+    s.close()
+    return label
+
+labels = [welcome($port_ih_stream) for _ in range(4)]
+assert len(set(labels)) == 1, labels
+print('stream: ip_hash same-client determinism ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Byte-exact relay across many MAGNUS_PROXY_BUFFER (16KiB) refills, plus a
+# half-close (client shuts its write side down mid-response) still
+# delivering the rest of the response before a clean EOF -- the standard
+# L4-proxy half-close semantics, not something HTTP has an equivalent of.
+port_plain=$((port + 80))
+port_plain_stream=$((port + 81))
+"$binary" --port "$port_plain" --stream-listen "$port_plain_stream" \
+  --stream-upstream "127.0.0.1:$portPlain" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_plain/healthz" >/dev/null && break
+  sleep 1
+done
+python3 -c "
+import socket, hashlib, os
+
+s = socket.create_connection(('127.0.0.1', $port_plain_stream), timeout=10)
+s.settimeout(10)
+payload = os.urandom(300 * 1024)
+s.sendall(payload)
+s.shutdown(socket.SHUT_WR)
+received = b''
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    received += chunk
+s.close()
+assert len(received) == len(payload), (len(received), len(payload))
+assert hashlib.sha256(received).digest() == hashlib.sha256(payload).digest()
+print('stream: byte-exact large-payload relay + half-close ok')
+"
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Active health check (roadmap 2f, extended to this cluster): killing
+# backend A must be found by background probing alone -- no stream
+# traffic sent at all, same M3/2f-1 discipline -- and a fresh listener on
+# that port must be found again the same way. Also regression-covers the
+# MAGNUS_OUTPUT_LIMIT/MAGNUS_METRICS_BUFFER bug this increment's own live
+# testing found: a real deployment with the upstream+stream clusters both
+# populated pushed /metrics' rendered body past the old 2048-byte ceiling,
+# silently emptying the *entire* response rather than just truncating it
+# -- checking that the response's own last-ever-emitted line
+# (magnus_cache_bytes, cache always being the final block) is present and
+# well-formed catches that regression directly.
+port_hc_stream=$((port + 82))
+port_hc_stream_listen=$((port + 83))
+"$binary" --port "$port_hc_stream" --stream-listen "$port_hc_stream_listen" \
+  --stream-upstream "127.0.0.1:$portA" --stream-upstream "127.0.0.1:$portB" \
+  --health-check-interval 1 --health-check-timeout 1 \
+  --health-check-failure-threshold 2 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_hc_stream/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+kill -TERM "$backend12_pid"
+wait "$backend12_pid" 2>/dev/null || true
+backend12_pid=
+stream_unhealthy_seen=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_hc_stream/metrics" \
+      | grep -qE "^magnus_stream_upstream_healthy\{endpoint=\"127\.0\.0\.1:$portA\"\} 0\$"; then
+    stream_unhealthy_seen=1
+    break
+  fi
+done
+test "$stream_unhealthy_seen" = 1
+metrics_intact=$(curl --fail --silent "http://127.0.0.1:$port_hc_stream/metrics")
+echo "$metrics_intact" | grep -qE '^magnus_cache_bytes [0-9]+$'
+labelled_backend "$portA" A >/dev/null 2>&1 &
+backend12_pid=$!
+stream_recovered_seen=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_hc_stream/metrics" \
+      | grep -qE "^magnus_stream_upstream_healthy\{endpoint=\"127\.0\.0\.1:$portA\"\} 1\$"; then
+    stream_recovered_seen=1
+    break
+  fi
+done
+test "$stream_recovered_seen" = 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend12_pid" 2>/dev/null
+wait "$backend12_pid" 2>/dev/null || true
+backend12_pid=
+kill -TERM "$backend13_pid" 2>/dev/null
+wait "$backend13_pid" 2>/dev/null || true
+backend13_pid=
+kill -TERM "$backend14_pid" 2>/dev/null
+wait "$backend14_pid" 2>/dev/null || true
+backend14_pid=
+echo "stream: TCP passthrough (round_robin/ip_hash/byte-exact/health-check) ok"

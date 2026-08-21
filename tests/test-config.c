@@ -60,6 +60,9 @@ main(void)
     assert(config.health_check_timeout_seconds == 2);
     assert(config.health_check_failure_threshold == 3);
     assert(config.health_check_cooldown_seconds == 5);
+    assert(!config.has_stream_listen);
+    assert(config.stream_upstream_count == 0);
+    assert(config.stream_lb_policy == MAGNUS_LB_ROUND_ROBIN);
 
     /* full config: comments, blank lines, all fields */
     {
@@ -84,6 +87,10 @@ main(void)
             "health_check_timeout_seconds = 3\n"
             "health_check_failure_threshold = 5\n"
             "health_check_cooldown_seconds = 30\n"
+            "stream_listen = 9091\n"
+            "stream_upstream = 10.0.1.1:6000:2\n"
+            "stream_upstream = 10.0.1.2:6000\n"
+            "stream_lb_policy = ip_hash\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -114,6 +121,49 @@ main(void)
     assert(config.health_check_timeout_seconds == 3);
     assert(config.health_check_failure_threshold == 5);
     assert(config.health_check_cooldown_seconds == 30);
+    assert(config.has_stream_listen);
+    assert(config.stream_listen_port == 9091);
+    assert(config.stream_upstream_count == 2);
+    assert(strcmp(config.stream_upstreams[0].address, "10.0.1.1") == 0);
+    assert(config.stream_upstreams[0].port == 6000);
+    assert(config.stream_upstreams[0].weight == 2);
+    assert(config.stream_upstreams[1].weight == 1);
+    assert(config.stream_lb_policy == MAGNUS_LB_IP_HASH);
+
+    /* stream_listen/stream_upstream: each requires the other, the port
+     * must differ from the main listener, a hostname is rejected (same
+     * restriction as grpc_upstream), and stream_lb_policy takes the same
+     * values lb_policy does. */
+    write_file(config_path, "port = 8080\nstream_listen = 9091\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_listen") != NULL);
+    write_file(config_path, "port = 8080\nstream_upstream = 10.0.0.1:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_upstream") != NULL);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 8080\nstream_upstream = 10.0.0.1:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_listen") != NULL);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = backend.internal:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\nstream_lb_policy = least_conn\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_OK);
+    assert(config.stream_lb_policy == MAGNUS_LB_LEAST_CONN);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = 10.0.0.1:6000\nstream_lb_policy = fastest\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_lb_policy") != NULL);
 
     /* health_check_*: malformed/out-of-range values rejected. */
     write_file(config_path, "port = 8080\nhealth_check_path = no-leading-slash\n");

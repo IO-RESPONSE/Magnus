@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.21.0
+
+### Added
+
+- **TCP passthrough (roadmap 3a): a second, independent listener with
+  zero HTTP awareness -- the first Phase 3 (L4) increment.** New
+  `stream_listen`/`stream_upstream`/`stream_lb_policy` config keys and
+  matching `--stream-listen`/`--stream-upstream`/`--stream-lb-policy`
+  CLI flags stand up a raw bidirectional byte relay between a client and
+  whichever endpoint a dedicated `magnus_stream_cluster` picks. One
+  listener/cluster for this first increment -- multiple simultaneous
+  stream listeners is a distinct future increment, not silently
+  half-done.
+- Reuses the h1/h2 proxy path's existing infrastructure unmodified
+  rather than inventing new load-balancing or health-checking code:
+  `round_robin`/`least_conn`/`ip_hash` (roadmap 2e-1's rendezvous
+  hashing, keyed on client IP since there is no HTTP-level cookie at L4
+  -- no cookie-based affinity here), the same circuit-breaker
+  trip/cooldown state, and active health checking (roadmap 2f,
+  TCP-connect only -- what is actually flowing over a stream connection
+  is unknown by design, so an HTTP-level probe would be meaningless, and
+  could easily misfire against a non-HTTP protocol).
+- New `magnus_stream_conn_t`/`magnus_stream_pipe_t` pair, kept separate
+  from the much larger HTTP-oriented `magnus_connection_t` (matching
+  this codebase's own precedent of a new protocol surface getting its
+  own lightweight state rather than growing the existing one). Drives
+  two independent byte pipes with per-direction epoll-interest
+  backpressure: a slow destination simply stops its source side being
+  read from until the buffered chunk drains, the same discipline the L7
+  proxy's own buffered-write path already uses, just with no HTTP
+  framing to track alongside it. A standard half-close (one direction
+  EOFs and is `shutdown()`-propagated to the other side while the other
+  direction keeps flowing) is supported, since an L4 tunnel has no
+  request/response boundary to assume one is coming. No retry budget on
+  a connect() failure, unlike the L7 proxy path -- there is no "request"
+  to safely retry once any bytes have already moved over an
+  in-progress byte stream.
+- `/metrics` gained `magnus_stream_connections_total`/`_active` (always
+  emitted when `stream_listen` is configured), per-direction
+  `magnus_stream_bytes_total{direction="client_to_upstream"|
+  "upstream_to_client"}`, and `magnus_stream_upstream_healthy{endpoint=...}`
+  mirroring the pre-existing `magnus_upstream_healthy`.
+- Deliberately out of scope for this increment: TLS passthrough / SNI
+  routing (3b) and UDP (3d) remain separate future increments, per the
+  roadmap's own Phase 3 scoping.
+
+### Fixed
+
+Found only through this increment's own live testing, not code review:
+`/metrics`' fixed response buffer (`MAGNUS_OUTPUT_LIMIT`, 2048 bytes) was
+already tight before this increment, and the new stream gauge block
+pushed a real multi-cluster deployment's rendered body past it entirely
+-- silently emptying the *whole* HTTP response rather than truncating
+just the body, since `magnus_prepare_response()`'s own overflow guard
+treats "would not fit" as "send nothing", for safety, rather than
+partial content. Fixed by growing both `MAGNUS_METRICS_BUFFER`
+(1536 -> 8192) and `MAGNUS_OUTPUT_LIMIT` (2048 -> 9216), sized with real
+headroom for a fully-populated deployment (the `upstream`,
+`grpc_upstream`, and `stream` clusters all near their own max endpoint
+count, every gRPC status code, every latency-histogram bucket all
+actually present at once), not just enough for this increment's own
+test. The HTTP/2 `/metrics` path was never affected -- it allocates its
+response buffer dynamically, sized to the actual rendered body, unlike
+the HTTP/1.1 path's fixed `connection->output` buffer.
+
+### Verified
+
+Live, under ASan+UBSan, against real backends: `round_robin`
+alternation and persistent-connection stickiness (the LB decision is
+made once per connection, never per message, since there is no
+HTTP-request boundary at L4 to re-decide on); `ip_hash` same-client
+determinism; a 300KiB payload relayed byte-for-byte across many
+`MAGNUS_PROXY_BUFFER` (16KiB) refills plus a half-close, verified via
+SHA-256 against a byte-for-byte echo backend (a labelled echo backend
+used elsewhere in this same test run turned out to prefix each
+individual `recv()` chunk separately, which would have produced a
+false-positive corruption signal on a large payload split across many
+chunks -- a test-harness artifact caught and worked around during this
+verification, not a product bug); active health check detecting a
+killed backend, and its later recovery, with zero stream traffic sent
+at all, mirroring the M3/2f-1 discipline. New unit coverage in
+`tests/test-config.c` (every `stream_*` key's default, explicit value,
+and rejection case). New permanent regression coverage in
+`tests/test-core.sh`, including a check that `/metrics`' own last-ever-
+emitted line is present and well-formed -- a direct regression guard for
+the buffer-size bug above. `make clean && make test` and `make sanitize`
+(ASan+UBSan) both green. Image rebuilt, `./scripts/test-image.sh`
+passes.
+
 ## 1.20.0
 
 ### Added
