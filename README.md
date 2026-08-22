@@ -259,9 +259,15 @@ independently by IORESPONSE.
   failed connect attempt (literal `"/proxy"` or a route-matched
   `action=proxy`) transparently retries against a freshly-selected
   endpoint, the same total-attempts budget HTTP/1.1 and HTTP/2 already
-  give proxy dispatch. Upstream connection pooling, session affinity,
-  and response caching remain later increments
-- Container image: 10,351,604 bytes (~9.87 MiB), non-root, read-only rootfs
+  give proxy dispatch
+- HTTP/3 proxy dispatch cookie-based session affinity (roadmap Phase
+  4h): a returning client's `MAGNUS_AFFINITY` cookie wins over
+  whichever load-balancing policy is configured, the exact same
+  `Set-Cookie`-issuing code path (`magnus_proxy_sanitize_response_
+  headers()`) HTTP/1.1 and HTTP/2 proxy dispatch already share.
+  Upstream connection pooling and response caching remain later
+  increments
+- Container image: 10,351,883 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

@@ -53,10 +53,12 @@ static nghttp3_conn *g_httpconn;
 static bool g_handshake_confirmed;
 static const char *g_request_path; /* NULL: handshake-only mode */
 static bool g_request_accept_gzip; /* roadmap 4e: send Accept-Encoding: gzip */
+static const char *g_request_cookie; /* roadmap 4h: send Cookie: <this> */
 static bool g_request_submitted;
 static char g_response_status[8];
 static char g_response_content_encoding[32]; /* roadmap 4e */
 static char g_response_vary[32]; /* roadmap 4e */
+static char g_response_set_cookie[128]; /* roadmap 4h */
 static uint8_t *g_response_body;
 static size_t g_response_body_len;
 static bool g_response_done;
@@ -254,6 +256,12 @@ http_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t token,
             ? v.len : sizeof(g_response_vary) - 1;
         memcpy(g_response_vary, v.base, length);
         g_response_vary[length] = '\0';
+    } else if (token == NGHTTP3_QPACK_TOKEN_SET_COOKIE) {
+        nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+        size_t length = v.len < sizeof(g_response_set_cookie) - 1
+            ? v.len : sizeof(g_response_set_cookie) - 1;
+        memcpy(g_response_set_cookie, v.base, length);
+        g_response_set_cookie[length] = '\0';
     }
     return 0;
 }
@@ -302,7 +310,7 @@ setup_httpconn(void)
     nghttp3_settings settings;
     int64_t control_stream_id, qpack_encoder_stream_id, qpack_decoder_stream_id;
     int64_t request_stream_id;
-    nghttp3_nv headers[5];
+    nghttp3_nv headers[6];
     size_t header_count = 4;
 
     if (g_httpconn || !g_request_path) return 0;
@@ -355,9 +363,16 @@ setup_httpconn(void)
         .value = (const uint8_t *) g_request_path, .namelen = 5,
         .valuelen = strlen(g_request_path) };
     if (g_request_accept_gzip) {
-        headers[4] = (nghttp3_nv) { .name = (const uint8_t *) "accept-encoding",
+        headers[header_count] = (nghttp3_nv) {
+            .name = (const uint8_t *) "accept-encoding",
             .value = (const uint8_t *) "gzip", .namelen = 15, .valuelen = 4 };
-        header_count = 5;
+        header_count++;
+    }
+    if (g_request_cookie != NULL) {
+        headers[header_count] = (nghttp3_nv) { .name = (const uint8_t *) "cookie",
+            .value = (const uint8_t *) g_request_cookie, .namelen = 6,
+            .valuelen = strlen(g_request_cookie) };
+        header_count++;
     }
     if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers,
                                     header_count, NULL, NULL) != 0) {
@@ -464,15 +479,17 @@ main(int argc, char **argv)
     ngtcp2_tstamp deadline;
     static const unsigned char alpn_h3[] = { 2, 'h', '3' };
 
-    if (argc != 3 && argc != 4 && argc != 5) {
+    if (argc < 3 || argc > 6) {
         fprintf(stderr,
-            "usage: %s <host> <port> [request-path] [gzip]\n", argv[0]);
+            "usage: %s <host> <port> [request-path] [gzip|-] [cookie]\n",
+            argv[0]);
         return 2;
     }
     host = argv[1];
     port = strtoul(argv[2], NULL, 10);
     if (argc >= 4) g_request_path = argv[3];
-    if (argc == 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
+    if (argc >= 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
+    if (argc == 6) g_request_cookie = argv[5];
 
     g_response_body = malloc(QUIC_HANDSHAKE_CHECK_MAX_BODY);
     if (!g_response_body) {
@@ -675,6 +692,9 @@ main(int argc, char **argv)
         printf("content-encoding: %s\n", g_response_content_encoding);
     if (g_response_vary[0] != '\0')
         printf("vary: %s\n", g_response_vary);
+    /* roadmap 4h -- same "printed only when present" convention. */
+    if (g_response_set_cookie[0] != '\0')
+        printf("set-cookie: %s\n", g_response_set_cookie);
     fwrite(g_response_body, 1, g_response_body_len, stdout);
     /* Skipped for a compressed body (roadmap 4e): gzip's own trailing
      * bytes are effectively random, so this readability nicety would

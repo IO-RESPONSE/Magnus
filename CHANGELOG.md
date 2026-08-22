@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.32.0
+
+### Added
+
+- **HTTP/3 proxy dispatch cookie-based session affinity (roadmap Phase
+  4h): a returning client's `MAGNUS_AFFINITY` cookie, when present and
+  still valid, wins over whichever load-balancing policy is configured
+  -- `magnus_cluster_select_sticky()`'s own documented precedence,
+  matching HTTP/1.1's and HTTP/2's identical proxy dispatch exactly.**
+  A response that issues a fresh cookie (no cookie presented, or a
+  connect-failure retry landed on a different endpoint than whatever
+  the cookie implied) does so through
+  `magnus_proxy_sanitize_response_headers()`'s own existing
+  `affinity_cookie_value` parameter -- always passed `NULL` until now
+  -- so the `Set-Cookie` line is the exact same shared code HTTP/1.1
+  and HTTP/2 proxy dispatch already emit it through.
+  `magnus_decode_affinity_cookie()`/`magnus_encode_affinity_cookie()`
+  (`magnus.c`, exposed via `src/magnus_static.h` for this reuse, the
+  same pattern every other roadmap-4 cross-module symbol has used) are
+  the codec; `magnus_quic_stream_t` gained `issue_affinity_cookie`/
+  `affinity_key`, the h3 analogue of `struct magnus_h2_stream`'s own
+  identically-named pair. `magnus_quic_proxy_start()`'s own `for (;;)`
+  connect loop (4g) now mirrors `magnus_h2_proxy_start()`'s exactly:
+  sticky selection on the first iteration if a valid cookie was
+  presented, falling back to (and refreshing the cookie for) a fresh
+  selection on any deviation -- an invalid/absent cookie, a retried
+  connect after failure, or the sticky endpoint itself being
+  unavailable. `magnus_quic_proxy_fail()`'s own retry (4g) always
+  refreshes the cookie on a successful retry too, for the same reason
+  `magnus_h2_proxy_connect_failed()`'s identical retry does: the
+  client must be pinned to the endpoint actually used now, not the one
+  that just failed. A new `magnus_quic_client_ip()` helper (added in
+  4g) is reused as-is; no Real-IP resolution for QUIC yet (see
+  `src/magnus_quic.h`'s own scope note).
+
+### Fixed (found during this increment's own verification, not by review)
+
+- The existing 4d/4f `test-core.sh` proxy-dispatch body assertions
+  (`tail -n +3 ... | diff/grep`) assumed exactly two response-header
+  lines (`:status`, `content-length`) ahead of the body. Once 4h shipped,
+  *every* proxy response without a client-presented cookie -- which is
+  every one of those pre-existing tests -- now also carries a
+  `set-cookie` line, shifting the body one line later and corrupting
+  the byte-exact large-payload comparison specifically (a real, visible
+  diff: the expected 5000-line fixture short by exactly the leading
+  `set-cookie` line). Found by the full `make test` run itself, not
+  reviewing the new code in isolation -- fixed by updating those three
+  assertions to `tail -n +4`.
+
+`tests/quic-handshake-check.c` gained `set-cookie` response-header
+capture and an optional fifth CLI argument to send a `Cookie:` request
+header, driving `tests/test-core.sh`'s new Phase 4h block: a fresh
+client is issued a cookie and round-robined, presenting that cookie
+back keeps every subsequent request on the same endpoint, and killing
+the sticky endpoint's own backend still fails over (via 4g's retry)
+with a refreshed cookie for the survivor -- mirroring M4's own
+identical h1/h2 session-affinity test exactly.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 proxy round trip against the running container
+itself -- first request issues a cookie, presenting it back sticks to
+the same endpoint every time): image size unchanged in kind from
+1.31.0 (no new runtime dependency -- affinity reuses the cookie codec
+and `magnus_proxy_sanitize_response_headers()` already linked in for
+HTTP/1.1 and HTTP/2).
+
 ## 1.31.0
 
 ### Added

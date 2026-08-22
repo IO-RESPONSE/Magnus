@@ -4132,7 +4132,10 @@ done
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
   /proxy/quic-proxy-small.txt > "$web_root/quic-proxy-small-out"
 grep -qE '^status: 200$' "$web_root/quic-proxy-small-out"
-tail -n +3 "$web_root/quic-proxy-small-out" \
+# tail -n +4, not +3: no client-presented cookie means a proxy-dispatched
+# response now always issues one (roadmap 4h), adding a set-cookie
+# line ahead of the body.
+tail -n +4 "$web_root/quic-proxy-small-out" \
   | grep -qE '^magnus quic proxy file$'
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
   /proxy/quic-proxy-large.txt > "$web_root/quic-proxy-large-out"
@@ -4141,7 +4144,7 @@ python3 -c "
 for n in range(1, 5001):
     print(f'proxy-line-{n:05d}-abcdefghijklmnopqrstuvwxyz')
 " > "$web_root/quic-proxy-large-expected"
-tail -n +3 "$web_root/quic-proxy-large-out" \
+tail -n +4 "$web_root/quic-proxy-large-out" \
   | diff - "$web_root/quic-proxy-large-expected"
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
   /proxy/quic-proxy-does-not-exist.txt | grep -qE '^status: 404$'
@@ -4214,7 +4217,9 @@ done
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
   /route-target > "$web_root/quic-route-proxy-out"
 grep -qE '^status: 200$' "$web_root/quic-route-proxy-out"
-tail -n +3 "$web_root/quic-route-proxy-out" \
+# tail -n +4, not +3 -- see the identical +4 note on the 4d proxy tests
+# above (roadmap 4h's own unconditional set-cookie line).
+tail -n +4 "$web_root/quic-route-proxy-out" \
   | grep -qE '^route-matched path=/route-target$'
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
   /blocked | grep -qE '^status: 403$'
@@ -4287,4 +4292,86 @@ backend_pid=
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry ok (Phase 4b/4c/4d/4e/4f/4g, see src/magnus_quic.h)"
+
+# Phase 4h: cookie-based session affinity -- a client with no
+# MAGNUS_AFFINITY cookie gets round-robined and issued one over HTTP/3
+# too; presenting that cookie back keeps every subsequent request on
+# the same endpoint, and a killed sticky endpoint still fails over via
+# the same connect-stage retry budget (roadmap 4g) with a refreshed
+# cookie for the survivor -- mirroring M4's own identical h1/h2 test
+# exactly.
+port_quic_affinity_a=$((port + 114))
+port_quic_affinity_b=$((port + 115))
+mkdir -p "$web_root/quic-affinity-a" "$web_root/quic-affinity-b"
+printf 'endpoint-a' > "$web_root/quic-affinity-a/id.txt"
+printf 'endpoint-b' > "$web_root/quic-affinity-b/id.txt"
+python3 -m http.server "$port_quic_affinity_a" --bind 127.0.0.1 \
+  --directory "$web_root/quic-affinity-a" >/dev/null 2>&1 &
+backend_pid=$!
+python3 -m http.server "$port_quic_affinity_b" --bind 127.0.0.1 \
+  --directory "$web_root/quic-affinity-b" >/dev/null 2>&1 &
+backend2_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_quic_affinity_a/id.txt" \
+    >/dev/null \
+    && curl --fail --silent "http://127.0.0.1:$port_quic_affinity_b/id.txt" \
+    >/dev/null && break
+  sleep 1
+done
+port_quic_affinity=$((port + 116))
+port_quic_affinity_udp=$((port + 117))
+"$binary" --port "$port_quic_affinity" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_affinity_udp" \
+  --upstream "127.0.0.1:$port_quic_affinity_a" \
+  --upstream "127.0.0.1:$port_quic_affinity_b" \
+  --health-check-failure-threshold 1 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_affinity/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_affinity_udp" /proxy/id.txt - \
+  > "$web_root/quic-affinity-first-out"
+sticky_cookie=$(sed -n 's/^set-cookie: \(MAGNUS_AFFINITY=[^;]*\);.*/\1/p' \
+  "$web_root/quic-affinity-first-out")
+test -n "$sticky_cookie"
+sticky_endpoint=$(tail -1 "$web_root/quic-affinity-first-out")
+for attempt in 1 2 3; do
+  test "$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+    "$port_quic_affinity_udp" /proxy/id.txt - "$sticky_cookie" \
+    | tail -1)" = "$sticky_endpoint"
+done
+
+# Affinity + retry budget together (roadmap 4g/4h): once the sticky
+# endpoint's own backend is gone, the very same cookie must fail over
+# to the surviving endpoint instead of the request failing, and the
+# response must issue a refreshed cookie for it.
+if [ "$sticky_endpoint" = "endpoint-a" ]; then
+  kill -TERM "$backend_pid"
+  wait "$backend_pid" 2>/dev/null || true
+  backend_pid=
+  expect_after=endpoint-b
+else
+  kill -TERM "$backend2_pid"
+  wait "$backend2_pid" 2>/dev/null || true
+  backend2_pid=
+  expect_after=endpoint-a
+fi
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_affinity_udp" /proxy/id.txt - "$sticky_cookie" \
+  > "$web_root/quic-affinity-failover-out"
+grep -qE '^status: 200$' "$web_root/quic-affinity-failover-out"
+grep -qE '^set-cookie: MAGNUS_AFFINITY=' "$web_root/quic-affinity-failover-out"
+test "$(tail -1 "$web_root/quic-affinity-failover-out")" = "$expect_after"
+[ -n "$backend_pid" ] && { kill -TERM "$backend_pid"
+  wait "$backend_pid" 2>/dev/null || true; backend_pid=; }
+[ -n "$backend2_pid" ] && { kill -TERM "$backend2_pid"
+  wait "$backend2_pid" 2>/dev/null || true; backend2_pid=; }
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity ok (Phase 4b/4c/4d/4e/4f/4g/4h, see src/magnus_quic.h)"

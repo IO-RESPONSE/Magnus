@@ -1596,8 +1596,11 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
  * integer parse instead of re-deriving it by hashing -- precise, and
  * independent of magnus_cluster_select()'s unrelated hash-based affinity
  * mode (kept for other potential callers). Returns false if `cookie` is
- * NULL/empty or not in this format. */
-static bool
+ * NULL/empty or not in this format. Not `static` -- see
+ * src/magnus_static.h's own comment on why magnus_quic.c's HTTP/3 proxy
+ * dispatch (roadmap 4h) needs this and magnus_encode_affinity_cookie()
+ * below across a real translation unit boundary. */
+bool
 magnus_decode_affinity_cookie(const char *cookie, size_t *out_index)
 {
     char *end;
@@ -1610,7 +1613,7 @@ magnus_decode_affinity_cookie(const char *cookie, size_t *out_index)
     return true;
 }
 
-static void
+void
 magnus_encode_affinity_cookie(char *out, size_t out_capacity,
                               size_t endpoint_index)
 {

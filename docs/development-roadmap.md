@@ -931,18 +931,22 @@ connection-pool and common-request-model decisions).
   matching, the same DSL and matcher HTTP/1.1 and HTTP/2 already share)
   in 1.30.0, 4g (HTTP/3 proxy dispatch retry-on-connect-failure, the
   same total-attempts budget HTTP/1.1 and HTTP/2 proxy dispatch already
-  have) in 1.31.0** — see `CHANGELOG.md` 1.25.0/1.26.0/1.27.0/1.28.0/
-  1.29.0/1.30.0/1.31.0 and `src/magnus_quic.h` for the exact scope and
-  what's deliberately still missing (proxied-response compression,
-  Brotli/zstd, and streaming compression above 2a's own 8 MiB bound, on
-  every protocol, not a QUIC-specific gap; upstream connection pooling,
-  session affinity, and response caching for HTTP/3 proxy dispatch
+  have) in 1.31.0, 4h (HTTP/3 proxy dispatch cookie-based session
+  affinity, the same `MAGNUS_AFFINITY`-cookie precedence and
+  `Set-Cookie`-issuing code HTTP/1.1 and HTTP/2 proxy dispatch already
+  share) in 1.32.0** — see `CHANGELOG.md` 1.25.0/1.26.0/1.27.0/1.28.0/
+  1.29.0/1.30.0/1.31.0/1.32.0 and `src/magnus_quic.h` for the exact
+  scope and what's deliberately still missing (proxied-response
+  compression, Brotli/zstd, and streaming compression above 2a's own
+  8 MiB bound, on every protocol, not a QUIC-specific gap; upstream
+  connection pooling and response caching for HTTP/3 proxy dispatch
   specifically, whether reached via the literal "/proxy" prefix or a
   matched route, the same way 1e-2 extended HTTP/2 past its own
-  1e-1/1e-4 start; Real-IP-aware `source_cidr` route matching, since
-  QUIC has no established PROXY-protocol-over-UDP precedent in this
-  codebase yet; no retry-based address validation, no migration, no
-  0-RTT at the transport level).
+  1e-1/1e-4 start; Real-IP-aware `source_cidr` route matching and
+  client-IP-based cluster selection, since QUIC has no established
+  PROXY-protocol-over-UDP precedent in this codebase yet; no
+  retry-based address validation, no migration, no 0-RTT at the
+  transport level).
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and

@@ -185,6 +185,22 @@ typedef struct {
      * magnus_h2_stream's own `attempt` field, bounded by
      * MAGNUS_QUIC_PROXY_MAX_ATTEMPTS the same way. */
     int attempt;
+    /* Session affinity (roadmap 4h) -- the h3 analogue of
+     * struct magnus_h2_stream's own identically-named pair. `affinity_key`
+     * is filled in by magnus_encode_affinity_cookie() the moment a fresh
+     * (non-sticky, or deviated-from-sticky) endpoint is actually
+     * selected -- not up front -- since a retry (roadmap 4g) can still
+     * change which endpoint the client should be pinned to after the
+     * first attempt. `issue_affinity_cookie` is what
+     * magnus_quic_proxy_receive_headers() checks to decide whether to
+     * pass a non-NULL affinity_key through to
+     * magnus_proxy_sanitize_response_headers() (its own existing
+     * parameter, unused by roadmap 4d/4f/4g -- always passed NULL until
+     * now), the same shared Set-Cookie-emission code path HTTP/1.1's
+     * own proxy dispatch and magnus_h2_proxy_receive_headers() already
+     * use. */
+    bool issue_affinity_cookie;
+    char affinity_key[64];
     time_t connect_started;
     time_t last_activity;
     char *proxy_request;
@@ -869,8 +885,19 @@ magnus_quic_proxy_fail(magnus_quic_connection_t *connection,
             stream->proxy_request_sent = 0;
             stream->upstream_headers_sent = false;
             if (magnus_quic_proxy_connect_endpoint(connection, stream,
-                                                   (size_t) endpoint) == 0)
+                                                   (size_t) endpoint) == 0) {
+                /* Deviated from whatever selection produced the failed
+                 * attempt (roadmap 4h, matching
+                 * magnus_h2_proxy_connect_failed()'s identical
+                 * unconditional refresh here): the cookie must reflect
+                 * the endpoint actually used now, not the one that just
+                 * failed. */
+                stream->issue_affinity_cookie = true;
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
                 return;
+            }
             magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
                                   magnus_now_ms_local());
         }
@@ -1122,7 +1149,12 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
     memcpy(header_copy, stream->header_buffer, header_length);
     header_copy[header_length] = '\0';
     sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
-        header_length, sanitized, sizeof(sanitized), NULL,
+        header_length, sanitized, sizeof(sanitized),
+        stream->issue_affinity_cookie ? stream->affinity_key : NULL
+        /* roadmap 4h: emits the MAGNUS_AFFINITY Set-Cookie line itself
+         * when non-NULL, the same shared code path h1/h2 proxy dispatch
+         * already use -- see magnus_quic_stream_t's own comment on
+         * issue_affinity_cookie/affinity_key. */,
         true /* client_wants_close: N/A for h3, same reasoning as h2 --
               * see magnus_quic_proxy_submit_response()'s own comment on
               * why the Connection header this produces is dropped
@@ -1351,22 +1383,25 @@ magnus_quic_handle_upstream_event(int fd, uint32_t flags)
  * outbound HTTP/1.1 proxy request (an h3 analogue of
  * magnus_proxy_pick_and_start()'s own request-building, GET/HEAD only
  * -- see this section's own top comment for why no body), then selects
- * a healthy cluster endpoint and connects -- retrying against a freshly
- * selected endpoint on a *synchronous* connect failure (roadmap 4g;
- * the far more common asynchronous failure, detected later via epoll,
- * is magnus_quic_proxy_fail()'s own retry to handle, not this
- * function's), bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total attempts
- * -- the same shape magnus_h2_proxy_start()'s own `for (;;)` connect
- * loop already has, session affinity aside (roadmap 4d/4f/4g all still
- * defer it, see this section's own top comment). `Connection: close` to
- * the upstream unconditionally -- this increment never pools a
- * connection for reuse, so there is nothing to keep it open for, and it
- * lets EOF unambiguously frame a response with no Content-Length the
- * same way HTTP/1.1 itself would. `forward_path` is the caller's to
- * decide (roadmap 4d's own literal "/proxy"-prefix-stripped path, or
- * roadmap 4f's own route-matched unstripped stream->parsed.target --
- * see magnus_quic_http_dispatch()'s own comment on why a route match
- * always wins when both apply, matching magnus_proxy_pick_and_start()'s
+ * a healthy cluster endpoint (a returning client's own MAGNUS_AFFINITY
+ * cookie, if present and still valid, always wins over whichever
+ * load-balancing policy is configured -- roadmap 4h, magnus_cluster_
+ * select_sticky()'s own documented precedence, matching every other
+ * protocol's identical proxy dispatch) and connects -- retrying against
+ * a freshly selected endpoint on a *synchronous* connect failure
+ * (roadmap 4g; the far more common asynchronous failure, detected later
+ * via epoll, is magnus_quic_proxy_fail()'s own retry to handle, not
+ * this function's), bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total
+ * attempts -- the same shape magnus_h2_proxy_start()'s own `for (;;)`
+ * connect loop already has. `Connection: close` to the upstream
+ * unconditionally -- this increment never pools a connection for reuse,
+ * so there is nothing to keep it open for, and it lets EOF unambiguously
+ * frame a response with no Content-Length the same way HTTP/1.1 itself
+ * would. `forward_path` is the caller's to decide (roadmap 4d's own
+ * literal "/proxy"-prefix-stripped path, or roadmap 4f's own
+ * route-matched unstripped stream->parsed.target -- see
+ * magnus_quic_http_dispatch()'s own comment on why a route match always
+ * wins when both apply, matching magnus_proxy_pick_and_start()'s
  * identical h1/h2 precedent). */
 static void
 magnus_quic_proxy_start(magnus_quic_connection_t *connection,
@@ -1375,6 +1410,10 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
 {
     struct in_addr client_ip;
     int written;
+    const char *cookie_header;
+    char client_affinity[64];
+    size_t preferred_index = 0;
+    bool sticky;
 
     /* No stream->body_chunk allocation here -- unlike the old
      * stream->body_buffer, a chunk is allocated fresh per read by
@@ -1398,20 +1437,49 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     }
     stream->proxy_request_length = (size_t) written;
 
+    client_affinity[0] = '\0';
+    cookie_header = magnus_http_header_find(&stream->parsed, "cookie");
+    if (cookie_header != NULL)
+        (void) magnus_http_extract_cookie(cookie_header, strlen(cookie_header),
+                                          MAGNUS_AFFINITY_COOKIE_NAME,
+                                          client_affinity,
+                                          sizeof(client_affinity));
+    sticky = magnus_decode_affinity_cookie(
+        client_affinity[0] != '\0' ? client_affinity : NULL, &preferred_index);
+    stream->issue_affinity_cookie = !sticky;
+
     client_ip = magnus_quic_client_ip(connection);
     stream->attempt = 0;
     for (;;) {
-        int endpoint = magnus_cluster_select(&magnus_cluster,
-                                             magnus_now_ms_local(), NULL,
-                                             client_ip);
+        int endpoint = sticky
+            ? magnus_cluster_select_sticky(&magnus_cluster,
+                                           magnus_now_ms_local(),
+                                           preferred_index, client_ip)
+            : magnus_cluster_select(&magnus_cluster, magnus_now_ms_local(),
+                                    NULL, client_ip);
         if (endpoint < 0) {
             magnus_quic_http_submit_status(connection, stream, "502");
             return;
         }
+        if (sticky) {
+            sticky = false;
+        } else if (stream->attempt > 0) {
+            /* Deviating from the client's original sticky target (or
+             * from plain round-robin) because a previous attempt
+             * failed -- the cookie must be refreshed to reflect the
+             * endpoint actually used, not what a retried/failed
+             * attempt implied. */
+            stream->issue_affinity_cookie = true;
+        }
         stream->attempt++;
         if (magnus_quic_proxy_connect_endpoint(connection, stream,
-                                               (size_t) endpoint) == 0)
+                                               (size_t) endpoint) == 0) {
+            if (stream->issue_affinity_cookie)
+                magnus_encode_affinity_cookie(stream->affinity_key,
+                                              sizeof(stream->affinity_key),
+                                              (size_t) endpoint);
             return;
+        }
         magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
                               magnus_now_ms_local());
         if (stream->attempt >= MAGNUS_QUIC_PROXY_MAX_ATTEMPTS) {

@@ -94,4 +94,19 @@ bool magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out);
  * QUIC traffic can arrive. */
 extern int magnus_global_epoll_fd;
 
+/* Session affinity (roadmap 4h for HTTP/3): the MAGNUS_AFFINITY cookie
+ * codec every protocol's own proxy dispatch shares -- decode a
+ * returning client's cookie value into the cluster endpoint index it
+ * names (false if absent/malformed, meaning "no sticky preference"),
+ * or encode a fresh one naming the endpoint a request actually landed
+ * on. `magnus_cluster_select_sticky()` (src/magnus_policy.h) and
+ * `magnus_proxy_sanitize_response_headers()`'s own `affinity_key`
+ * parameter (src/magnus_proxy.h, already the place every protocol's
+ * proxy response emits the resulting Set-Cookie) are the other two
+ * pieces of this same mechanism -- neither needed exposing here, both
+ * already public. */
+bool magnus_decode_affinity_cookie(const char *cookie, size_t *out_index);
+void magnus_encode_affinity_cookie(char *out, size_t out_capacity,
+                                   size_t endpoint_index);
+
 #endif
