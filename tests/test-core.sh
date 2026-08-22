@@ -3934,3 +3934,34 @@ kill -TERM "$backend19_pid" 2>/dev/null
 wait "$backend19_pid" 2>/dev/null || true
 backend19_pid=
 echo "udp: UDP passthrough (round_robin/stickiness/ip_hash/session-cap) ok"
+
+# Phase 4a (roadmap): a real ngtcp2 handshake against magnus's own QUIC
+# listener, using the in-repo tests/quic-handshake-check.c client (see
+# its own file header, and docs/phase4-spike-results.md for the
+# external-reference-client verification this automated version
+# followed up on). No HTTP/3 request/response yet -- see src/magnus_quic.h.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/quic-server.key" -out "$web_root/quic-server.crt" \
+  2>>"$log"
+port_quic=$((port + 100))
+port_quic_udp=$((port + 101))
+"$binary" --port "$port_quic" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_udp" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_quic/healthz" >/dev/null && break
+  sleep 1
+done
+# Twice: the second run exercises the listener handling a second,
+# independent connection cleanly after the first one's already been
+# torn down, not just a first-ever accept path.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  | grep -qE '^quic-handshake-check: ok$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  | grep -qE '^quic-handshake-check: ok$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake ok (Phase 4a -- transport only, see src/magnus_quic.h)"

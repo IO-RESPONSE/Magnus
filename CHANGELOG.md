@@ -1,5 +1,78 @@
 # Changelog
 
+## 1.25.0
+
+### Added
+
+- **QUIC transport (roadmap Phase 4a): the first Phase 4 increment,
+  scoped the same way Phase 1e (HTTP/2) and Phase 3 both were --
+  transport and handshake only, no HTTP/3 request/response layer yet.**
+  New `--quic-port`/`quic_listen` config key opens a fifth, independent
+  UDP listener (`src/magnus_quic.c`/`.h`) that completes a real RFC
+  9000 handshake -- ngtcp2 + `libngtcp2_crypto_ossl` (see
+  `docs/phase4-http3-quic-dependency-evaluation.md` for the dependency
+  gate this went through first, and `docs/phase4-spike-results.md` for
+  the standalone verification against a real OpenSSL 3.5 before this
+  landed in `magnus.c`) -- integrated into Magnus's own epoll reactor:
+  one shared UDP socket demultiplexes every active connection by QUIC
+  connection ID (a bounded, linear-scan table, same style as every
+  other fixed-size state table in this codebase), and ngtcp2 timer
+  expiry rides the same 1 Hz per-tick sweep `magnus_expire_idle()`/
+  `magnus_health_tick()`/etc. already use. Requires `tls_cert`/
+  `tls_key` (the same certificate the HTTPS listener uses -- no
+  separate QUIC cert); ALPN negotiates `h3` and a modest number of
+  unidirectional streams are accepted (drained for flow control only,
+  never parsed) so a real HTTP/3 client's own control/QPACK streams
+  don't stall its handshake, but bidirectional (request/response)
+  streams stay closed -- nghttp3 joins this build in a later increment
+  once request handling is actually implemented.
+- New `tests/quic-handshake-check.c`: a minimal, self-contained QUIC
+  client (same ngtcp2/crypto_ossl stack, no other new dependency) used
+  by `tests/test-core.sh`'s own new Phase 4a block to drive a real
+  handshake against a running magnus and assert it completes -- not a
+  general-purpose client, only enough of the handshake to prove the
+  listener works under real network I/O, following up on an external
+  reference client (ngtcp2's own `examples/osslclient`) doing the same
+  by hand in `docs/phase4-spike-results.md`.
+- `Dockerfile`'s builder stage now builds ngtcp2 v1.19.0 from source:
+  Debian 13's own package (1.11.0) is below the >= 1.12.0 floor
+  `libngtcp2_crypto_ossl` needs for OpenSSL 3.5+, so apt's copy would
+  build cleanly but fail the handshake at runtime -- found via the
+  dependency evaluation, not by trial and error against the image.
+
+### Fixed (found during this increment's own verification, not by review)
+
+- `ngtcp2_conn_server_new()` asserts on a server connection's transport
+  params missing `original_dcid`/`original_dcid_present` (RFC 9000
+  18.2) -- `ngtcp2_transport_params_default()` leaves both unset, and
+  the very first real handshake attempt against a running magnus
+  crashed the whole process on that assert. Fixed by setting both from
+  the accepted Initial packet's own header.
+- The connection-ID demux table only ever registered CIDs magnus itself
+  issued, never the client's own original dcid -- harmless for a
+  handshake that fits in one Initial packet, but a first flight large
+  enough to span more than one (routine with a post-quantum hybrid key
+  share bulking up the ClientHello) or a retransmission arriving before
+  magnus's first response reaches the client both still carry the
+  client's original dcid, which the table had no entry for, spawning a
+  second, bogus connection for what was really a continuation of the
+  same handshake. Fixed by also registering the client's original dcid
+  at accept time.
+
+### Known gaps (Phase 4a's own deliberately narrow scope, see
+`src/magnus_quic.h`)
+
+- No HTTP/3 request/response handling (nghttp3 not yet linked).
+- No retry-based stateless address validation (anti-amplification): an
+  unmatched Initial is accepted unconditionally.
+- No connection migration / path validation beyond a single,
+  non-migrating handshake.
+- No 0-RTT.
+- A certificate rotated via SIGHUP reload does not propagate to the
+  QUIC listener's own separate SSL_CTX (only the HTTPS listener's
+  cert hot-reloads today) -- a restart is required to rotate the QUIC
+  listener's certificate.
+
 ## 1.24.0
 
 ### Added

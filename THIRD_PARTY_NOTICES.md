@@ -24,5 +24,16 @@ distributions:
 - License: BSD 3-Clause License
 - Used for: transitive dependency of the TLS stack (`libzstd`)
 
+## ngtcp2 / ngtcp2_crypto_ossl
+
+- Upstream: https://github.com/ngtcp2/ngtcp2
+- License: MIT License
+- Used for: QUIC transport (RFC 9000) and its OpenSSL-3.5+ crypto backend
+  (`libngtcp2`, `libngtcp2_crypto_ossl`) -- see
+  `docs/phase4-http3-quic-dependency-evaluation.md` for why this stack was
+  chosen and `docs/phase4-spike-results.md` for it verified working.
+  Transport-only in this release (roadmap Phase 4a, see `src/magnus_quic.h`);
+  no HTTP/3 request handling yet.
+
 Each component's upstream license and copyright notice must be preserved
 unchanged in every distribution that bundles the corresponding library.

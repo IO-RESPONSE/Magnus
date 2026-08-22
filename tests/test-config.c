@@ -106,6 +106,7 @@ main(void)
             "udp_lb_policy = least_conn\n"
             "udp_session_idle_seconds = 60\n"
             "udp_max_sessions = 256\n"
+            "quic_listen = 9093\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
         write_file(config_path, content);
@@ -120,6 +121,8 @@ main(void)
     assert(config.has_tls);
     assert(strcmp(config.tls_cert, cert_path) == 0);
     assert(strcmp(config.tls_key, key_path) == 0);
+    assert(config.has_quic_listen);
+    assert(config.quic_listen_port == 9093);
     assert(config.upstream_count == 2);
     assert(strcmp(config.upstreams[0].address, "10.0.0.1") == 0);
     assert(!config.upstreams[0].is_hostname);
@@ -299,6 +302,39 @@ main(void)
         "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 4097\n");
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
+
+    /* quic_listen (roadmap Phase 4a): requires tls_cert/tls_key -- unlike
+     * udp_listen, this listener terminates a real TLS 1.3 handshake using
+     * the same certificate/key the HTTPS listener does, so there is no
+     * "runs without TLS" case to test the opposite way. */
+    write_file(config_path, "port = 8080\nquic_listen = 9093\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "quic_listen") != NULL);
+    {
+        char content[512];
+        snprintf(content, sizeof(content),
+            "port = 8080\ntls_cert = %s\ntls_key = %s\nquic_listen = 9093\n",
+            cert_path, key_path);
+        write_file(config_path, content);
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_OK);
+        assert(config.has_quic_listen);
+        assert(config.quic_listen_port == 9093);
+        snprintf(content, sizeof(content),
+            "port = 8080\ntls_cert = %s\ntls_key = %s\nquic_listen = 0\n",
+            cert_path, key_path);
+        write_file(config_path, content);
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_ERROR);
+        assert(strstr(error, "quic_listen") != NULL);
+        snprintf(content, sizeof(content),
+            "port = 8080\ntls_cert = %s\ntls_key = %s\nquic_listen = 70000\n",
+            cert_path, key_path);
+        write_file(config_path, content);
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_ERROR);
+    }
 
     /* health_check_*: malformed/out-of-range values rejected. */
     write_file(config_path, "port = 8080\nhealth_check_path = no-leading-slash\n");

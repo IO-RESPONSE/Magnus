@@ -8,6 +8,7 @@
 #include "magnus_dns.h"
 #include "magnus_h2.h"
 #include "magnus_proxy.h"
+#include "magnus_quic.h"
 #include "magnus_realip.h"
 #include "magnus_route.h"
 #include "magnus_sni.h"
@@ -38,7 +39,7 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.24.0"
+#define MAGNUS_VERSION "1.25.0"
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -559,6 +560,16 @@ static unsigned magnus_udp_port;
 static int magnus_udp_listener = -1;
 static unsigned magnus_udp_session_idle_seconds = 30;
 static unsigned magnus_udp_max_sessions = 1024;
+
+/* QUIC transport (roadmap Phase 4a) -- see src/magnus_quic.h for the
+ * full scope note. Unlike magnus_udp_listener above, this is not a
+ * passthrough listener; magnus_quic.c owns the actual per-connection
+ * state (ngtcp2_conn table), magnus.c only owns the listener fd and
+ * the epoll/periodic-sweep wiring, same division of responsibility
+ * magnus_h2.c/magnus_ws.c already have for their own protocols. */
+static bool magnus_quic_enabled;
+static unsigned magnus_quic_port;
+static int magnus_quic_listener = -1;
 
 typedef struct {
     bool in_use;
@@ -1129,6 +1140,19 @@ static double magnus_latency_sum_ms;
 static int magnus_admin_listener = -1;
 static bool magnus_admin_enabled;
 static char magnus_admin_socket_path[MAGNUS_CONFIG_PATH_MAX];
+
+/* Kept only so magnus_quic_init() (called once, at startup, after
+ * magnus_parse_options() returns -- see main()) has the actual
+ * certificate/key file paths to build its own separate QUIC-specific
+ * SSL_CTX from; magnus_tls_context itself is an already-built SSL_CTX*,
+ * not paths. Populated from both entry points that can establish TLS
+ * (the CLI --tls-cert/--tls-key branch and magnus_apply_config(), the
+ * latter covering both --config startup and SIGHUP reload). A reload
+ * that rotates the certificate does NOT currently propagate to the
+ * QUIC listener's own SSL_CTX -- a known Phase 4a gap, see
+ * src/magnus_quic.h; only the HTTPS listener's cert hot-reloads today. */
+static char magnus_tls_cert_path[MAGNUS_CONFIG_PATH_MAX];
+static char magnus_tls_key_path[MAGNUS_CONFIG_PATH_MAX];
 
 /* Per-client-IP ingress rate limiting. Disabled unless --rate-limit is
  * given. A bounded linear-scan table keeps memory flat regardless of how
@@ -9505,6 +9529,10 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_root_fd = new_root_fd;
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
     magnus_tls_context = new_tls_context;
+    if (config->has_tls) {
+        strcpy(magnus_tls_cert_path, config->tls_cert);
+        strcpy(magnus_tls_key_path, config->tls_key);
+    }
     /* Pooled connections are indexed purely by endpoint *position*
      * (0..count-1), not by address -- after a reload, position N in the
      * new cluster is not necessarily the same backend it was in the old
@@ -9647,6 +9675,13 @@ magnus_handle_reload(void)
                         "requires a restart\n");
         return;
     }
+    if (config.has_quic_listen != magnus_quic_enabled
+        || (config.has_quic_listen
+            && config.quic_listen_port != magnus_quic_port)) {
+        fprintf(stderr, "magnus: reload rejected: changing quic_listen "
+                        "requires a restart\n");
+        return;
+    }
     if (magnus_apply_config(&config) != 0) {
         fprintf(stderr, "magnus: reload rejected: a referenced root/tls "
                         "resource could not be opened\n");
@@ -9704,6 +9739,14 @@ magnus_parse_options(int argc, char **argv)
         if (config.has_udp_listen) {
             magnus_udp_port = config.udp_listen_port;
             magnus_udp_enabled = true;
+        }
+        /* QUIC listener (roadmap Phase 4a): same restart-only shape;
+         * magnus_config_load() already rejected quic_listen without
+         * tls_cert/tls_key, so `config.has_tls` is guaranteed true
+         * here whenever this is. */
+        if (config.has_quic_listen) {
+            magnus_quic_port = config.quic_listen_port;
+            magnus_quic_enabled = true;
         }
         return config.port;
     }
@@ -9952,6 +9995,15 @@ magnus_parse_options(int argc, char **argv)
                 || udp_port > 65535) break;
             magnus_udp_port = (unsigned) udp_port;
             magnus_udp_enabled = true;
+        } else if (strcmp(argv[index], "--quic-port") == 0) {
+            char *end;
+            unsigned long quic_port;
+            errno = 0;
+            quic_port = strtoul(argv[index + 1], &end, 10);
+            if (errno != 0 || *end != '\0' || quic_port == 0
+                || quic_port > 65535) break;
+            magnus_quic_port = (unsigned) quic_port;
+            magnus_quic_enabled = true;
         } else if (strcmp(argv[index], "--udp-upstream") == 0) {
             /* ipv4:port or ipv4:port:weight; repeatable to build the UDP
              * cluster. Literal IPv4 only, same restriction and reason as
@@ -10205,6 +10257,12 @@ magnus_parse_options(int argc, char **argv)
         fprintf(stderr, "magnus: --udp-upstream needs --udp-listen\n");
         exit(2);
     }
+    if (magnus_quic_enabled && (certificate == NULL || private_key == NULL)) {
+        fprintf(stderr, "magnus: --quic-port needs --tls-cert/--tls-key "
+                        "(QUIC terminates its own TLS 1.3, using the same "
+                        "certificate the HTTPS listener does)\n");
+        exit(2);
+    }
     /* Deliberately no "--udp-listen must differ from --port/--stream-
      * listen" check -- see magnus_config_t's own comment on why. */
     if (index == argc && port != 0
@@ -10225,6 +10283,13 @@ magnus_parse_options(int argc, char **argv)
             }
             SSL_CTX_set_options(magnus_tls_context, SSL_OP_NO_COMPRESSION);
             magnus_h2_configure_alpn(magnus_tls_context);
+            if (strlen(certificate) >= sizeof(magnus_tls_cert_path)
+                || strlen(private_key) >= sizeof(magnus_tls_key_path)) {
+                fprintf(stderr, "magnus: --tls-cert/--tls-key path too long\n");
+                exit(2);
+            }
+            strcpy(magnus_tls_cert_path, certificate);
+            strcpy(magnus_tls_key_path, private_key);
         }
         return port;
     }
@@ -10252,6 +10317,7 @@ magnus_parse_options(int argc, char **argv)
                     "[--udp-lb-policy round_robin|least_conn|ip_hash] "
                     "[--udp-session-idle <seconds>] "
                     "[--udp-max-sessions <n>] "
+                    "[--quic-port <1-65535>] "
                     "[--route <spec> ...] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
@@ -10419,6 +10485,40 @@ main(int argc, char **argv)
             return 1;
         }
     }
+    if (magnus_quic_enabled) {
+        struct epoll_event quic_event;
+        if (magnus_quic_init(magnus_tls_cert_path, magnus_tls_key_path) != 0) {
+            if (magnus_udp_listener >= 0) close(magnus_udp_listener);
+            if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+            if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+        magnus_quic_listener = magnus_quic_create_listener(magnus_quic_port);
+        if (magnus_quic_listener < 0) {
+            perror("magnus: quic-port");
+            if (magnus_udp_listener >= 0) close(magnus_udp_listener);
+            if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+            if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+        quic_event = (struct epoll_event) { .events = EPOLLIN,
+                                            .data.fd = magnus_quic_listener };
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, magnus_quic_listener,
+                      &quic_event) < 0) {
+            perror("magnus: quic-port epoll_ctl");
+            close(magnus_quic_listener);
+            if (magnus_udp_listener >= 0) close(magnus_udp_listener);
+            if (magnus_stream_listener >= 0) close(magnus_stream_listener);
+            if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            close(epoll_fd);
+            close(listener);
+            return 1;
+        }
+    }
 
     magnus_phase_init(&magnus_phases);
     if (magnus_phase_register(&magnus_phases, MAGNUS_PHASE_INGRESS, 100,
@@ -10557,6 +10657,16 @@ main(int argc, char **argv)
                 magnus_udp_session_service(epoll_fd, magnus_udp_upstream_owner[fd]);
                 continue;
             }
+            if (fd == magnus_quic_listener && magnus_quic_listener >= 0) {
+                /* Unlike every listener dispatched above, QUIC has no
+                 * per-connection fd of its own to also match here --
+                 * every active QUIC connection is demultiplexed inside
+                 * magnus_quic_listener_service() itself, by connection
+                 * ID, off this one shared UDP socket. See
+                 * src/magnus_quic.h. */
+                magnus_quic_listener_service(magnus_quic_listener);
+                continue;
+            }
             if (fd < 0 || fd >= MAGNUS_MAX_FDS
                 || (connection = magnus_connections[fd]) == NULL) {
                 continue;
@@ -10594,6 +10704,8 @@ main(int argc, char **argv)
             magnus_expire_idle(epoll_fd, now);
             magnus_stream_expire_idle(epoll_fd, now);
             magnus_udp_expire_idle(epoll_fd, now);
+            if (magnus_quic_enabled)
+                magnus_quic_tick(magnus_quic_listener, now);
             magnus_pool_expire_idle(now);
             magnus_grpc_pool_expire(now);
             magnus_cache_expire_sweep(magnus_cache_now_ms());
@@ -10655,6 +10767,10 @@ main(int argc, char **argv)
     }
     if (magnus_stream_listener >= 0) close(magnus_stream_listener);
     if (magnus_udp_listener >= 0) close(magnus_udp_listener);
+    if (magnus_quic_listener >= 0) {
+        close(magnus_quic_listener);
+        magnus_quic_shutdown();
+    }
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
     magnus_access_log_flush();

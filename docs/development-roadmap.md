@@ -914,8 +914,16 @@ connection-pool and common-request-model decisions).
     full detail.
 - **Phase 4 — HTTP/3/QUIC.** Per the master prompt's own instruction
   (Section 4), not hand-rolled — evaluated against vetted libraries
-  (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic)
-  in Section 5's dependency framework before any code.
+  (e.g. an OpenSSL-integrated QUIC stack vs. quiche vs. msquic) in
+  Section 5's dependency framework before any code: see
+  `docs/phase4-http3-quic-dependency-evaluation.md` (ngtcp2 + nghttp3
+  chosen) and `docs/phase4-spike-results.md` (standalone verification
+  against a real OpenSSL 3.5 before any of it touched `magnus.c`).
+  **4a (transport/handshake only) shipped in 1.25.0** — see
+  `CHANGELOG.md` 1.25.0 and `src/magnus_quic.h` for the exact scope and
+  what's deliberately still missing (no HTTP/3 request handling, no
+  retry-based address validation, no migration, no 0-RTT). 4b (nghttp3,
+  actual HTTP/3 request/response) is next, not started.
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and

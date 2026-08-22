@@ -452,6 +452,17 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
             }
             config->udp_listen_port = (unsigned) udp_port;
             config->has_udp_listen = true;
+        } else if (strcmp(key, "quic_listen") == 0) {
+            unsigned long quic_port;
+            if (!magnus_config_parse_uint(value, 1, 65535, &quic_port)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'quic_listen' must be 1-65535, "
+                                        "got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->quic_listen_port = (unsigned) quic_port;
+            config->has_quic_listen = true;
         } else if (strcmp(key, "udp_upstream") == 0) {
             magnus_config_upstream_t upstream;
             if (config->udp_upstream_count == MAGNUS_CONFIG_MAX_UPSTREAMS) {
@@ -778,6 +789,14 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     if (!config->has_udp_listen && config->udp_upstream_count > 0) {
         magnus_config_set_error(error, error_capacity, 0,
                                 "'udp_upstream' needs 'udp_listen'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (config->has_quic_listen && !config->has_tls) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'quic_listen' needs 'tls_cert'/'tls_key' "
+                                "(QUIC terminates its own TLS 1.3, using "
+                                "the same certificate the HTTPS listener "
+                                "does)");
         return MAGNUS_CONFIG_ERROR;
     }
     /* Deliberately no "udp_listen must differ from port/stream_listen"

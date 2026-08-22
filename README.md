@@ -217,7 +217,14 @@ independently by IORESPONSE.
 - Verified clean under ASan+UBSan across the full test suite (`make
   sanitize`), and against a 4M-iteration mutation fuzz run of the HTTP
   parser (`tests/fuzz-http.c`, `make test` runs 200k of it by default)
-- Container image: 9,313,789 bytes (~8.88 MiB), non-root, read-only rootfs
+- QUIC transport (roadmap Phase 4a): `--quic-port`/`quic_listen` opens a
+  UDP listener that completes a real RFC 9000 handshake (ngtcp2 +
+  `libngtcp2_crypto_ossl`, terminating TLS 1.3 with the same
+  certificate/key the HTTPS listener uses) integrated into Magnus's own
+  epoll reactor rather than a bundled event loop; ALPN negotiates `h3`
+  so a real client's handshake completes normally, but there is no
+  HTTP/3 request/response layer yet -- see `src/magnus_quic.h`
+- Container image: 10,067,919 bytes (~9.60 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

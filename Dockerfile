@@ -6,7 +6,35 @@ FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates \
         libssl-dev libnghttp2-dev zlib1g-dev \
+        git autoconf automake libtool \
     && rm -rf /var/lib/apt/lists/*
+
+# ngtcp2 + libngtcp2_crypto_ossl (Phase 4a, roadmap): built from source
+# rather than apt -- Debian 13 (trixie)'s own ngtcp2 package is 1.11.0,
+# below the >= 1.12.0 floor libngtcp2_crypto_ossl needs to work against
+# OpenSSL 3.5+ (see docs/phase4-http3-quic-dependency-evaluation.md);
+# apt's copy would build but fail this image's own runtime handshake.
+# v1.19.0 matches the EPEL version this stack was verified against on
+# the development host (docs/phase4-spike-results.md). --without-libev
+# (and every other crypto backend but openssl) skips what neither this
+# image nor Magnus's own build needs. Installed to /usr/local (gcc/ld's
+# own default search path, same as -lssl/-lnghttp2 above resolve
+# without any special flag), not layered into the final apt package
+# set. nghttp3 is NOT built here -- 4a is transport-only (src/
+# magnus_quic.h) and links nothing from it yet (see Makefile's own
+# comment); it joins this build in 4b, once HTTP/3 request handling
+# actually needs it.
+RUN git clone --depth 1 --branch v1.19.0 \
+        https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2 \
+    && cd /tmp/ngtcp2 \
+    && autoreconf -i \
+    && ./configure --prefix=/usr/local --with-openssl --without-gnutls \
+        --without-boringssl --without-libev \
+    && make -j"$(nproc)" \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/ngtcp2
+
 WORKDIR /src
 COPY Makefile ./
 COPY src ./src
@@ -18,7 +46,9 @@ RUN make clean all \
     && cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libzstd.so.1 /out/lib64/ \
-    && cp -L /usr/lib/x86_64-linux-gnu/libnghttp2.so.14 /out/lib64/
+    && cp -L /usr/lib/x86_64-linux-gnu/libnghttp2.so.14 /out/lib64/ \
+    && cp -L /usr/local/lib/libngtcp2.so.16 /out/lib64/ \
+    && cp -L /usr/local/lib/libngtcp2_crypto_ossl.so.0 /out/lib64/
 
 FROM ${BASE_IMAGE}
 COPY --from=builder /out/ /

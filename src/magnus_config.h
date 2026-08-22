@@ -200,6 +200,18 @@ typedef struct {
     magnus_route_t routes[MAGNUS_CONFIG_MAX_ROUTES];
     size_t trusted_proxy_count;
     magnus_cidr_t trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
+    /* QUIC transport (roadmap Phase 4a, see src/magnus_quic.h for the
+     * full scope note): a fifth, independent listener -- SOCK_DGRAM,
+     * its own UDP port (may equal `port`/`stream_listen`/`udp_listen`
+     * without conflict, same reasoning as udp_listen's own comment
+     * above), but unlike udp_listen this one is not a passthrough --
+     * it terminates a real QUIC/TLS 1.3 handshake using the same
+     * `tls_cert`/`tls_key` the HTTPS listener already validates, so
+     * quic_listen requires has_tls the same way stream_sni_route
+     * requires stream_listen. No HTTP/3 request handling yet (4b);
+     * see magnus_quic.h. */
+    bool has_quic_listen;
+    unsigned quic_listen_port;
 } magnus_config_t;
 
 typedef enum {

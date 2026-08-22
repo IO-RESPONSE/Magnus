@@ -2,14 +2,27 @@ CC ?= cc
 CFLAGS ?= -O2 -pipe -std=c17 -Wall -Wextra -Werror -Wpedantic
 CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
-LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz
+# ngtcp2/ngtcp2_crypto_ossl (Phase 4a, roadmap): see
+# docs/phase4-http3-quic-dependency-evaluation.md for why this stack and
+# docs/phase4-spike-results.md for it verified working against this
+# host's OpenSSL. EPEL packages both for EL10; the Dockerfile's own
+# Debian 13 builder needs ngtcp2 built from source instead of its apt
+# package, since Debian's version (1.11.0) is below the >=1.12.0 floor
+# libngtcp2_crypto_ossl needs for OpenSSL 3.5+ -- see Dockerfile.
+# nghttp3 is deliberately NOT linked yet: 4a is transport-only (see
+# src/magnus_quic.h), no code calls into it, and Section 5's own
+# framework is "record a dependency when it's actually adopted, not
+# before" -- it lands here (and in Dockerfile/THIRD_PARTY_NOTICES.md)
+# in 4b, once HTTP/3 request handling actually uses it.
+LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lngtcp2 \
+          -lngtcp2_crypto_ossl
 
 SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_compression.c \
            src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
            src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
-           src/magnus_proxy.c src/magnus_realip.c src/magnus_route.c \
-           src/magnus_sni.c src/magnus_ws.c
+           src/magnus_proxy.c src/magnus_quic.c src/magnus_realip.c \
+           src/magnus_route.c src/magnus_sni.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -65,7 +78,7 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
 		build/test-base64 build/test-compression build/test-realip \
-		build/test-cache build/test-sni \
+		build/test-cache build/test-sni build/quic-handshake-check \
 		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2 \
 		build/fuzz-base64 build/fuzz-compression build/fuzz-realip \
 		build/fuzz-sni
@@ -193,6 +206,15 @@ build/test-sni: tests/test-sni.c src/magnus_sni.c src/magnus_sni.h
 build/fuzz-sni: tests/fuzz-sni.c src/magnus_sni.c src/magnus_sni.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-sni.c src/magnus_sni.c -o $@
+
+# Standalone QUIC client (Phase 4a regression coverage, tests/test-core.sh
+# drives it against a running magnus) -- not a unit test binary invoked
+# directly by the `test` target above, same reason the Python slowloris/
+# malformed-request helpers inside test-core.sh aren't either.
+build/quic-handshake-check: tests/quic-handshake-check.c
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/quic-handshake-check.c $(LDFLAGS) \
+		-lssl -lcrypto -lngtcp2 -lngtcp2_crypto_ossl -o $@
 
 clean:
 	rm -rf build
