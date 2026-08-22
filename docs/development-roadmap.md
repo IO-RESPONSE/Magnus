@@ -934,15 +934,17 @@ connection-pool and common-request-model decisions).
   have) in 1.31.0, 4h (HTTP/3 proxy dispatch cookie-based session
   affinity, the same `MAGNUS_AFFINITY`-cookie precedence and
   `Set-Cookie`-issuing code HTTP/1.1 and HTTP/2 proxy dispatch already
-  share) in 1.32.0** — see `CHANGELOG.md` 1.25.0/1.26.0/1.27.0/1.28.0/
-  1.29.0/1.30.0/1.31.0/1.32.0 and `src/magnus_quic.h` for the exact
-  scope and what's deliberately still missing (proxied-response
-  compression, Brotli/zstd, and streaming compression above 2a's own
-  8 MiB bound, on every protocol, not a QUIC-specific gap; upstream
-  connection pooling and response caching for HTTP/3 proxy dispatch
-  specifically, whether reached via the literal "/proxy" prefix or a
-  matched route, the same way 1e-2 extended HTTP/2 past its own
-  1e-1/1e-4 start; Real-IP-aware `source_cidr` route matching and
+  share) in 1.32.0, 4i (HTTP/3 reverse-proxy response caching for proxy
+  dispatch, one shared bounded/LRU-evicted cache with HTTP/1.1 and
+  HTTP/2, not one per protocol) in 1.33.0** — see `CHANGELOG.md`
+  1.25.0/1.26.0/1.27.0/1.28.0/1.29.0/1.30.0/1.31.0/1.32.0/1.33.0 and
+  `src/magnus_quic.h` for the exact scope and what's deliberately still
+  missing (proxied-response compression, Brotli/zstd, and streaming
+  compression above 2a's own 8 MiB bound, on every protocol, not a
+  QUIC-specific gap; upstream connection pooling for HTTP/3 proxy
+  dispatch specifically, whether reached via the literal "/proxy"
+  prefix or a matched route, the same way 1e-2 extended HTTP/2 past its
+  own 1e-1/1e-4 start; Real-IP-aware `source_cidr` route matching and
   client-IP-based cluster selection, since QUIC has no established
   PROXY-protocol-over-UDP precedent in this codebase yet; no
   retry-based address validation, no migration, no 0-RTT at the

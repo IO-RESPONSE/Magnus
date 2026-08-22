@@ -1,5 +1,6 @@
 #include "magnus_quic.h"
 #include "magnus_static.h"
+#include "magnus_cache.h"
 #include "magnus_compression.h"
 #include "magnus_proxy.h"
 
@@ -201,6 +202,41 @@ typedef struct {
      * use. */
     bool issue_affinity_cookie;
     char affinity_key[64];
+    /* Reverse-proxy cache (roadmap 4i for HTTP/3) -- the h3 analogue of
+     * struct magnus_h2_stream's own identically-named fields, see
+     * magnus_h2_proxy_start()'s and magnus_h2_proxy_receive_headers()'s
+     * own comments for the full rationale behind each one. `cache_enabled`
+     * is this stream's own copy of the matched route's `cache_enabled`
+     * (roadmap 4f) -- action=proxy without cache=on never touches any of
+     * the rest of this. `cache_host`/`cache_target` key the lookup
+     * (stream->parsed.host / the forward path, exact case-sensitive
+     * match on both). `cache_revalidating` plus the two validator fields
+     * are set only when a stale-but-still-useful entry was found, driving
+     * the conditional GET (If-None-Match/If-Modified-Since) built into
+     * the outbound proxy_request. `cache_this_response_cacheable` is
+     * decided once headers are known (roadmap 2d-1's own precedent);
+     * `cache_pending_headers`/`cache_response_etag`/
+     * `cache_response_last_modified` are what magnus_cache_store()
+     * eventually gets, `cache_capture`/`cache_capture_length`/
+     * `cache_capture_capacity`/`cache_capture_overflowed` the growable
+     * body buffer magnus_quic_proxy_cache_capture() fills as the
+     * response streams in. */
+    bool cache_enabled;
+    bool cache_revalidating;
+    char cache_host[256];
+    char cache_target[256];
+    char cache_validator_etag[128];
+    char cache_validator_last_modified[64];
+    bool cache_this_response_cacheable;
+    magnus_cache_freshness_t cache_freshness;
+    char cache_pending_headers[MAGNUS_QUIC_PROXY_SANITIZED_LIMIT];
+    size_t cache_pending_headers_length;
+    char cache_response_etag[128];
+    char cache_response_last_modified[64];
+    char *cache_capture;
+    size_t cache_capture_length;
+    size_t cache_capture_capacity;
+    bool cache_capture_overflowed;
     time_t connect_started;
     time_t last_activity;
     char *proxy_request;
@@ -408,15 +444,19 @@ magnus_quic_slot_alloc(void)
 
 /* Forward declarations -- all defined with the rest of proxy dispatch
  * (roadmap 4d) further down; magnus_quic_http_stream_free(),
- * magnus_quic_tick(), and magnus_quic_proxy_fail() (roadmap 4g's own
- * retry-on-connect-failure) below all need one ahead of that point in
- * file order. */
+ * magnus_quic_tick(), magnus_quic_proxy_fail() (roadmap 4g's own
+ * retry-on-connect-failure), and magnus_quic_proxy_receive_headers()
+ * (roadmap 4i's own cache-revalidation branch) below all need one ahead
+ * of that point in file order. */
 static void magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream);
 static void magnus_quic_proxy_tick(time_t now);
 static void magnus_quic_flush(int listener_fd, int slot);
 static int magnus_quic_proxy_connect_endpoint(
     magnus_quic_connection_t *connection, magnus_quic_stream_t *stream,
     size_t endpoint_index);
+static void magnus_quic_submit_cached_response(
+    magnus_quic_connection_t *connection, magnus_quic_stream_t *stream,
+    magnus_cache_entry_t *entry, const char *x_cache_value);
 
 /* Unmaps whatever magnus_quic_http_dispatch_static() mapped (if
  * anything -- a HEAD request or a zero-length file never map one) and
@@ -445,6 +485,7 @@ magnus_quic_http_stream_free(magnus_quic_stream_t *stream)
     free(stream->header_buffer);
     free(stream->body_chunk);
     free(stream->proxy_request);
+    free(stream->cache_capture); /* roadmap 4i */
     free(stream);
 }
 
@@ -819,6 +860,43 @@ magnus_quic_proxy_find_header_end(char *buffer, size_t length)
     return NULL;
 }
 
+/* Appends `data`/`len` to stream->cache_capture (growable, doubling,
+ * bounded by MAGNUS_CACHE_MAX_ENTRY_BYTES) -- the h3 analogue of
+ * magnus_h2_proxy_cache_capture(), same shape exactly. A no-op once
+ * cache_capture_overflowed is already true (or on this call's own
+ * allocation failure, which sets it) -- capture is always a pure,
+ * silently-declinable side observation of a response this stream is
+ * relaying to the client regardless, so its failure must never affect
+ * (or even be visible to) the normal relay path at all. */
+static void
+magnus_quic_proxy_cache_capture(magnus_quic_stream_t *stream,
+                                const char *data, size_t len)
+{
+    if (!stream->cache_enabled || stream->cache_capture_overflowed
+        || len == 0)
+        return;
+    if (stream->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+        stream->cache_capture_overflowed = true;
+        return;
+    }
+    if (stream->cache_capture_length + len > stream->cache_capture_capacity) {
+        size_t new_capacity = stream->cache_capture_capacity == 0
+            ? MAGNUS_QUIC_PROXY_BUFFER : stream->cache_capture_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->cache_capture_length + len)
+            new_capacity *= 2;
+        grown = realloc(stream->cache_capture, new_capacity);
+        if (grown == NULL) {
+            stream->cache_capture_overflowed = true;
+            return;
+        }
+        stream->cache_capture = grown;
+        stream->cache_capture_capacity = new_capacity;
+    }
+    memcpy(stream->cache_capture + stream->cache_capture_length, data, len);
+    stream->cache_capture_length += len;
+}
+
 static void
 magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream)
 {
@@ -1081,6 +1159,21 @@ magnus_quic_proxy_maybe_complete(magnus_quic_connection_t *connection,
         && stream->response_received >= stream->response_length;
     if (!stream->upstream_eof && !complete_by_length) return;
     stream->response_complete = true;
+    /* Reverse-proxy cache (roadmap 4i): commits the captured body now
+     * that the whole response is known complete -- before
+     * magnus_quic_proxy_teardown_upstream() below, which does not touch
+     * stream->cache_capture itself but this is still the natural,
+     * single place every completion path (Content-Length reached or
+     * upstream EOF) passes through, matching
+     * magnus_h2_proxy_maybe_complete()'s own identical placement. */
+    if (stream->cache_this_response_cacheable
+        && !stream->cache_capture_overflowed) {
+        magnus_cache_store(stream->cache_host, stream->cache_target, 200,
+            stream->cache_pending_headers, stream->cache_pending_headers_length,
+            stream->cache_capture, stream->cache_capture_length,
+            stream->cache_response_etag, stream->cache_response_last_modified,
+            &stream->cache_freshness);
+    }
     magnus_quic_proxy_teardown_upstream(stream);
     if (stream->nghttp3_wants_resume) {
         stream->nghttp3_wants_resume = false;
@@ -1148,24 +1241,89 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
     leftover = stream->header_accum - header_length;
     memcpy(header_copy, stream->header_buffer, header_length);
     header_copy[header_length] = '\0';
-    sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
-        header_length, sanitized, sizeof(sanitized),
-        stream->issue_affinity_cookie ? stream->affinity_key : NULL
-        /* roadmap 4h: emits the MAGNUS_AFFINITY Set-Cookie line itself
-         * when non-NULL, the same shared code path h1/h2 proxy dispatch
-         * already use -- see magnus_quic_stream_t's own comment on
-         * issue_affinity_cookie/affinity_key. */,
-        true /* client_wants_close: N/A for h3, same reasoning as h2 --
-              * see magnus_quic_proxy_submit_response()'s own comment on
-              * why the Connection header this produces is dropped
-              * either way */, &info, NULL);
-    if (sanitized_length < 0) {
-        magnus_quic_proxy_fail(connection, stream, "502");
-        return true;
+    {
+        size_t cacheable_prefix_length;
+        sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
+            header_length, sanitized, sizeof(sanitized),
+            stream->issue_affinity_cookie ? stream->affinity_key : NULL
+            /* roadmap 4h: emits the MAGNUS_AFFINITY Set-Cookie line
+             * itself when non-NULL, the same shared code path h1/h2
+             * proxy dispatch already use -- see magnus_quic_stream_t's
+             * own comment on issue_affinity_cookie/affinity_key. */,
+            true /* client_wants_close: N/A for h3, same reasoning as h2
+                  * -- see magnus_quic_proxy_submit_response()'s own
+                  * comment on why the Connection header this produces
+                  * is dropped either way */, &info,
+            &cacheable_prefix_length /* roadmap 4i: bytes of `sanitized`
+                                       * that are safe for
+                                       * magnus_cache_store() -- see
+                                       * this parameter's own doc
+                                       * comment in magnus_proxy.h for
+                                       * exactly what it excludes and
+                                       * why. */);
+        if (sanitized_length < 0) {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            return true;
+        }
+
+        magnus_cluster_result(&magnus_cluster, stream->endpoint_index, true,
+                              magnus_now_ms_local());
+
+        /* Reverse-proxy cache revalidation (roadmap 4i): a 304 from the
+         * upstream in response to the conditional GET
+         * magnus_quic_proxy_start() built -- refresh the stored entry's
+         * freshness window and serve it, exactly like
+         * magnus_h2_proxy_receive_headers()'s own identical branch (see
+         * its own comment on why nothing left to honestly answer with
+         * if the entry vanished between this attempt starting and the
+         * 304 arriving). */
+        if (stream->cache_revalidating && info.status == 304) {
+            magnus_cache_entry_t *entry;
+            magnus_quic_proxy_teardown_upstream(stream);
+            entry = magnus_cache_lookup(stream->cache_host,
+                                        stream->cache_target);
+            if (entry != NULL) {
+                magnus_cache_freshness_t freshness;
+                magnus_cache_compute_freshness(
+                    info.cache_control[0] != '\0' ? info.cache_control : NULL,
+                    info.expires[0] != '\0' ? info.expires : NULL, NULL,
+                    false, magnus_cache_now_ms(), &freshness);
+                magnus_cache_revalidated(entry, &freshness);
+                magnus_quic_submit_cached_response(connection, stream, entry,
+                                                   "REVALIDATED");
+                return true;
+            }
+            magnus_quic_http_submit_status(connection, stream, "502");
+            return true;
+        }
+
+        /* Decided once, right here, the moment headers (and therefore
+         * Cache-Control/Expires/Vary/Set-Cookie/status) are known --
+         * see magnus_h2_proxy_receive_headers()'s own identical
+         * comment. */
+        if (stream->cache_enabled && info.status == 200) {
+            magnus_cache_compute_freshness(
+                info.cache_control[0] != '\0' ? info.cache_control : NULL,
+                info.expires[0] != '\0' ? info.expires : NULL,
+                info.vary[0] != '\0' ? info.vary : NULL, info.has_set_cookie,
+                magnus_cache_now_ms(), &stream->cache_freshness);
+            stream->cache_this_response_cacheable
+                = stream->cache_freshness.cacheable;
+        }
+        if (stream->cache_this_response_cacheable) {
+            memcpy(stream->cache_pending_headers, sanitized,
+                  cacheable_prefix_length);
+            stream->cache_pending_headers_length = cacheable_prefix_length;
+            strcpy(stream->cache_response_etag, info.etag);
+            strcpy(stream->cache_response_last_modified,
+                  info.last_modified);
+        }
     }
 
     if (info.has_content_length && leftover > info.content_length)
         leftover = info.content_length;
+    if (stream->cache_this_response_cacheable)
+        magnus_quic_proxy_cache_capture(stream, body_start, leftover);
     if (leftover > 0) {
         /* stream->body_chunk is necessarily NULL here (this is the
          * very first body data this stream has ever seen) -- see
@@ -1185,8 +1343,6 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
     stream->response_length = info.content_length;
     stream->response_received = leftover;
 
-    magnus_cluster_result(&magnus_cluster, stream->endpoint_index, true,
-                          magnus_now_ms_local());
     magnus_quic_proxy_submit_response(connection, stream, info.status,
                                       sanitized);
     magnus_quic_proxy_maybe_complete(connection, stream);
@@ -1231,6 +1387,9 @@ magnus_quic_proxy_stream_response(magnus_quic_connection_t *connection,
         stream->body_chunk_length = (size_t) received;
         stream->response_received += (size_t) received;
         stream->last_activity = time(NULL);
+        if (stream->cache_this_response_cacheable)
+            magnus_quic_proxy_cache_capture(stream, (const char *) buffer,
+                                            (size_t) received);
         if (stream->nghttp3_wants_resume) {
             stream->nghttp3_wants_resume = false;
             (void) nghttp3_conn_resume_stream(connection->http3_conn,
@@ -1379,34 +1538,164 @@ magnus_quic_handle_upstream_event(int fd, uint32_t flags)
     return true;
 }
 
-/* Entry point from magnus_quic_http_dispatch() below: builds the
- * outbound HTTP/1.1 proxy request (an h3 analogue of
- * magnus_proxy_pick_and_start()'s own request-building, GET/HEAD only
- * -- see this section's own top comment for why no body), then selects
- * a healthy cluster endpoint (a returning client's own MAGNUS_AFFINITY
- * cookie, if present and still valid, always wins over whichever
- * load-balancing policy is configured -- roadmap 4h, magnus_cluster_
- * select_sticky()'s own documented precedence, matching every other
- * protocol's identical proxy dispatch) and connects -- retrying against
- * a freshly selected endpoint on a *synchronous* connect failure
- * (roadmap 4g; the far more common asynchronous failure, detected later
- * via epoll, is magnus_quic_proxy_fail()'s own retry to handle, not
- * this function's), bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total
- * attempts -- the same shape magnus_h2_proxy_start()'s own `for (;;)`
- * connect loop already has. `Connection: close` to the upstream
- * unconditionally -- this increment never pools a connection for reuse,
- * so there is nothing to keep it open for, and it lets EOF unambiguously
- * frame a response with no Content-Length the same way HTTP/1.1 itself
- * would. `forward_path` is the caller's to decide (roadmap 4d's own
- * literal "/proxy"-prefix-stripped path, or roadmap 4f's own
- * route-matched unstripped stream->parsed.target -- see
- * magnus_quic_http_dispatch()'s own comment on why a route match always
- * wins when both apply, matching magnus_proxy_pick_and_start()'s
- * identical h1/h2 precedent). */
+/* Serves a stored cache entry directly, never touching the upstream at
+ * all -- the h3 analogue of magnus_h2_submit_cached_response(), same
+ * shape exactly (its own header-line tokenizer duplicated here rather
+ * than shared, matching magnus_quic_proxy_submit_response()'s own
+ * pre-existing near-identical copy for the same reason: nghttp3_nv and
+ * nghttp2_nv are different types, so nothing about the loop itself is
+ * actually shareable). `x_cache_value` is "HIT" (a fresh entry found
+ * at dispatch time) or "REVALIDATED" (a stale entry the upstream just
+ * confirmed via 304) -- magnus_quic_http_dispatch()'s and
+ * magnus_quic_proxy_receive_headers()'s own two call sites. The body
+ * is copied into a fresh malloc()ed buffer and handed to nghttp3 via
+ * magnus_quic_http_read_file() exactly like /healthz//metrics (4c) and
+ * compressed static files (4e) already reuse it for -- see
+ * body_is_malloc's own comment on why one pair of fields covers every
+ * non-mmap body shape. */
+static void
+magnus_quic_submit_cached_response(magnus_quic_connection_t *connection,
+                                   magnus_quic_stream_t *stream,
+                                   magnus_cache_entry_t *entry,
+                                   const char *x_cache_value)
+{
+    const char *entry_headers, *entry_body, *etag, *last_modified;
+    size_t entry_headers_length, entry_body_length;
+    nghttp3_nv headers[24];
+    char name_storage[24][64];
+    size_t count = 0;
+    char status_text[8];
+    char content_length_text[32];
+    char *copy;
+    char *saveptr = NULL;
+    char *line;
+
+    magnus_cache_entry_data(entry, &entry_headers, &entry_headers_length,
+                            &entry_body, &entry_body_length, &etag,
+                            &last_modified);
+    (void) etag;
+    (void) last_modified;
+
+    copy = malloc(entry_headers_length + 1);
+    if (copy == NULL) {
+        magnus_quic_http_submit_status(connection, stream, "500");
+        return;
+    }
+    memcpy(copy, entry_headers, entry_headers_length);
+    copy[entry_headers_length] = '\0';
+
+    snprintf(status_text, sizeof(status_text), "%u",
+            magnus_cache_entry_status(entry));
+    headers[count] = magnus_quic_nv(":status", status_text);
+    count++;
+    headers[count] = magnus_quic_nv("server", "Magnus/" MAGNUS_VERSION);
+    count++;
+
+    strtok_r(copy, "\r\n", &saveptr); /* status line, already captured above */
+    for (line = strtok_r(NULL, "\r\n", &saveptr);
+         line != NULL && count < sizeof(headers) / sizeof(headers[0]);
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
+        char *colon = strchr(line, ':');
+        char *value;
+        size_t name_length;
+        if (colon == NULL) continue;
+        name_length = (size_t) (colon - line);
+        if (name_length == 0 || name_length >= sizeof(name_storage[0]))
+            continue;
+        memcpy(name_storage[count], line, name_length);
+        name_storage[count][name_length] = '\0';
+        for (size_t i = 0; i < name_length; i++)
+            name_storage[count][i]
+                = (char) tolower((unsigned char) name_storage[count][i]);
+        if (strcmp(name_storage[count], "connection") == 0) continue;
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        headers[count] = magnus_quic_nv(name_storage[count], value);
+        count++;
+    }
+    /* NOT freed until after nghttp3_conn_submit_response() below --
+     * each header's *value* (unlike its name, already copied into
+     * name_storage) is still a pointer straight into `copy`.
+     * nghttp3_conn_submit_response() copies every name/value out
+     * synchronously within the call (magnus_quic_proxy_submit_response()'s
+     * own identical pattern, passing a *stack*-local buffer with no
+     * explicit lifetime management at all, is the proof this is safe --
+     * were that not true, that pre-existing, already-ASan-verified code
+     * would itself be a dangling-pointer bug). */
+
+    if (count < sizeof(headers) / sizeof(headers[0])) {
+        snprintf(content_length_text, sizeof(content_length_text), "%zu",
+                entry_body_length);
+        headers[count] = magnus_quic_nv("content-length", content_length_text);
+        count++;
+    }
+    if (count < sizeof(headers) / sizeof(headers[0])) {
+        headers[count] = magnus_quic_nv("x-cache", x_cache_value);
+        count++;
+    }
+
+    if (stream->head_only) {
+        free(copy);
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers,
+                                            count, NULL);
+        return;
+    }
+    if (entry_body_length > 0) {
+        stream->mmap_base = malloc(entry_body_length);
+        if (stream->mmap_base == NULL) {
+            free(copy);
+            magnus_quic_http_submit_status(connection, stream, "500");
+            return;
+        }
+        memcpy(stream->mmap_base, entry_body, entry_body_length);
+        stream->mmap_length = entry_body_length;
+        stream->body_is_malloc = true;
+    }
+    {
+        nghttp3_data_reader reader = { .read_data = magnus_quic_http_read_file };
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers,
+                                            count, &reader);
+    }
+    free(copy);
+}
+
+/* Entry point from magnus_quic_http_dispatch() below: reverse-proxy
+ * cache lookup (roadmap 4i, only for `cache_route_enabled` routes and
+ * GET requests -- see magnus_h2_proxy_start()'s own identical logic
+ * for the full rationale) first, since a fresh HIT never touches the
+ * upstream at all; a stale-but-still-validator-bearing entry drives a
+ * conditional GET instead. Then builds the outbound HTTP/1.1 proxy
+ * request (an h3 analogue of magnus_proxy_pick_and_start()'s own
+ * request-building, GET/HEAD only -- see this section's own top
+ * comment for why no body), then selects a healthy cluster endpoint (a
+ * returning client's own MAGNUS_AFFINITY cookie, if present and still
+ * valid, always wins over whichever load-balancing policy is
+ * configured -- roadmap 4h, magnus_cluster_select_sticky()'s own
+ * documented precedence, matching every other protocol's identical
+ * proxy dispatch) and connects -- retrying against a freshly selected
+ * endpoint on a *synchronous* connect failure (roadmap 4g; the far
+ * more common asynchronous failure, detected later via epoll, is
+ * magnus_quic_proxy_fail()'s own retry to handle, not this function's),
+ * bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total attempts -- the same
+ * shape magnus_h2_proxy_start()'s own `for (;;)` connect loop already
+ * has. `Connection: close` to the upstream unconditionally -- this
+ * increment never pools a connection for reuse, so there is nothing to
+ * keep it open for, and it lets EOF unambiguously frame a response
+ * with no Content-Length the same way HTTP/1.1 itself would.
+ * `forward_path` is the caller's to decide (roadmap 4d's own literal
+ * "/proxy"-prefix-stripped path, or roadmap 4f's own route-matched
+ * unstripped stream->parsed.target -- see magnus_quic_http_dispatch()'s
+ * own comment on why a route match always wins when both apply,
+ * matching magnus_proxy_pick_and_start()'s identical h1/h2 precedent);
+ * also this stream's own cache_target once a route with cache=on
+ * matched, matching magnus_h2_proxy_start()'s identical choice to key
+ * the cache on the *forwarded*, not the client-facing, path. */
 static void
 magnus_quic_proxy_start(magnus_quic_connection_t *connection,
                         magnus_quic_stream_t *stream,
-                        const char *forward_path)
+                        const char *forward_path, bool cache_route_enabled)
 {
     struct in_addr client_ip;
     int written;
@@ -1414,23 +1703,82 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     char client_affinity[64];
     size_t preferred_index = 0;
     bool sticky;
+    char conditional_headers[300] = "";
+
+    stream->cache_enabled = cache_route_enabled;
+    stream->cache_revalidating = false;
+    stream->cache_this_response_cacheable = false;
+    stream->cache_capture_overflowed = false;
+    if (cache_route_enabled && strcmp(stream->parsed.method, "GET") == 0) {
+        magnus_cache_entry_t *entry;
+        strncpy(stream->cache_host, stream->parsed.host,
+               sizeof(stream->cache_host) - 1);
+        stream->cache_host[sizeof(stream->cache_host) - 1] = '\0';
+        strncpy(stream->cache_target, forward_path,
+               sizeof(stream->cache_target) - 1);
+        stream->cache_target[sizeof(stream->cache_target) - 1] = '\0';
+
+        entry = magnus_cache_lookup(stream->cache_host, stream->cache_target);
+        if (entry != NULL
+            && magnus_cache_entry_is_fresh(entry, magnus_cache_now_ms())) {
+            magnus_quic_submit_cached_response(connection, stream, entry,
+                                               "HIT");
+            return;
+        }
+        if (entry != NULL && magnus_cache_entry_has_validator(entry)) {
+            const char *h, *b, *etag, *last_modified;
+            size_t hl, bl;
+            magnus_cache_entry_data(entry, &h, &hl, &b, &bl, &etag,
+                                    &last_modified);
+            stream->cache_revalidating = true;
+            strncpy(stream->cache_validator_etag, etag,
+                   sizeof(stream->cache_validator_etag) - 1);
+            stream->cache_validator_etag[
+                sizeof(stream->cache_validator_etag) - 1] = '\0';
+            strncpy(stream->cache_validator_last_modified, last_modified,
+                   sizeof(stream->cache_validator_last_modified) - 1);
+            stream->cache_validator_last_modified[
+                sizeof(stream->cache_validator_last_modified) - 1] = '\0';
+        }
+    }
+    if (stream->cache_revalidating) {
+        size_t off = 0;
+        int w;
+        if (stream->cache_validator_etag[0] != '\0') {
+            w = snprintf(conditional_headers + off,
+                        sizeof(conditional_headers) - off,
+                        "If-None-Match: %s\r\n", stream->cache_validator_etag);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off)
+                off += (size_t) w;
+        }
+        if (stream->cache_validator_last_modified[0] != '\0') {
+            w = snprintf(conditional_headers + off,
+                        sizeof(conditional_headers) - off,
+                        "If-Modified-Since: %s\r\n",
+                        stream->cache_validator_last_modified);
+            if (w > 0 && (size_t) w < sizeof(conditional_headers) - off)
+                off += (size_t) w;
+        }
+    }
 
     /* No stream->body_chunk allocation here -- unlike the old
      * stream->body_buffer, a chunk is allocated fresh per read by
      * magnus_quic_proxy_stream_response() and freed once acked (see
      * magnus_quic_stream_t's own comment), never pre-allocated. */
     stream->header_buffer = malloc(MAGNUS_QUIC_PROXY_HEADER_LIMIT);
-    stream->proxy_request = malloc(512 + strlen(forward_path));
+    stream->proxy_request = malloc(512 + strlen(forward_path)
+                                   + strlen(conditional_headers));
     if (stream->header_buffer == NULL
         || stream->proxy_request == NULL) {
         magnus_quic_http_submit_status(connection, stream, "500");
         return;
     }
     written = snprintf(stream->proxy_request,
-        512 + strlen(forward_path),
-        "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        512 + strlen(forward_path) + strlen(conditional_headers),
+        "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: close\r\n\r\n",
         stream->parsed.method, forward_path,
-        stream->parsed.host[0] != '\0' ? stream->parsed.host : "localhost");
+        stream->parsed.host[0] != '\0' ? stream->parsed.host : "localhost",
+        conditional_headers);
     if (written < 0) {
         magnus_quic_http_submit_status(connection, stream, "500");
         return;
@@ -1659,6 +2007,7 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
     bool is_proxy_route;
     bool route_denied = false;
     bool is_grpc_route = false;
+    bool cache_route_enabled = false;
     const char *forward_path;
     struct in_addr client_ip;
 
@@ -1718,14 +2067,13 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
      * route always wins over the literal "/proxy" prefix above (its own
      * forward_path is the *whole*, unstripped target, matching
      * magnus_proxy_pick_and_start()'s documented h1/h2 precedent), even
-     * when both apply to the same request. Deliberately NOT consulted
-     * here: a matched route's own `cache_enabled` (response caching for
-     * HTTP/3 proxy dispatch is a later increment -- see this section's
-     * own top comment in src/magnus_quic.h) and Real IP resolution
-     * (source_cidr below matches against the raw QUIC peer address,
-     * not a trusted-proxy-resolved one -- QUIC has no established
-     * PROXY-protocol-over-UDP precedent in this codebase to resolve
-     * from in the first place). */
+     * when both apply to the same request -- and, once matched, its own
+     * `cache_enabled` (roadmap 4i) travels along with it into
+     * magnus_quic_proxy_start(). Deliberately NOT consulted here: Real
+     * IP resolution (source_cidr below matches against the raw QUIC
+     * peer address, not a trusted-proxy-resolved one -- QUIC has no
+     * established PROXY-protocol-over-UDP precedent in this codebase to
+     * resolve from in the first place). */
     for (size_t r = 0; r < magnus_route_count; r++) {
         if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
                                   client_ip))
@@ -1733,6 +2081,7 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
         if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
             is_proxy_route = true;
             forward_path = stream->parsed.target;
+            cache_route_enabled = magnus_routes[r].cache_enabled;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
             route_denied = true;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
@@ -1766,7 +2115,8 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
     }
     if (is_proxy_route) {
         stream->is_proxy = true;
-        magnus_quic_proxy_start(connection, stream, forward_path);
+        magnus_quic_proxy_start(connection, stream, forward_path,
+                                cache_route_enabled);
         return;
     }
     magnus_quic_http_dispatch_static(connection, stream);

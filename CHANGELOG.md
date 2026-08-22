@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.33.0
+
+### Added
+
+- **HTTP/3 reverse-proxy response caching for proxy dispatch (roadmap
+  Phase 4i): a route matched with `action=proxy; cache=on` now shares
+  the exact same bounded, in-memory, LRU-evicted cache
+  (`src/magnus_cache.h`) HTTP/1.1 and HTTP/2 already use -- one cache,
+  not one per protocol.** A fresh `GET` looks the entry up before ever
+  touching the upstream; a fresh hit is served entirely from the cache
+  (`X-Cache: HIT`); a stale entry that still carries an `ETag`/
+  `Last-Modified` validator drives a conditional `GET`
+  (`If-None-Match`/`If-Modified-Since`) against the upstream instead of
+  a wholesale re-fetch, and a `304` refreshes the stored entry's
+  freshness window and serves it (`X-Cache: REVALIDATED`) rather than
+  re-transferring a body that has not actually changed.
+  `magnus_quic_stream_t` gained the full cache-related field set
+  `struct magnus_h2_stream` already carries (`cache_enabled`/
+  `cache_host`/`cache_target`/`cache_revalidating`/the two validator
+  fields/`cache_this_response_cacheable`/`cache_freshness`/
+  `cache_pending_headers`/the two response-validator fields/
+  `cache_capture` and its length/capacity/overflow tracking) --
+  `magnus_quic_proxy_cache_capture()` (the h3 analogue of
+  `magnus_h2_proxy_cache_capture()`) fills the capture buffer as the
+  response streams in from two call sites (leftover bytes already read
+  past the header block, and each subsequent `recv()`), and
+  `magnus_quic_proxy_maybe_complete()` commits it via
+  `magnus_cache_store()` once the whole response is known complete.
+  Cacheability itself follows the exact same RFC 7234-narrowed rules
+  every protocol already shares (`magnus_cache_compute_freshness()`) --
+  `no-store`/`private`, a response carrying `Set-Cookie`, or a `Vary`
+  other than `Accept-Encoding` are all excluded outright, same as
+  before. A new `magnus_quic_submit_cached_response()` (the h3 analogue
+  of `magnus_h2_submit_cached_response()`) serves a stored entry
+  directly, reusing `magnus_quic_http_read_file()` and the
+  `mmap_base`/`mmap_length`/`body_is_malloc` pattern 4c/4e already
+  established for non-mmap response bodies.
+
+`tests/quic-handshake-check.c` gained `x-cache` response-header
+capture (matched by name -- no QPACK static-table token exists for a
+non-standard header). `tests/test-core.sh` gained a dedicated
+Phase 4i block mirroring the earlier M-series h1/h2 cache test's own
+fixture and assertions exactly: fresh MISS then HIT with zero
+additional hits against the fake upstream's own per-request marker,
+`no-store`/`Set-Cookie` responses never cached, and a stale
+ETag-bearing entry revalidating via `304` (`X-Cache: REVALIDATED`,
+identical body) or refetching wholesale when the upstream's own
+content genuinely changed -- plus one HTTP/3-specific check the h1/h2
+version has no need for: an ordinary HTTP/1.1 request against the same
+running instance also sees the entry HTTP/3 just stored, proving one
+shared cache rather than a QUIC-local copy.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 MISS-then-HIT round trip, plus the
+cross-protocol HTTP/1.1-sees-the-same-entry check, against the running
+container itself, not just the host binary): image size unchanged in
+kind from 1.32.0 (no new runtime dependency -- caching reuses
+`magnus_cache.c` already linked in for HTTP/1.1 and HTTP/2).
+
 ## 1.32.0
 
 ### Added

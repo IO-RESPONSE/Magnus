@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -59,6 +60,7 @@ static char g_response_status[8];
 static char g_response_content_encoding[32]; /* roadmap 4e */
 static char g_response_vary[32]; /* roadmap 4e */
 static char g_response_set_cookie[128]; /* roadmap 4h */
+static char g_response_x_cache[32]; /* roadmap 4i */
 static uint8_t *g_response_body;
 static size_t g_response_body_len;
 static bool g_response_done;
@@ -234,7 +236,6 @@ http_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t token,
 {
     (void) conn;
     (void) stream_id;
-    (void) name;
     (void) flags;
     (void) conn_user_data;
     (void) stream_user_data;
@@ -262,6 +263,20 @@ http_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t token,
             ? v.len : sizeof(g_response_set_cookie) - 1;
         memcpy(g_response_set_cookie, v.base, length);
         g_response_set_cookie[length] = '\0';
+    } else {
+        /* No QPACK static-table token for "x-cache" (roadmap 4i) --
+         * it is not a standard HTTP header, so unlike every other
+         * response header captured above this one is matched by name
+         * instead of by its own token. */
+        nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+        if (n.len == 7 && strncasecmp((const char *) n.base, "x-cache", 7)
+            == 0) {
+            nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+            size_t length = v.len < sizeof(g_response_x_cache) - 1
+                ? v.len : sizeof(g_response_x_cache) - 1;
+            memcpy(g_response_x_cache, v.base, length);
+            g_response_x_cache[length] = '\0';
+        }
     }
     return 0;
 }
@@ -695,6 +710,9 @@ main(int argc, char **argv)
     /* roadmap 4h -- same "printed only when present" convention. */
     if (g_response_set_cookie[0] != '\0')
         printf("set-cookie: %s\n", g_response_set_cookie);
+    /* roadmap 4i -- same convention again. */
+    if (g_response_x_cache[0] != '\0')
+        printf("x-cache: %s\n", g_response_x_cache);
     fwrite(g_response_body, 1, g_response_body_len, stdout);
     /* Skipped for a compressed body (roadmap 4e): gzip's own trailing
      * bytes are effectively random, so this readability nicety would

@@ -4374,4 +4374,191 @@ test "$(tail -1 "$web_root/quic-affinity-failover-out")" = "$expect_after"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity ok (Phase 4b/4c/4d/4e/4f/4g/4h, see src/magnus_quic.h)"
+
+# Phase 4i: reverse-proxy response caching for HTTP/3 proxy dispatch,
+# sharing magnus_cache_lookup()/_store()/_revalidated() (src/magnus_cache.h)
+# with HTTP/1.1 and HTTP/2 -- one cache, not one per protocol (proven
+# below by an ordinary curl also seeing the entry an HTTP/3 request
+# stored). Same fixture and same shape as the earlier M-series h1/h2
+# cache test: a fresh GET goes to the upstream and gets stored, a
+# repeat GET is answered entirely from the cache (X-Cache: HIT, zero
+# additional hits against the fake upstream's own per-request marker),
+# no-store/Set-Cookie responses are never cached, and a stale entry
+# with an ETag revalidates via conditional GET (X-Cache: REVALIDATED
+# on a 304, a fresh uncached response when the upstream's own content
+# actually changed).
+port_quic_cache_upstream=$((port + 118))
+quic_cache_hits_file="$web_root/quic-cache-hits.txt"
+: > "$quic_cache_hits_file"
+python3 -c "
+import http.server, threading
+
+HITS_FILE = '$quic_cache_hits_file'
+STATE = {'body': b'hello-v1', 'changed': False}
+LOCK = threading.Lock()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def _record(self):
+        with LOCK, open(HITS_FILE, 'a') as f:
+            f.write('x')
+
+    def do_GET(self):
+        self._record()
+        with LOCK:
+            body = STATE['body']
+            changed = STATE['changed']
+        if self.path == '/quic-cacheable':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'max-age=60')
+            self.send_header('ETag', '\"v1\"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/quic-no-store':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/quic-with-cookie':
+            self.send_response(200)
+            self.send_header('Cache-Control', 'max-age=60')
+            self.send_header('Set-Cookie', 'sess=abc')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/quic-revalidate':
+            inm = self.headers.get('If-None-Match')
+            if changed:
+                newbody = b'hello-v2'
+                self.send_response(200)
+                self.send_header('Cache-Control', 'max-age=60')
+                self.send_header('ETag', '\"v2\"')
+                self.send_header('Content-Length', str(len(newbody)))
+                self.end_headers()
+                self.wfile.write(newbody)
+            elif inm == '\"v1\"':
+                self.send_response(304)
+                self.send_header('Cache-Control', 'max-age=1')
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header('Cache-Control', 'max-age=1')
+                self.send_header('ETag', '\"v1\"')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        elif self.path == '/quic-change':
+            with LOCK:
+                STATE['changed'] = True
+            self.send_response(200)
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'ok')
+        else:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $port_quic_cache_upstream), \
+    Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_quic_cache_upstream/quic-cacheable" >/dev/null \
+    && break
+  sleep 1
+done
+port_quic_cache=$((port + 119))
+port_quic_cache_udp=$((port + 120))
+# --health-check-interval pushed out to effectively "never, within this
+# test's runtime" -- see the earlier h1/h2 cache block's own identical
+# comment on why an unthrottled default corrupts the exact-hit-count
+# assertions below.
+"$binary" --port "$port_quic_cache" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_cache_udp" \
+  --upstream "127.0.0.1:$port_quic_cache_upstream" \
+  --route "path_prefix=/; action=proxy; cache=on" \
+  --health-check-interval 3600 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_cache/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-cacheable > "$web_root/quic-cache-out1"
+grep -qE '^status: 200$' "$web_root/quic-cache-out1"
+! grep -q '^x-cache:' "$web_root/quic-cache-out1"
+quic_cache_hits_after_first=$(wc -c < "$quic_cache_hits_file")
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-cacheable > "$web_root/quic-cache-out2"
+grep -qE '^x-cache: HIT$' "$web_root/quic-cache-out2"
+test "$(tail -1 "$web_root/quic-cache-out1")" \
+  = "$(tail -1 "$web_root/quic-cache-out2")"
+test "$(wc -c < "$quic_cache_hits_file")" = "$quic_cache_hits_after_first"
+
+# One shared cache, not one per protocol: an ordinary HTTP/1.1 request
+# against the same running magnus instance also sees the entry HTTP/3
+# just stored -- explicit Host: localhost (magnus_cache_lookup()'s own
+# key is (host, target) exact match, and quic-handshake-check.c always
+# sends :authority: localhost, not this connection's own 127.0.0.1:port)
+# and --http1.1 (curl negotiates h2 over TLS by default when the server
+# offers it, which would exercise the same cache from a different,
+# already-covered protocol instead of the HTTP/1.1 this comment means).
+curl -k --http1.1 --fail --silent -H "Host: localhost" \
+  --dump-header "$web_root/quic-cache-h1-hdrs" --output /dev/null \
+  "https://127.0.0.1:$port_quic_cache/quic-cacheable"
+grep -qi '^X-Cache: HIT' "$web_root/quic-cache-h1-hdrs"
+test "$(wc -c < "$quic_cache_hits_file")" = "$quic_cache_hits_after_first"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-no-store > "$web_root/quic-cache-no-store-1"
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-no-store > "$web_root/quic-cache-no-store-2"
+! grep -q '^x-cache:' "$web_root/quic-cache-no-store-1"
+! grep -q '^x-cache:' "$web_root/quic-cache-no-store-2"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-with-cookie > "$web_root/quic-cache-with-cookie-1"
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-with-cookie > "$web_root/quic-cache-with-cookie-2"
+! grep -q '^x-cache:' "$web_root/quic-cache-with-cookie-1"
+! grep -q '^x-cache:' "$web_root/quic-cache-with-cookie-2"
+
+# Revalidation: a stale entry with an ETag is revalidated via a
+# conditional GET rather than re-fetched wholesale -- X-Cache:
+# REVALIDATED, identical body, on a 304; a genuinely changed upstream
+# still gets a fresh, uncached response instead.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-revalidate > "$web_root/quic-cache-reval-out1"
+sleep 2
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-revalidate > "$web_root/quic-cache-reval-out2"
+grep -qE '^x-cache: REVALIDATED$' "$web_root/quic-cache-reval-out2"
+test "$(tail -1 "$web_root/quic-cache-reval-out1")" \
+  = "$(tail -1 "$web_root/quic-cache-reval-out2")"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-change > /dev/null
+sleep 2
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_cache_udp" \
+  /quic-revalidate > "$web_root/quic-cache-reval-out3"
+! grep -q '^x-cache:' "$web_root/quic-cache-reval-out3"
+test "$(tail -1 "$web_root/quic-cache-reval-out3")" = "hello-v2"
+
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i, see src/magnus_quic.h)"
