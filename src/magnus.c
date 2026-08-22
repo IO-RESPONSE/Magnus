@@ -836,8 +836,11 @@ static magnus_pool_t magnus_upstream_pool[MAGNUS_MAX_UPSTREAMS];
  * most-recently-idled slot first (LIFO -- the warmest connection, most
  * likely to still be alive on a backend with its own idle timeout).
  * Returns -1 if none is available; the caller falls back to opening a
- * fresh connection exactly as it did before pooling existed. */
-static int
+ * fresh connection exactly as it did before pooling existed. Not
+ * `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c's HTTP/3 proxy dispatch (roadmap 4j) needs this and
+ * magnus_pool_checkin() below across a real translation unit boundary. */
+int
 magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served)
 {
     magnus_pool_t *pool;
@@ -876,8 +879,9 @@ magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served)
  * has not yet hit its request budget; otherwise just closes it. Ownership
  * of fd (its magnus_upstream_owner[] entry, its epoll registration -- none
  * held while idle, per the type comment above) is entirely the caller's
- * responsibility to have already cleared before calling this. */
-static void
+ * responsibility to have already cleared before calling this. Not
+ * `static` -- see magnus_pool_checkout()'s own comment just above. */
+void
 magnus_pool_checkin(size_t endpoint_index, int fd, unsigned requests_served)
 {
     magnus_pool_t *pool;

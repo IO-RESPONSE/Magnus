@@ -270,9 +270,15 @@ independently by IORESPONSE.
   LRU-evicted cache (`src/magnus_cache.h`) HTTP/1.1 and HTTP/2 already
   use -- one cache, not one per protocol -- with the same freshness
   rules, conditional-GET revalidation, and `X-Cache: HIT`/
-  `REVALIDATED` observability. Upstream connection pooling remains a
-  later increment
-- Container image: 10,353,598 bytes (~9.87 MiB), non-root, read-only rootfs
+  `REVALIDATED` observability
+- HTTP/3 upstream connection pooling for proxy dispatch (roadmap Phase
+  4j): a completed poolable response is returned to the exact same
+  shared, endpoint-keyed idle pool HTTP/1.1 and HTTP/2 already use --
+  one pool, not one per protocol. This closes the last gap between
+  HTTP/3 proxy dispatch and HTTP/1.1's/HTTP/2's own; see
+  `src/magnus_quic.h` for the handful of genuinely QUIC-specific or
+  cross-cutting items that remain
+- Container image: 10,353,767 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

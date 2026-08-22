@@ -4561,4 +4561,91 @@ backend_pid=
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i, see src/magnus_quic.h)"
+
+# Phase 4j: upstream connection pooling for HTTP/3 proxy dispatch,
+# sharing magnus_pool_checkout()/_checkin() (src/magnus_static.h) --
+# the one shared, endpoint-keyed pool 1a already built -- with HTTP/1.1
+# and HTTP/2, not a QUIC-local one. Same fixture-shape as 1a's own
+# identical pool test: a backend that reports which specific TCP
+# connection (by identity, assigned once per accept) each request
+# arrived on. Several separate HTTP/3 requests all landing on the same
+# connection id proves reuse; a plain HTTP/1.1 request landing on that
+# *same* id afterward proves it is genuinely the one shared pool, not a
+# second, QUIC-only one.
+port_quic_pool_upstream=$((port + 121))
+python3 -c "
+import http.server, threading
+
+lock = threading.Lock()
+next_id = [0]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def setup(self):
+        super().setup()
+        with lock:
+            next_id[0] += 1
+            self.conn_id = next_id[0]
+    def do_GET(self):
+        payload = ('id=' + str(self.conn_id)).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+    def log_message(self, *a): pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', $port_quic_pool_upstream), \
+    Handler).serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_quic_pool_upstream/quic-pool-x" >/dev/null && break
+  sleep 1
+done
+port_quic_pool=$((port + 122))
+port_quic_pool_udp=$((port + 123))
+# --health-check-interval pushed out to effectively "never, within this
+# test's runtime": magnus's own active health checker opens its own
+# periodic probe connections to this same backend independent of
+# anything under test here, which would otherwise consume a connection
+# id that simply never appears in any of these responses -- harmless in
+# principle (see 1a's own identical comment on this), but pushed out
+# anyway to keep this block's own timing predictable.
+"$binary" --port "$port_quic_pool" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_pool_udp" \
+  --upstream "127.0.0.1:$port_quic_pool_upstream" \
+  --health-check-interval 3600 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_pool/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+quic_pool_baseline=$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_pool_udp" /proxy/quic-pool-x | tail -1)
+for _ in 1 2 3 4 5; do
+  test "$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+    "$port_quic_pool_udp" /proxy/quic-pool-x | tail -1)" \
+    = "$quic_pool_baseline"
+done
+
+# One shared pool, not one per protocol: an ordinary HTTP/1.1 request
+# against the same running magnus instance lands on that same pooled
+# upstream connection id (-k https:// and --http1.1, not http:// --
+# this instance's own --tls-cert/--tls-key make the main --port
+# listener HTTPS-only, and curl negotiates h2 over TLS by default when
+# the server offers it).
+h1_pool_id=$(curl -k --http1.1 --fail --silent \
+  "https://127.0.0.1:$port_quic_pool/proxy/quic-pool-x")
+test "$h1_pool_id" = "$quic_pool_baseline"
+
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j, see src/magnus_quic.h)"

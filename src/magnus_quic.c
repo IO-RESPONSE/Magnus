@@ -172,10 +172,9 @@ typedef struct {
      * magnus_quic_http_stream_free() checks to call free() instead of
      * munmap() on cleanup. */
     bool body_is_malloc;
-    /* Proxy dispatch (roadmap 4d, retry-on-connect-failure added 4g) --
-     * see magnus_quic.h's own scope note for what is deliberately still
-     * not here: upstream connection pooling/reuse, session affinity,
-     * response caching. */
+    /* Proxy dispatch (roadmap 4d; retry-on-connect-failure 4g, session
+     * affinity 4h, response caching 4i, upstream connection pooling 4j
+     * all layered on afterward). */
     bool is_proxy;
     int upstream_fd;
     bool upstream_connected;
@@ -256,11 +255,17 @@ typedef struct {
     bool has_response_length;
     size_t response_length;
     size_t response_received;
-    bool upstream_poolable; /* computed, but never acted on in this
-                             * increment -- no pool to check into (see
-                             * this struct's own top comment) -- kept so
-                             * a later increment adding pooling has
-                             * nothing to change here. */
+    /* Whether the *upstream* connection this response came in on may be
+     * pooled for reuse (roadmap 4j) -- has_content_length, and the
+     * upstream did not itself send Connection: close (see
+     * magnus_proxy_response_info_t's own doc comment in
+     * src/magnus_proxy.h). `upstream_requests_served` is how many
+     * requests this fd has already answered before this one -- checked
+     * against MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION (magnus.c-internal)
+     * by magnus_pool_checkin() itself, not read directly here; this
+     * stream only carries it from checkout to checkin. */
+    bool upstream_poolable;
+    unsigned upstream_requests_served;
     bool upstream_eof;
     bool response_complete;
     /* One chunk in flight at a time -- NOT the same shape as
@@ -1001,7 +1006,8 @@ magnus_quic_proxy_abort(magnus_quic_connection_t *connection,
 static int
 magnus_quic_proxy_attach_upstream(magnus_quic_connection_t *connection,
                                   magnus_quic_stream_t *stream,
-                                  size_t endpoint_index, int fd)
+                                  size_t endpoint_index, int fd,
+                                  bool connected, unsigned requests_served)
 {
     struct epoll_event event;
     if (fd < 0 || fd >= MAGNUS_QUIC_MAX_FDS) {
@@ -1009,7 +1015,8 @@ magnus_quic_proxy_attach_upstream(magnus_quic_connection_t *connection,
         return -1;
     }
     stream->upstream_fd = fd;
-    stream->upstream_connected = false;
+    stream->upstream_connected = connected;
+    stream->upstream_requests_served = requests_served;
     stream->endpoint_index = endpoint_index;
     magnus_cluster_endpoint_begin(&magnus_cluster, endpoint_index);
     stream->cluster_endpoint_counted = true;
@@ -1029,6 +1036,14 @@ magnus_quic_proxy_attach_upstream(magnus_quic_connection_t *connection,
     return 0;
 }
 
+/* The h3 analogue of magnus_h2_proxy_connect_endpoint() (roadmap 4j): a
+ * pooled idle connection for this endpoint is tried first -- this is
+ * the connection-pool reuse the master prompt asked 1e-2 to keep, and
+ * it works unmodified here since magnus_upstream_pool
+ * (src/magnus_static.h) is keyed by cluster endpoint, not by which
+ * client connection or protocol is asking. Falls back to a fresh
+ * connect() exactly as every earlier increment already did if the pool
+ * has nothing idle for this endpoint. */
 static int
 magnus_quic_proxy_connect_endpoint(magnus_quic_connection_t *connection,
                                    magnus_quic_stream_t *stream,
@@ -1037,7 +1052,16 @@ magnus_quic_proxy_connect_endpoint(magnus_quic_connection_t *connection,
     struct sockaddr_in address;
     int fd;
     int result;
+    unsigned pooled_requests_served;
+    int pooled_fd = magnus_pool_checkout(endpoint_index,
+                                         &pooled_requests_served);
 
+    if (pooled_fd >= 0) {
+        if (magnus_quic_proxy_attach_upstream(connection, stream,
+                                              endpoint_index, pooled_fd, true,
+                                              pooled_requests_served) == 0)
+            return 0;
+    }
     if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
     fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0 || fd >= MAGNUS_QUIC_MAX_FDS) {
@@ -1049,11 +1073,9 @@ magnus_quic_proxy_connect_endpoint(magnus_quic_connection_t *connection,
         close(fd);
         return -1;
     }
-    if (magnus_quic_proxy_attach_upstream(connection, stream, endpoint_index,
-                                          fd) != 0)
-        return -1;
-    if (result == 0) stream->upstream_connected = true;
-    return 0;
+    return magnus_quic_proxy_attach_upstream(connection, stream,
+                                             endpoint_index, fd,
+                                             result == 0, 0);
 }
 
 /* nghttp3 read_data callback for a proxy-dispatched stream's response
@@ -1174,7 +1196,28 @@ magnus_quic_proxy_maybe_complete(magnus_quic_connection_t *connection,
             stream->cache_response_etag, stream->cache_response_last_modified,
             &stream->cache_freshness);
     }
-    magnus_quic_proxy_teardown_upstream(stream);
+    /* Upstream connection pooling (roadmap 4j) -- only a completion by
+     * Content-Length (never one by upstream EOF, which by definition
+     * means the upstream already closed its own end -- nothing left to
+     * pool) of a response the upstream itself marked poolable goes back
+     * into the idle pool instead of being torn down, exactly matching
+     * magnus_h2_proxy_maybe_complete()'s own identical branch. */
+    if (complete_by_length && stream->upstream_poolable
+        && stream->upstream_fd >= 0) {
+        int fd = stream->upstream_fd;
+        epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        magnus_quic_upstream_owner[fd] = NULL;
+        magnus_quic_upstream_connection[fd] = NULL;
+        stream->upstream_fd = -1;
+        magnus_pool_checkin(stream->endpoint_index, fd,
+                            stream->upstream_requests_served + 1);
+        if (stream->cluster_endpoint_counted) {
+            magnus_cluster_endpoint_end(&magnus_cluster, stream->endpoint_index);
+            stream->cluster_endpoint_counted = false;
+        }
+    } else {
+        magnus_quic_proxy_teardown_upstream(stream);
+    }
     if (stream->nghttp3_wants_resume) {
         stream->nghttp3_wants_resume = false;
         (void) nghttp3_conn_resume_stream(connection->http3_conn,
@@ -1279,7 +1322,26 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
          * 304 arriving). */
         if (stream->cache_revalidating && info.status == 304) {
             magnus_cache_entry_t *entry;
-            magnus_quic_proxy_teardown_upstream(stream);
+            /* Upstream connection pooling (roadmap 4j) applies here
+             * exactly like the ordinary (non-revalidation) completion
+             * path does -- a 304 with no body is still a cleanly
+             * framed response the upstream may have marked poolable. */
+            if (info.upstream_poolable && stream->upstream_fd >= 0) {
+                int fd = stream->upstream_fd;
+                epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                magnus_quic_upstream_owner[fd] = NULL;
+                magnus_quic_upstream_connection[fd] = NULL;
+                stream->upstream_fd = -1;
+                magnus_pool_checkin(stream->endpoint_index, fd,
+                                    stream->upstream_requests_served + 1);
+                if (stream->cluster_endpoint_counted) {
+                    magnus_cluster_endpoint_end(&magnus_cluster,
+                                                stream->endpoint_index);
+                    stream->cluster_endpoint_counted = false;
+                }
+            } else {
+                magnus_quic_proxy_teardown_upstream(stream);
+            }
             entry = magnus_cache_lookup(stream->cache_host,
                                         stream->cache_target);
             if (entry != NULL) {
@@ -1680,11 +1742,15 @@ magnus_quic_submit_cached_response(magnus_quic_connection_t *connection,
  * magnus_quic_proxy_fail()'s own retry to handle, not this function's),
  * bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total attempts -- the same
  * shape magnus_h2_proxy_start()'s own `for (;;)` connect loop already
- * has. `Connection: close` to the upstream unconditionally -- this
- * increment never pools a connection for reuse, so there is nothing to
- * keep it open for, and it lets EOF unambiguously frame a response
- * with no Content-Length the same way HTTP/1.1 itself would.
- * `forward_path` is the caller's to decide (roadmap 4d's own literal
+ * has, and that loop's own magnus_quic_proxy_connect_endpoint() tries a
+ * pooled idle connection first (roadmap 4j). `Connection: keep-alive`
+ * to the upstream, matching magnus_h2_proxy_start()'s own identical
+ * choice -- an upstream response missing a usable Content-Length still
+ * frames correctly via EOF exactly as before (info.upstream_poolable
+ * simply comes back false for it, so it is never actually pooled),
+ * this just stops *forcing* a close on every response that could
+ * otherwise be pooled. `forward_path` is the caller's to decide
+ * (roadmap 4d's own literal
  * "/proxy"-prefix-stripped path, or roadmap 4f's own route-matched
  * unstripped stream->parsed.target -- see magnus_quic_http_dispatch()'s
  * own comment on why a route match always wins when both apply,
@@ -1775,7 +1841,7 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     }
     written = snprintf(stream->proxy_request,
         512 + strlen(forward_path) + strlen(conditional_headers),
-        "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: close\r\n\r\n",
+        "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: keep-alive\r\n\r\n",
         stream->parsed.method, forward_path,
         stream->parsed.host[0] != '\0' ? stream->parsed.host : "localhost",
         conditional_headers);

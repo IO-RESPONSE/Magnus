@@ -109,4 +109,23 @@ bool magnus_decode_affinity_cookie(const char *cookie, size_t *out_index);
 void magnus_encode_affinity_cookie(char *out, size_t out_capacity,
                                    size_t endpoint_index);
 
+/* Idle upstream connection pool (roadmap 4j for HTTP/3), keyed by
+ * cluster endpoint -- one shared pool, not one per protocol, since it
+ * is indexed by which *endpoint* a connection belongs to, never by
+ * which client connection or protocol asked for it (the same reasoning
+ * magnus_h2_proxy_connect_endpoint()'s own comment gives for reusing
+ * this unmodified on the h2 side). `magnus_pool_checkout()` returns a
+ * still-live, reusable fd for `endpoint_index` if one is idle (-1 if
+ * not, meaning "open a fresh connection instead" exactly as if pooling
+ * did not exist), also filling in how many requests that connection has
+ * already served. `magnus_pool_checkin()` returns a finished
+ * connection's fd to the idle pool if it still has budget left
+ * (MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION, magnus.c-internal), or
+ * simply closes it -- caller must have already cleared its own
+ * *_upstream_owner[]/epoll registration for `fd` first, since idle
+ * connections are deliberately not registered with epoll at all. */
+int magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served);
+void magnus_pool_checkin(size_t endpoint_index, int fd,
+                         unsigned requests_served);
+
 #endif

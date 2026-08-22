@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.34.0
+
+### Added
+
+- **HTTP/3 upstream connection pooling for proxy dispatch (roadmap
+  Phase 4j): the last remaining gap between HTTP/3 proxy dispatch and
+  HTTP/1.1's/HTTP/2's own. A completed response the upstream marked
+  poolable is now returned to the exact same shared, endpoint-keyed
+  idle pool (`magnus_pool_checkout()`/`magnus_pool_checkin()`,
+  `src/magnus_static.h`) HTTP/1.1 and HTTP/2 already use -- one pool,
+  not one per protocol, since it is indexed by which *endpoint* a
+  connection belongs to, never by which client connection or protocol
+  asked for it.** `magnus_quic_proxy_connect_endpoint()` now tries a
+  pooled idle connection first, falling back to a fresh `connect()`
+  only when the pool has nothing idle for that endpoint -- the exact
+  shape `magnus_h2_proxy_connect_endpoint()`'s own identical function
+  already has. The outbound proxy request's own `Connection` header
+  changed from an unconditional `close` to `keep-alive` (matching
+  `magnus_h2_proxy_start()`'s own choice) -- without it the upstream
+  would simply close every connection regardless of how eager magnus
+  itself was to reuse it. `magnus_quic_stream_t` gained
+  `upstream_requests_served`, threaded from checkout through to
+  checkin exactly like `struct magnus_h2_stream`'s own field, so
+  `MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION` (magnus.c-internal) still
+  retires a connection on schedule regardless of which protocol has
+  been driving it. `magnus_quic_proxy_maybe_complete()`'s own
+  completion path -- and the reverse-proxy-cache revalidation branch's
+  304 handling (roadmap 4i) -- both now check the response's own
+  `upstream_poolable` verdict (`magnus_proxy_response_info_t`, already
+  computed, previously ignored) before deciding checkin-vs-teardown,
+  the same branch `magnus_h2_proxy_maybe_complete()`'s own identical
+  logic already has: only a completion by Content-Length (never one by
+  upstream EOF, which by definition means the upstream already closed
+  its own end) of a poolable response goes back into the idle pool.
+  `magnus_pool_expire_idle()`'s own existing once-per-second sweep
+  (already running unconditionally from `main()`) needed no QUIC-side
+  hook at all -- it already covers the shared pool regardless of which
+  protocol checked a connection in.
+
+`tests/test-core.sh` gained a dedicated Phase 4j block mirroring 1a's
+own identical connection-pool test's fixture and assertions exactly: a
+backend that reports which specific TCP connection (by identity,
+assigned once per accept) each request arrived on. Several separate
+HTTP/3 requests all landing on the same connection id proves reuse; an
+ordinary HTTP/1.1 request against the same running instance landing on
+that same id afterward proves it is genuinely the one shared pool, not
+a second, QUIC-only one.
+
+With this, HTTP/3 proxy dispatch (roadmap 4d/4f/4g/4h/4i/4j) has
+reached functional parity with HTTP/1.1's and HTTP/2's own -- see
+`src/magnus_quic.h`'s own top comment for the handful of gaps that
+remain genuinely QUIC-specific rather than a missing feature (Real-IP
+resolution, since QUIC has no established PROXY-protocol-over-UDP
+precedent in this codebase) or cross-cutting rather than HTTP/3-scoped
+(proxied-response compression, still absent on every protocol).
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean -- including no leaked/dangling pooled fds under ASan across a
+proxy request boundary; several live HTTP/3 requests plus a
+cross-protocol HTTP/1.1 request all landing on the same pooled
+upstream connection identity, against the running container itself,
+not just the host binary): image size unchanged in kind from 1.33.0
+(no new runtime dependency -- pooling reuses `magnus_pool_checkout()`/
+`_checkin()` already linked in for HTTP/1.1 and HTTP/2).
+
 ## 1.33.0
 
 ### Added
