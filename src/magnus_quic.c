@@ -119,18 +119,19 @@ typedef struct {
  * in magnus.c for the exact same reason. */
 typedef struct {
     int64_t stream_id;
-    char method[8];
-    char path[256];
-    char authority[256];
-    /* accept-encoding (roadmap 4e): captured in
-     * magnus_quic_http_recv_header() via its own QPACK static-table
-     * token (NGHTTP3_QPACK_TOKEN_ACCEPT_ENCODING), the same way :path/
-     * :method/:authority are captured via theirs -- fed to
-     * magnus_accepts_gzip() exactly like HTTP/1.1's own
-     * magnus_http_header_find(request, "accept-encoding") and HTTP/2's
-     * stream->parsed equivalent, so all three protocols negotiate
-     * compression by the same rule. */
-    char accept_encoding[256];
+    /* :method/:path/:authority captured into .method/.target/.host,
+     * every ordinary header into .headers[] -- exactly the shape
+     * magnus_h2_on_header() already builds for HTTP/2's own
+     * stream->parsed (magnus.c), reused verbatim here (not a QUIC-local
+     * near-copy) specifically so magnus_route_matches() (roadmap 4f:
+     * host/path-prefix/method/header/header_prefix/cookie/query/
+     * source-CIDR route matching) and magnus_accepts_gzip() (roadmap
+     * 4e, via magnus_http_header_find(&stream->parsed,
+     * "accept-encoding") -- no longer a separate ad hoc field) both
+     * work identically regardless of which protocol a request arrived
+     * over. See magnus_quic_http_recv_header()'s own comment for the
+     * capture side. */
+    magnus_http_request_t parsed;
     bool head_only;
     /* The whole file, mmap()ed once at dispatch and handed to nghttp3
      * as a single vec (magnus_quic_http_read_file()) rather than
@@ -1288,26 +1289,20 @@ magnus_quic_handle_upstream_event(int fd, uint32_t flags)
  * upstream unconditionally -- this increment never pools a connection
  * for reuse (see this section's own top comment), so there is nothing
  * to keep it open for, and it lets EOF unambiguously frame a response
- * with no Content-Length the same way HTTP/1.1 itself would. */
+ * with no Content-Length the same way HTTP/1.1 itself would.
+ * `forward_path` is the caller's to decide (roadmap 4d's own literal
+ * "/proxy"-prefix-stripped path, or roadmap 4f's own route-matched
+ * unstripped stream->parsed.target -- see magnus_quic_http_dispatch()'s
+ * own comment on why a route match always wins when both apply,
+ * matching magnus_proxy_pick_and_start()'s identical h1/h2 precedent). */
 static void
 magnus_quic_proxy_start(magnus_quic_connection_t *connection,
-                        magnus_quic_stream_t *stream)
+                        magnus_quic_stream_t *stream,
+                        const char *forward_path)
 {
     int endpoint;
     struct in_addr client_ip;
     int written;
-    /* The literal "/proxy" prefix itself is stripped before relaying --
-     * matching magnus_proxy_pick_and_start()'s own documented contract
-     * for the h1/h2 "reached here via the hardcoded prefix" case
-     * exactly (its own comment: "request->path with the literal
-     * '/proxy' prefix stripped"). Falls back to "/" for a bare
-     * "/proxy" request (nothing left after stripping) rather than
-     * forwarding an empty request-target, which HTTP/1.1 does not
-     * allow -- a deliberate small improvement over reusing that exact
-     * edge case here, not a behavior this new code path needs to
-     * import unchanged. */
-    const char *forward_path = stream->path + 6;
-    if (forward_path[0] == '\0') forward_path = "/";
 
     /* No stream->body_chunk allocation here -- unlike the old
      * stream->body_buffer, a chunk is allocated fresh per read by
@@ -1323,8 +1318,8 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     written = snprintf(stream->proxy_request,
         512 + strlen(forward_path),
         "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-        stream->method, forward_path,
-        stream->authority[0] != '\0' ? stream->authority : "localhost");
+        stream->parsed.method, forward_path,
+        stream->parsed.host[0] != '\0' ? stream->parsed.host : "localhost");
     if (written < 0) {
         magnus_quic_http_submit_status(connection, stream, "500");
         return;
@@ -1400,11 +1395,11 @@ magnus_quic_compress_static(int fd, const struct stat *metadata,
     return true;
 }
 
-/* Serves stream->path as a static file -- the fallback once
- * magnus_quic_http_dispatch() below has ruled out /healthz and
- * /metrics. Method/head_only validation already happened there, same
- * as magnus_h2_dispatch()'s own single validation pass ahead of its
- * own healthz/metrics/static branches. */
+/* Serves stream->parsed.target as a static file -- the fallback once
+ * magnus_quic_http_dispatch() below has ruled out /healthz, /metrics,
+ * and every route (roadmap 4f). Method/head_only validation already
+ * happened there, same as magnus_h2_dispatch()'s own single validation
+ * pass ahead of its own healthz/metrics/static branches. */
 static void
 magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
                                  magnus_quic_stream_t *stream)
@@ -1419,18 +1414,20 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     size_t compressed_length = 0;
     bool use_gzip;
 
-    fd = magnus_open_static(stream->path, &metadata);
+    fd = magnus_open_static(stream->parsed.target, &metadata);
     if (fd < 0) {
         magnus_quic_http_submit_status(connection, stream, "404");
         return;
     }
-    content_type = magnus_content_type(stream->path);
+    content_type = magnus_content_type(stream->parsed.target);
     /* Computed unconditionally, ahead of the head_only check below --
      * a HEAD response still needs the *compressed* Content-Length to
      * be accurate (what a subsequent GET would actually transfer),
      * exactly like magnus_h2_dispatch_static()'s own ordering. */
     use_gzip = magnus_quic_compress_static(fd, &metadata, content_type,
-                                           stream->accept_encoding,
+                                           magnus_http_header_find(
+                                               &stream->parsed,
+                                               "accept-encoding"),
                                            &compressed, &compressed_length);
     snprintf(content_length, sizeof(content_length), "%lld",
             use_gzip ? (long long) compressed_length
@@ -1502,22 +1499,31 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
  * request's headers and (if any) body have both been fully received --
  * exactly the same trigger point magnus_h2_dispatch()'s own non-early-
  * response path uses. Method/path validation, then /healthz, then
- * /metrics, then static -- literal "/healthz"/"/metrics" wins over a
- * same-named file exactly like magnus_h2_dispatch()'s own comment
- * documents for the h2 side. No request body is ever read for GET/
+ * /metrics, then the `route` table (roadmap 4f), then static -- literal
+ * "/healthz"/"/metrics" wins over a same-named file *and* over any
+ * route's own conditions, exactly like magnus_h2_dispatch()'s own
+ * comment documents for the h2 side (a route matching action=grpc, say,
+ * still leaves /healthz alone). No request body is ever read for GET/
  * HEAD, so in practice this fires as soon as headers finish for the
  * only two methods this increment accepts. */
 static void
 magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
                           magnus_quic_stream_t *stream)
 {
-    stream->head_only = strcmp(stream->method, "HEAD") == 0;
-    if (stream->path[0] == '\0'
-        || (strcmp(stream->method, "GET") != 0 && !stream->head_only)) {
+    bool literal_proxy_prefix;
+    bool is_proxy_route;
+    bool route_denied = false;
+    bool is_grpc_route = false;
+    const char *forward_path;
+    struct in_addr client_ip;
+
+    stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
+    if (stream->parsed.target[0] == '\0'
+        || (strcmp(stream->parsed.method, "GET") != 0 && !stream->head_only)) {
         magnus_quic_http_submit_status(connection, stream, "400");
         return;
     }
-    if (strcmp(stream->path, "/healthz") == 0) {
+    if (strcmp(stream->parsed.target, "/healthz") == 0) {
         magnus_quic_http_submit_text(connection, stream, "200", "text/plain",
                                      "magnus: ok\n");
         return;
@@ -1527,7 +1533,8 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
      * (roadmap 1e-4), extended to the QUIC listener too. Falls through
      * to the static-file path below when withdrawn, same as a request
      * for any other path that happens not to exist. */
-    if (strcmp(stream->path, "/metrics") == 0 && !magnus_admin_enabled) {
+    if (strcmp(stream->parsed.target, "/metrics") == 0
+        && !magnus_admin_enabled) {
         /* Matches magnus.c's own MAGNUS_METRICS_BUFFER -- not shared
          * via magnus_static.h because that constant's own sizing is
          * coupled to magnus.c's unrelated MAGNUS_OUTPUT_LIMIT (see its
@@ -1541,13 +1548,83 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
                                      "text/plain; version=0.0.4", metrics);
         return;
     }
-    /* Roadmap 4d -- see that section's own top comment for exactly what
-     * "/proxy" dispatches to and what is deliberately not supported
-     * yet (the `route` table's own host/path-prefix/header/cookie/
-     * query/source-CIDR matching among them). */
-    if (magnus_upstream_enabled && strncmp(stream->path, "/proxy", 6) == 0) {
+
+    /* Roadmap 4d: the literal "/proxy" prefix, stripped before
+     * relaying (falls back to "/" for a bare "/proxy" request rather
+     * than forwarding an empty request-target, which HTTP/1.1 does not
+     * allow -- a deliberate small improvement over the exact h1/h2
+     * edge case, not a behavior this path needs to import unchanged). */
+    literal_proxy_prefix = magnus_upstream_enabled
+        && strncmp(stream->parsed.target, "/proxy", 6) == 0
+        && (stream->parsed.target[6] == '/' || stream->parsed.target[6] == '\0');
+    is_proxy_route = literal_proxy_prefix;
+    forward_path = literal_proxy_prefix ? stream->parsed.target + 6
+                                        : stream->parsed.target;
+    if (forward_path[0] == '\0') forward_path = "/";
+
+    if (connection->remote_addr.ss_family == AF_INET)
+        client_ip = ((struct sockaddr_in *) &connection->remote_addr)->sin_addr;
+    else
+        client_ip.s_addr = 0;
+
+    /* Roadmap 4f: host/path-prefix/method/header/header_prefix/cookie/
+     * query/source-CIDR route matching, reusing magnus_route_matches()
+     * (src/magnus_route.h) and the same magnus_routes[]/magnus_route_count
+     * table (src/magnus_static.h) HTTP/1.1 and HTTP/2 already share --
+     * evaluated in file order, first match wins, exactly like
+     * magnus_h2_dispatch()'s own identical loop. A matched action=proxy
+     * route always wins over the literal "/proxy" prefix above (its own
+     * forward_path is the *whole*, unstripped target, matching
+     * magnus_proxy_pick_and_start()'s documented h1/h2 precedent), even
+     * when both apply to the same request. Deliberately NOT consulted
+     * here: a matched route's own `cache_enabled` (response caching for
+     * HTTP/3 proxy dispatch is a later increment -- see this section's
+     * own top comment in src/magnus_quic.h) and Real IP resolution
+     * (source_cidr below matches against the raw QUIC peer address,
+     * not a trusted-proxy-resolved one -- QUIC has no established
+     * PROXY-protocol-over-UDP precedent in this codebase to resolve
+     * from in the first place). */
+    for (size_t r = 0; r < magnus_route_count; r++) {
+        if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
+                                  client_ip))
+            continue;
+        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
+            is_proxy_route = true;
+            forward_path = stream->parsed.target;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
+            route_denied = true;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
+            is_grpc_route = true;
+        }
+        /* action=static needs no branch of its own here: matching and
+         * being neither deny/proxy/grpc already falls through to the
+         * same static-file dispatch a request with no matching route
+         * at all gets, exactly like magnus_h2_dispatch()'s own comment
+         * documents. */
+        break;
+    }
+
+    if (route_denied) {
+        magnus_quic_http_submit_status(connection, stream, "403");
+        return;
+    }
+    if (is_grpc_route) {
+        /* A real gRPC server requires HTTP/2 end to end (trailers alone
+         * make it impossible over HTTP/1.1 -- and this codebase's own
+         * gRPC dispatch is HTTP/2-native-only in the first place, see
+         * magnus_h2_dispatch()'s own action=grpc branch), so HTTP/3 is
+         * no more able to reach it than HTTP/1.1 is -- same explicit,
+         * immediate 505 magnus_dispatch_request()'s own action=grpc
+         * branch already answers with, rather than silently falling
+         * through to ordinary static dispatch as if action=grpc were
+         * not there at all. */
+        magnus_quic_http_submit_text(connection, stream, "505", "text/plain",
+            "gRPC requires HTTP/2 (TLS ALPN \"h2\" or h2c)\n");
+        return;
+    }
+    if (is_proxy_route) {
         stream->is_proxy = true;
-        magnus_quic_proxy_start(connection, stream);
+        magnus_quic_proxy_start(connection, stream, forward_path);
         return;
     }
     magnus_quic_http_dispatch_static(connection, stream);
@@ -1648,6 +1725,16 @@ magnus_quic_http_begin_headers(nghttp3_conn *conn, int64_t stream_id,
     return 0;
 }
 
+/* Captures :method/:path/:authority into stream->parsed's own fixed
+ * fields, and (roadmap 4f) every ordinary header into
+ * stream->parsed.headers[] up to MAGNUS_HTTP_MAX_HEADERS -- truncated
+ * (not rejected) past its fixed-size slot, simply not retained past
+ * the count limit, exactly mirroring magnus_h2_on_header()'s own
+ * handling (and, further back, magnus_http_parse()'s), so route
+ * matching and Accept-Encoding negotiation behave identically
+ * regardless of which protocol a request arrived over. Any other
+ * pseudo-header (:scheme, :protocol, ...) is silently ignored, same as
+ * magnus_h2_on_header()'s own `name[0] == ':'` check. */
 static int
 magnus_quic_http_recv_header(nghttp3_conn *conn, int64_t stream_id,
                              int32_t token, nghttp3_rcbuf *name,
@@ -1656,36 +1743,53 @@ magnus_quic_http_recv_header(nghttp3_conn *conn, int64_t stream_id,
 {
     magnus_quic_stream_t *stream = stream_user_data;
     nghttp3_vec v;
+    nghttp3_vec n;
     (void) conn;
     (void) stream_id;
-    (void) name;
     (void) flags;
     (void) conn_user_data;
     if (stream == NULL) return 0;
     v = nghttp3_rcbuf_get_buf(value);
     if (token == NGHTTP3_QPACK_TOKEN__METHOD) {
-        size_t length = v.len < sizeof(stream->method) - 1
-            ? v.len : sizeof(stream->method) - 1;
-        memcpy(stream->method, v.base, length);
-        stream->method[length] = '\0';
-    } else if (token == NGHTTP3_QPACK_TOKEN__PATH) {
-        size_t length = v.len < sizeof(stream->path) - 1
-            ? v.len : sizeof(stream->path) - 1;
-        memcpy(stream->path, v.base, length);
-        stream->path[length] = '\0';
-    } else if (token == NGHTTP3_QPACK_TOKEN__AUTHORITY) {
-        /* :authority (roadmap 4d) -- becomes the outbound Host header
-         * for a proxy-dispatched request; unused by the static/healthz/
-         * metrics paths (4b/4c), which never look at it. */
-        size_t length = v.len < sizeof(stream->authority) - 1
-            ? v.len : sizeof(stream->authority) - 1;
-        memcpy(stream->authority, v.base, length);
-        stream->authority[length] = '\0';
-    } else if (token == NGHTTP3_QPACK_TOKEN_ACCEPT_ENCODING) {
-        size_t length = v.len < sizeof(stream->accept_encoding) - 1
-            ? v.len : sizeof(stream->accept_encoding) - 1;
-        memcpy(stream->accept_encoding, v.base, length);
-        stream->accept_encoding[length] = '\0';
+        size_t length = v.len < sizeof(stream->parsed.method) - 1
+            ? v.len : sizeof(stream->parsed.method) - 1;
+        memcpy(stream->parsed.method, v.base, length);
+        stream->parsed.method[length] = '\0';
+        return 0;
+    }
+    if (token == NGHTTP3_QPACK_TOKEN__PATH) {
+        size_t length = v.len < sizeof(stream->parsed.target) - 1
+            ? v.len : sizeof(stream->parsed.target) - 1;
+        memcpy(stream->parsed.target, v.base, length);
+        stream->parsed.target[length] = '\0';
+        return 0;
+    }
+    if (token == NGHTTP3_QPACK_TOKEN__AUTHORITY) {
+        /* :authority -- becomes the outbound Host header for a
+         * proxy-dispatched request (roadmap 4d) and the value a
+         * MAGNUS_ROUTE_MATCH_HOST condition compares against (roadmap
+         * 4f), matching HTTP/2's own :authority-as-Host precedent
+         * exactly (see magnus_h2_on_header()'s own comment). */
+        size_t length = v.len < sizeof(stream->parsed.host) - 1
+            ? v.len : sizeof(stream->parsed.host) - 1;
+        memcpy(stream->parsed.host, v.base, length);
+        stream->parsed.host[length] = '\0';
+        return 0;
+    }
+    n = nghttp3_rcbuf_get_buf(name);
+    if (n.len > 0 && n.base[0] == ':') return 0; /* any other pseudo-header */
+    if (stream->parsed.header_count < MAGNUS_HTTP_MAX_HEADERS) {
+        magnus_http_header_t *stored
+            = &stream->parsed.headers[stream->parsed.header_count];
+        size_t stored_name_length = n.len < sizeof(stored->name) - 1
+            ? n.len : sizeof(stored->name) - 1;
+        size_t stored_value_length = v.len < sizeof(stored->value) - 1
+            ? v.len : sizeof(stored->value) - 1;
+        memcpy(stored->name, n.base, stored_name_length);
+        stored->name[stored_name_length] = '\0';
+        memcpy(stored->value, v.base, stored_value_length);
+        stored->value[stored_value_length] = '\0';
+        stream->parsed.header_count++;
     }
     return 0;
 }

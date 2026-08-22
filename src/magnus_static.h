@@ -16,6 +16,7 @@
  * them across a real translation unit boundary rather than inline. */
 
 #include "magnus_policy.h"
+#include "magnus_route.h"
 
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -53,17 +54,32 @@ extern bool magnus_admin_enabled;
  * process. */
 void magnus_build_metrics(char *out, size_t out_capacity);
 
-/* The plain (non-route-table) upstream cluster `--upstream`/`upstream=`
- * configures -- what a literal "/proxy" path prefix dispatches to on
- * every protocol, HTTP/3's new proxy dispatch (roadmap 4d) included.
- * `magnus_upstream_enabled` is `magnus_cluster.count > 0`, kept as its
- * own flag (not recomputed from the count each time) for the same
- * reason every other protocol's own dispatch already reads it that way.
- * Deliberately NOT the `route` table (host/path-prefix/header/cookie/
- * query/source-CIDR matching, each with its own cluster) -- 4d's own
- * scope note in src/magnus_quic.h covers why. */
+/* The plain upstream cluster `--upstream`/`upstream=` configures --
+ * what a literal "/proxy" path prefix dispatches to on every protocol,
+ * HTTP/3's own proxy dispatch (roadmap 4d) included, and also what a
+ * matched `route` table entry's own action=proxy dispatches to (roadmap
+ * 4f) -- there is only ever this one cluster; a route match decides
+ * *whether* and *what path* to forward, never a different upstream of
+ * its own (matching magnus_proxy_pick_and_start()'s identical h1/h2
+ * behavior). `magnus_upstream_enabled` is `magnus_cluster.count > 0`,
+ * kept as its own flag (not recomputed from the count each time) for
+ * the same reason every other protocol's own dispatch already reads it
+ * that way. */
 extern magnus_cluster_t magnus_cluster;
 extern bool magnus_upstream_enabled;
+
+/* The `route` table (roadmap 4f for HTTP/3; host/path-prefix/method/
+ * header/header_prefix/cookie/query/source-CIDR matching -- see
+ * src/magnus_route.h) every protocol evaluates in file order, first
+ * match wins, ahead of falling through to the literal "/proxy" prefix
+ * and static-file dispatch. `magnus_route_count` entries are valid in
+ * `magnus_routes[]`; the array itself is sized (MAGNUS_CONFIG_MAX_ROUTES,
+ * src/magnus_config.h) only where it is actually defined, magnus.c --
+ * declared here as an incomplete array type (valid C, just not
+ * `sizeof`-able from this translation unit, which magnus_quic.c never
+ * needs to do since it only ever indexes up to magnus_route_count). */
+extern magnus_route_t magnus_routes[];
+extern size_t magnus_route_count;
 
 /* Resolves cluster endpoint `index` (`magnus_cluster`'s own indexing)
  * to a connectable IPv4 address, or false if `index` is out of range or

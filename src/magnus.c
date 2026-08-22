@@ -715,9 +715,12 @@ static uint64_t magnus_stream_bytes_u2c_total;
  * healthz/metrics/proxy-prefix/static dispatch -- see
  * magnus_dispatch_request(). Empty (route_count == 0, the default) means
  * every request falls straight through to that built-in dispatch exactly
- * as it did before routes existed. */
-static magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
-static size_t magnus_route_count;
+ * as it did before routes existed. Not `static` -- see
+ * src/magnus_static.h's own comment on why magnus_quic.c's HTTP/3
+ * request dispatch (roadmap 4f) needs this same table across a real
+ * translation unit boundary. */
+magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
+size_t magnus_route_count;
 static magnus_cidr_t magnus_trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
 static size_t magnus_trusted_proxy_count;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];

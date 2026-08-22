@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.30.0
+
+### Added
+
+- **HTTP/3 `route` table dispatch (roadmap Phase 4f): host/path-prefix/
+  method/header/header_prefix/cookie/query/source-CIDR matching, the
+  same `--route`/`route =` DSL and `magnus_route_matches()`
+  (`src/magnus_route.h`) HTTP/1.1 and HTTP/2 already share.** Evaluated
+  in file order, first match wins, ahead of the literal `"/proxy"`
+  prefix (4d) and static-file dispatch -- exactly
+  `magnus_h2_dispatch()`'s own precedence. A matched `action=proxy`
+  route always wins over the literal `"/proxy"` prefix when both apply
+  to the same request, forwarding the *whole*, unstripped target
+  (matching `magnus_proxy_pick_and_start()`'s documented h1/h2
+  precedent); `action=deny` answers 403; `action=grpc` answers an
+  explicit 505 (`gRPC requires HTTP/2 ...`) rather than silently
+  falling through to static/proxy, since this codebase's gRPC dispatch
+  is HTTP/2-native-only and HTTP/3 cannot reach it any more than
+  HTTP/1.1 can; `action=static` needs no branch of its own -- matching
+  and being neither deny/proxy/grpc already falls through to the same
+  static dispatch a request with no matching route at all gets.
+  `magnus_quic_stream_t` gained a full `magnus_http_request_t parsed`
+  field (`src/magnus_http.h`) -- the same shape HTTP/2's own
+  `stream->parsed` already is -- replacing the ad hoc `method`/`path`/
+  `authority` fields (and 4e's own `accept_encoding` field, now just
+  `magnus_http_header_find(&stream->parsed, "accept-encoding")`):
+  `magnus_quic_http_recv_header()` now captures every ordinary header
+  into `parsed.headers[]` up to `MAGNUS_HTTP_MAX_HEADERS`, mirroring
+  `magnus_h2_on_header()`'s own capture exactly, so route matching
+  behaves identically regardless of which protocol a request arrived
+  over. `src/magnus_static.h` gained `magnus_routes[]`/
+  `magnus_route_count` (declared as an incomplete array type -- valid
+  C, magnus_quic.c only ever indexes up to the count, never needs
+  `sizeof`) for this reuse.
+
+Deliberately still not here, matching 4d's own scope note exactly (a
+matched route decides *whether* and *what path* to forward, never a
+different upstream of its own -- there is only ever the one shared
+`magnus_cluster`): retry-on-connect-failure, upstream connection
+pooling, session affinity, and response caching (a route's own
+`cache_enabled` is not consulted yet) for proxy dispatch. Also not
+here: Real-IP-aware `source_cidr` matching -- 4f matches against the
+raw QUIC peer address only, since QUIC has no established
+PROXY-protocol-over-UDP precedent in this codebase to resolve a
+trusted client address from in the first place. See
+`src/magnus_quic.h`'s own top comment.
+
+`tests/test-core.sh`'s Phase 4 block gained a dedicated route-dispatch
+section: a multi-condition (`host` + `path_prefix`) route reaching the
+shared upstream cluster with the correct unstripped path, `action=deny`
+still denying, `action=grpc` still answering its 505, and an
+unmatched path still falling through to ordinary static 404 --
+condition-*kind* coverage itself (header/cookie/query/source_cidr) is
+not re-proven per protocol, already exercised for h1/h2 in this same
+file and unit-tested directly in `tests/test-route.c`; this block
+proves the wiring, not the shared matcher.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 route-matched proxy/deny/grpc-505/404 round trip
+against the running container itself, not just the host binary): image
+size unchanged in kind from 1.29.0 (no new runtime dependency --
+route matching reuses `magnus_route.c`/`magnus_http.c` already linked
+in for HTTP/1.1 and HTTP/2).
+
 ## 1.29.0
 
 ### Added

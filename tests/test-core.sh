@@ -4155,4 +4155,79 @@ curl -k --fail --silent "https://127.0.0.1:$port_quic_proxy/metrics" \
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression ok (Phase 4b/4c/4d/4e, see src/magnus_quic.h)"
+
+# Phase 4f: the `route` table (host/path-prefix/method/header/
+# header_prefix/cookie/query/source-CIDR matching, src/magnus_route.h)
+# over HTTP/3, sharing magnus_route_matches() and magnus_routes[]/
+# magnus_route_count (src/magnus_static.h) with HTTP/1.1 and HTTP/2 --
+# condition-kind coverage itself (header/cookie/query/source_cidr, each
+# already exercised for h1/h2 above and unit-tested directly in
+# tests/test-route.c) is not re-proven per protocol; this block proves
+# the *wiring*: a multi-condition route reaches the shared upstream
+# cluster with the correct (unstripped) forward path, action=deny
+# still denies, and action=grpc still answers its explicit 505 rather
+# than silently falling through to static/proxy.
+port_quic_route_upstream=$((port + 107))
+python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ('route-matched path=' + self.path).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+http.server.HTTPServer(('127.0.0.1', $port_quic_route_upstream), Handler) \
+    .serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_quic_route_upstream/route-target" >/dev/null \
+    && break
+  sleep 1
+done
+port_quic_route=$((port + 108))
+port_quic_route_udp=$((port + 109))
+"$binary" --port "$port_quic_route" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_route_udp" \
+  --upstream "127.0.0.1:$port_quic_route_upstream" \
+  --grpc-upstream "127.0.0.1:$((port_quic_route_upstream + 500))" \
+  --route "host=localhost; path_prefix=/route-target; action=proxy" \
+  --route "path_prefix=/blocked; action=deny" \
+  --route "path_prefix=/grpc-test; action=grpc" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_route/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+# The route-matched request carries no literal "/proxy" prefix at all --
+# only a matched route's own action=proxy gets it there, and with the
+# *whole* target forwarded unstripped (matching
+# magnus_proxy_pick_and_start()'s documented h1/h2 precedent), not a
+# "/route-target"-with-something-stripped path.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
+  /route-target > "$web_root/quic-route-proxy-out"
+grep -qE '^status: 200$' "$web_root/quic-route-proxy-out"
+tail -n +3 "$web_root/quic-route-proxy-out" \
+  | grep -qE '^route-matched path=/route-target$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
+  /blocked | grep -qE '^status: 403$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
+  /grpc-test | grep -qE '^status: 505$'
+# A path matching none of the three routes above still falls through to
+# ordinary static dispatch, exactly as if the route table were empty.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_route_udp" \
+  /quic-route-does-not-exist.txt | grep -qE '^status: 404$'
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch ok (Phase 4b/4c/4d/4e/4f, see src/magnus_quic.h)"
