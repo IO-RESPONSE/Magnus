@@ -4648,4 +4648,48 @@ backend_pid=
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j, see src/magnus_quic.h)"
+
+# Phase 4k: retry-based stateless address validation (RFC 9000 8.1.2)
+# -- every QUIC connection above (4a through 4j) already went through
+# a Retry round-trip transparently on every one of its own requests;
+# this block is the one explicit assertion that a Retry is actually
+# what happened, not merely that the requests still worked despite it.
+# magnus_quic_retry_total (roadmap 4k's own new /metrics counter, see
+# magnus_quic_send_retry() in src/magnus_quic.c) is incremented once
+# per Retry packet actually sent, and read by the exact same
+# magnus_build_metrics() every protocol's own /metrics already shares
+# -- so it must read 0 before any QUIC connection has ever been
+# attempted against this fresh instance, and it must have gone up by
+# the time an HTTP/1.1 request reads it back afterward, proving it is
+# one shared counter, not a QUIC-only one, same "one shared thing, not
+# per-protocol" shape 4j's own pooling block above already proved for
+# the connection pool.
+port_quic_retry=$((port + 124))
+port_quic_retry_udp=$((port + 125))
+"$binary" --port "$port_quic_retry" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_retry_udp" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_retry/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+retry_before=$(curl -k --http1.1 --fail --silent \
+  "https://127.0.0.1:$port_quic_retry/metrics" \
+  | sed -n 's/^magnus_quic_retry_total //p')
+test "$retry_before" = 0
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_retry_udp" \
+  /healthz >/dev/null
+
+retry_after=$(curl -k --http1.1 --fail --silent \
+  "https://127.0.0.1:$port_quic_retry/metrics" \
+  | sed -n 's/^magnus_quic_retry_total //p')
+test "$retry_after" -gt "$retry_before"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k, see src/magnus_quic.h)"

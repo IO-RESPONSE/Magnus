@@ -1,5 +1,81 @@
 # Changelog
 
+## 1.35.0
+
+### Added
+
+- **QUIC retry-based stateless address validation (roadmap Phase 4k,
+  RFC 9000 8.1.2): a client's first `Initial` packet on a fresh
+  connection now must prove it can actually receive traffic at its
+  claimed source address before magnus allocates any real connection
+  state for it.** An `Initial` that arrives with no token gets a
+  `Retry` packet back instead (`magnus_quic_send_retry()`, new): a
+  fresh server-chosen connection ID plus a short-lived, authenticated
+  token binding the client's address and its original destination
+  connection ID (`ngtcp2_crypto_generate_retry_token()`, keyed off the
+  same process-lifetime `magnus_quic_static_secret` roadmap 4a already
+  generates once at startup for stateless-reset tokens -- one secret
+  serving both purposes, matching common reference-implementation
+  practice; a process restart simply invalidates any in-flight retry
+  tokens, forcing an affected client to retry the connection from
+  scratch, an acceptable minor inconvenience, not a correctness bug).
+  Only once the client resends its `Initial` *with* that exact token
+  (`ngtcp2_crypto_verify_retry_token()`, timeout-bounded by the new
+  `MAGNUS_QUIC_RETRY_TOKEN_TIMEOUT_NS`) does `magnus_quic_accept_new()`
+  go on to allocate a connection slot at all -- an off-path attacker
+  spoofing a victim's address can no longer make magnus do a full TLS
+  handshake's worth of work toward that victim, and a flood of junk
+  no-token `Initial`s can no longer exhaust the fixed
+  `MAGNUS_QUIC_MAX_CONNECTIONS` slot table either, since nothing is
+  ever allocated until a verified-token retry arrives. The eventual
+  real connection's own transport parameters carry `retry_scid`/
+  `retry_scid_present` (RFC 9000 18.2) so the client can cryptographically
+  confirm a genuine `Retry` actually happened, not an off-path attacker
+  telling it to skip validation, and `original_dcid` is taken from the
+  *verified token's* own copy rather than the retried `Initial`'s own
+  header, per spec. ngtcp2's base (non-`_token2`) retry-token API was
+  used deliberately, for the same Docker-pinned-ngtcp2-v1.19.0
+  compatibility reason roadmap 4b's own dependency evaluation already
+  established -- confirmed to exist there by this release's own image
+  rebuild, not merely assumed.
+
+  A new lifetime counter, `magnus_quic_retry_total` (`/metrics`,
+  every protocol's own shared `magnus_build_metrics()`), is
+  incremented once per `Retry` packet actually sent -- the only
+  externally observable proof that address validation is happening at
+  all, since a `Retry` produces no connection state of its own to
+  otherwise point to. `tests/test-core.sh` gained a dedicated Phase 4k
+  block: the counter reads `0` against a fresh instance that has never
+  seen a QUIC connection, and strictly increases once
+  `quic-handshake-check` completes a single HTTP/3 request against it
+  -- read back over an ordinary HTTP/1.1 request, proving it is one
+  shared counter, not a QUIC-only one, the same "one shared thing, not
+  per-protocol" shape roadmap 4j's own pooling block already
+  established for the connection pool. Every pre-existing QUIC test
+  block (4a through 4j) now transparently exercises the full two-round-
+  trip `Retry` exchange on every one of its own connections too, and
+  all still pass unmodified.
+
+  With this, `src/magnus_quic.h`'s own "deliberately still not here"
+  list loses its oldest entry: connection migration / path validation
+  remains a distinct, still-deferred RFC 9000 mechanism (revalidating
+  an address that *changes* mid-connection), not what 4k's own
+  narrower scope (confirming a client owns its address once, at the
+  very start of a connection) ever claimed to cover.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; manual protocol-level verification (temporary trace
+  instrumentation, since removed) against both the host binary and a
+  live Docker container confirmed the exact expected sequence -- a
+  no-token `Initial`, a `Retry` sent, the client's own harmless
+  pre-`Retry` retransmit triggering a second `Retry`, then the
+  client's retried `Initial` carrying a valid token, verified, the
+  handshake completing, and the HTTP/3 request succeeding -- not
+  merely "it still works." Image rebuilt against the pinned ngtcp2
+  v1.19.0 and smoke-tested; size unchanged in kind from 1.34.0 (no new
+  runtime dependency -- the retry-token helpers are already part of
+  `libngtcp2_crypto_ossl`, already linked in since roadmap 4a).
+
 ## 1.34.0
 
 ### Added

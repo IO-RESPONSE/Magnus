@@ -54,6 +54,15 @@
  * (a bug, not a normal path) camping on a table slot forever. */
 #define MAGNUS_QUIC_STALE_SECONDS 120
 #define MAGNUS_QUIC_MAX_IDLE_TIMEOUT_NS (30ULL * NGTCP2_SECONDS)
+/* Retry-based stateless address validation (roadmap 4k, RFC 9000
+ * 8.1.2) -- how long a Retry token stays valid between the server
+ * issuing it and the client's own retried Initial arriving with it,
+ * on ngtcp2_crypto_verify_retry_token()'s own `timeout` clock. Long
+ * enough for one real network round trip plus the client's own
+ * processing, short enough that a captured token cannot usefully be
+ * replayed later; 10 seconds matches this exact tradeoff other real
+ * QUIC server implementations commonly use for the same parameter. */
+#define MAGNUS_QUIC_RETRY_TOKEN_TIMEOUT_NS (10ULL * NGTCP2_SECONDS)
 /* Concurrent client-initiated bidirectional (HTTP/3 request) streams
  * per QUIC connection -- advertised to the peer via
  * initial_max_streams_bidi (magnus_quic_accept_new()) and, separately,
@@ -333,6 +342,16 @@ static magnus_quic_connection_t *magnus_quic_upstream_connection[MAGNUS_QUIC_MAX
 /* See magnus_quic_create_listener()'s own comment on why this is
  * cached rather than threaded through as a parameter everywhere. */
 static int magnus_quic_listener_fd = -1;
+/* Roadmap 4k: incremented once per Retry packet actually sent (see
+ * magnus_quic_send_retry()) -- the only externally-observable proof
+ * that address validation is happening at all, since a Retry produces
+ * no connection state of its own to otherwise point to. Exposed to
+ * magnus_build_metrics() (magnus.c) via magnus_quic_retry_total()
+ * below, the same "static counter + one-line getter" shape
+ * magnus_quic_handle_upstream_event()'s own cross-TU boundary already
+ * uses. Not reset by magnus_quic_shutdown() -- a lifetime total,
+ * matching every other *_total counter magnus_build_metrics() reports. */
+static unsigned long long magnus_quic_retry_total_count;
 
 /* --- small helpers ------------------------------------------------- */
 
@@ -2749,6 +2768,69 @@ magnus_quic_flush(int listener_fd, int slot)
     }
 }
 
+/* Retry-based stateless address validation (roadmap 4k, RFC 9000
+ * 8.1.2): sends a Retry packet in reply to an Initial that arrived
+ * with no token, carrying a fresh, server-chosen CID and a token that
+ * encodes the client's own address plus the original DCID it used --
+ * magnus_quic_accept_new() below only ever creates real connection
+ * state (allocates a slot, runs the TLS handshake) once a client comes
+ * back with that exact token, proving it can actually receive traffic
+ * at the address it claims (an off-path attacker spoofing a victim's
+ * source address never sees the Retry at all, so never has a token to
+ * retry with). Anti-amplification: without this, an attacker could
+ * spend one small spoofed UDP datagram to make the server do a full
+ * TLS handshake's worth of (much larger) work toward an arbitrary
+ * victim address. No connection state exists yet at this point --
+ * this is a raw, one-off `sendto()` on the listener fd itself, not
+ * anything routed through an `ngtcp2_conn`. A failure at any step here
+ * (RAND_bytes, token generation, packet encoding, the send itself) is
+ * silently dropped -- the client's own PTO simply retransmits the
+ * original Initial, and this function runs again from scratch, no
+ * different from any other lost-packet recovery already built into
+ * QUIC itself. */
+static void
+magnus_quic_send_retry(int listener_fd, const struct sockaddr *remote_addr,
+                       socklen_t remote_addrlen, const ngtcp2_pkt_hd *header)
+{
+    ngtcp2_cid scid;
+    uint8_t token[NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN];
+    ngtcp2_ssize tokenlen;
+    uint8_t buffer[MAGNUS_QUIC_SEND_BUFFER];
+    ngtcp2_ssize written;
+
+    if (RAND_bytes(scid.data, NGTCP2_MAX_CIDLEN) != 1) return;
+    scid.datalen = NGTCP2_MAX_CIDLEN;
+
+    tokenlen = ngtcp2_crypto_generate_retry_token(token,
+        magnus_quic_static_secret, sizeof(magnus_quic_static_secret),
+        header->version, (const ngtcp2_sockaddr *) remote_addr,
+        (ngtcp2_socklen) remote_addrlen, &scid, &header->dcid,
+        magnus_quic_timestamp());
+    if (tokenlen < 0) return;
+
+    written = ngtcp2_crypto_write_retry(buffer, sizeof(buffer),
+        header->version, &header->scid, &scid, &header->dcid, token,
+        (size_t) tokenlen);
+    if (written < 0) return;
+
+    if (sendto(listener_fd, buffer, (size_t) written, 0, remote_addr,
+              remote_addrlen) < 0) {
+        perror("magnus: quic retry sendto");
+        return;
+    }
+    magnus_quic_retry_total_count++;
+}
+
+/* Roadmap 4k: magnus_build_metrics() (magnus.c) reads this to publish
+ * magnus_quic_retry_total -- see magnus_quic_retry_total_count's own
+ * comment above for why a getter, not the counter itself, crosses the
+ * translation-unit boundary. */
+unsigned long long
+magnus_quic_retry_total(void)
+{
+    return magnus_quic_retry_total_count;
+}
+
 static int
 magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
                        socklen_t local_addrlen,
@@ -2758,6 +2840,8 @@ magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
 {
     ngtcp2_pkt_hd header;
     ngtcp2_cid scid;
+    ngtcp2_cid odcid;
+    bool retried = false;
     ngtcp2_path path;
     ngtcp2_callbacks callbacks;
     ngtcp2_settings settings;
@@ -2774,6 +2858,33 @@ magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
          * yet, same "narrow the first increment" call Phase 3's own
          * PROXY-protocol-emission entry made about UDP's v2 variant. */
         return 0;
+    }
+
+    /* Roadmap 4k: every new connection must prove address ownership
+     * via Retry before this function ever allocates real state for
+     * it -- see magnus_quic_send_retry()'s own comment for why. An
+     * Initial with no token at all has not been through this exchange
+     * yet; one whose token fails to verify (expired past
+     * MAGNUS_QUIC_RETRY_TOKEN_TIMEOUT_NS, or simply forged) is treated
+     * identically to one with no token, not distinguished for the
+     * client's benefit -- nothing about *why* validation failed is
+     * ever worth revealing to an unauthenticated sender. */
+    if (header.type == NGTCP2_PKT_INITIAL) {
+        if (header.tokenlen == 0) {
+            magnus_quic_send_retry(listener_fd, remote_addr, remote_addrlen,
+                                   &header);
+            return 0;
+        }
+        if (ngtcp2_crypto_verify_retry_token(&odcid, header.token,
+                header.tokenlen, magnus_quic_static_secret,
+                sizeof(magnus_quic_static_secret), header.version,
+                (const ngtcp2_sockaddr *) remote_addr,
+                (ngtcp2_socklen) remote_addrlen, &header.dcid,
+                MAGNUS_QUIC_RETRY_TOKEN_TIMEOUT_NS,
+                magnus_quic_timestamp()) != 0) {
+            return 0;
+        }
+        retried = true;
     }
 
     slot = magnus_quic_slot_alloc();
@@ -2843,9 +2954,24 @@ magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
      * running magnus crashed the whole process on this exact assert,
      * not a review-time catch), since it lets the client detect a
      * spoofed/off-path server response by confirming the server saw
-     * the same DCID the client originally sent. */
-    params.original_dcid = header.dcid;
-    params.original_dcid_present = 1;
+     * the same DCID the client originally sent. After a Retry
+     * (roadmap 4k), this must be the *original* DCID from the
+     * client's first, pre-Retry Initial (extracted from the verified
+     * token as `odcid`, RFC 9000 17.2.5.2) -- not `header.dcid`, which
+     * at this point is the fresh CID magnus_quic_send_retry() itself
+     * chose and sent back; `retry_scid`/`retry_scid_present` carries
+     * that fresh CID separately, so the client can verify a genuine
+     * Retry actually happened rather than being told to skip
+     * validation by an off-path attacker. */
+    if (retried) {
+        params.original_dcid = odcid;
+        params.original_dcid_present = 1;
+        params.retry_scid = header.dcid;
+        params.retry_scid_present = 1;
+    } else {
+        params.original_dcid = header.dcid;
+        params.original_dcid_present = 1;
+    }
 
     path.local.addr = (ngtcp2_sockaddr *) local_addr;
     path.local.addrlen = local_addrlen;

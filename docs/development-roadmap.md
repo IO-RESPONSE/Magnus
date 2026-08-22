@@ -939,16 +939,23 @@ connection-pool and common-request-model decisions).
   HTTP/2, not one per protocol) in 1.33.0, 4j (HTTP/3 upstream
   connection pooling for proxy dispatch, one shared endpoint-keyed idle
   pool with HTTP/1.1 and HTTP/2 -- closes out HTTP/3 proxy dispatch's
-  parity with theirs) in 1.34.0** — see `CHANGELOG.md`
-  1.25.0/1.26.0/1.27.0/1.28.0/1.29.0/1.30.0/1.31.0/1.32.0/1.33.0/1.34.0
+  parity with theirs) in 1.34.0, 4k (QUIC retry-based stateless address
+  validation, RFC 9000 8.1.2 -- a fresh connection's first `Initial`
+  must prove its claimed source address is real, via a server `Retry`
+  carrying an authenticated token, before any connection state is
+  allocated for it, closing off both off-path amplification and
+  connection-slot exhaustion by junk `Initial` floods; a new
+  `magnus_quic_retry_total` `/metrics` counter makes the exchange
+  externally observable) in 1.35.0** — see `CHANGELOG.md`
+  1.25.0/1.26.0/1.27.0/1.28.0/1.29.0/1.30.0/1.31.0/1.32.0/1.33.0/1.34.0/1.35.0
   and `src/magnus_quic.h` for the exact scope and what's deliberately
   still missing (proxied-response compression, Brotli/zstd, and
   streaming compression above 2a's own 8 MiB bound, on every protocol,
   not a QUIC-specific gap; Real-IP-aware `source_cidr` route matching
   and client-IP-based cluster selection, since QUIC has no established
-  PROXY-protocol-over-UDP precedent in this codebase yet; no
-  retry-based address validation, no migration, no 0-RTT at the
-  transport level).
+  PROXY-protocol-over-UDP precedent in this codebase yet; no connection
+  migration/path validation beyond a single non-migrating handshake, no
+  0-RTT, at the transport level).
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and

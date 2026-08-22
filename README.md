@@ -278,7 +278,16 @@ independently by IORESPONSE.
   HTTP/3 proxy dispatch and HTTP/1.1's/HTTP/2's own; see
   `src/magnus_quic.h` for the handful of genuinely QUIC-specific or
   cross-cutting items that remain
-- Container image: 10,353,767 bytes (~9.87 MiB), non-root, read-only rootfs
+- QUIC retry-based stateless address validation (roadmap Phase 4k, RFC
+  9000 8.1.2): a fresh connection's first `Initial` packet must prove
+  its claimed source address is real -- via a server `Retry` packet
+  carrying an authenticated, short-lived token -- before magnus
+  allocates any connection state for it, closing off both off-path
+  amplification attacks and connection-slot-table exhaustion by junk
+  no-token `Initial` floods. A new `magnus_quic_retry_total` counter on
+  `/metrics` (the same shared `magnus_build_metrics()` every protocol
+  already reports through) makes the exchange externally observable
+- Container image: 10,354,335 bytes (~9.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`
