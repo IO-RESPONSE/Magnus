@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.31.0
+
+### Added
+
+- **HTTP/3 proxy dispatch retry-on-connect-failure (roadmap Phase 4g):
+  a failed connect attempt (either the literal `"/proxy"` prefix,
+  roadmap 4d, or a route-matched `action=proxy`, roadmap 4f) now
+  transparently retries against a freshly-selected cluster endpoint
+  instead of surfacing 502/504 on the very first failure -- bounded by
+  a new `MAGNUS_QUIC_PROXY_MAX_ATTEMPTS` (2, mirroring `magnus.c`'s own
+  `MAGNUS_PROXY_MAX_ATTEMPTS`), the exact same total-attempts budget
+  `magnus_proxy_connect_failed()`/`magnus_h2_proxy_connect_failed()`
+  already give HTTP/1.1 and HTTP/2.** Split across the same two call
+  sites those functions cover: `magnus_quic_proxy_start()`'s own
+  `for (;;)` loop retries a *synchronous* connect failure (rare --
+  `connect()` on a genuinely closed local port almost always returns
+  `EINPROGRESS`, not an immediate error); `magnus_quic_proxy_fail()`
+  (already the one place every pre-header proxy failure funnels
+  through, since 4d's own "killed upstream never degraded
+  `magnus_upstream_healthy`" fix) retries the far more common
+  *asynchronous* failure, detected later via `SO_ERROR` -- and, per
+  that function's own existing contract, every other pre-header
+  failure too (a mid-request `send()` error, a malformed/oversized
+  upstream response, a read timeout), exactly matching
+  `magnus_h2_proxy_connect_failed()`'s identical scope (any failure
+  while `response_headers_submitted` is still false, not just a
+  connect-stage one). `magnus_quic_stream_t` gained an `attempt` field,
+  the h3 analogue of `struct magnus_h2_stream`'s own. Session affinity
+  is deliberately not part of this retry (still deferred, see
+  `src/magnus_quic.h`'s own scope note) -- a retried request has no
+  cookie to issue or honor either way. A new `magnus_quic_client_ip()`
+  helper (`connection->remote_addr`'s own IPv4 address, the one place
+  this cast now lives) replaces three separate copies of the same
+  inline cast this and the 4f route-matching code each had.
+
+`tests/test-core.sh` gained a dedicated retry test mirroring M3's own
+identical h1/h2 retry-budget test exactly: the first configured
+endpoint refuses every connection, so a request must still complete
+successfully against the second (live) one instead of surfacing 502.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 proxy request against a cluster whose first
+endpoint is unreachable, completing successfully via the second,
+against the running container itself, not just the host binary): image
+size unchanged in kind from 1.30.0 (no new runtime dependency -- the
+retry reuses `magnus_cluster_select()`/`magnus_cluster_result()`
+already linked in).
+
 ## 1.30.0
 
 ### Added

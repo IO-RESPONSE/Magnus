@@ -253,11 +253,15 @@ independently by IORESPONSE.
   same DSL and matcher (`src/magnus_route.h`) HTTP/1.1 and HTTP/2
   already share -- `action=proxy`/`deny`/`static`/`grpc` (the last
   answered with an explicit 505, since this codebase's gRPC dispatch
-  is HTTP/2-native-only). Retry-on-connect-failure, upstream
-  connection pooling, session affinity, response caching, and
-  Real-IP-aware `source_cidr` matching remain later increments -- see
-  `src/magnus_quic.h`
-- Container image: 10,351,405 bytes (~9.87 MiB), non-root, read-only rootfs
+  is HTTP/2-native-only). Real-IP-aware `source_cidr` matching remains
+  a later increment -- see `src/magnus_quic.h`
+- HTTP/3 proxy dispatch retry-on-connect-failure (roadmap Phase 4g): a
+  failed connect attempt (literal `"/proxy"` or a route-matched
+  `action=proxy`) transparently retries against a freshly-selected
+  endpoint, the same total-attempts budget HTTP/1.1 and HTTP/2 already
+  give proxy dispatch. Upstream connection pooling, session affinity,
+  and response caching remain later increments
+- Container image: 10,351,604 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

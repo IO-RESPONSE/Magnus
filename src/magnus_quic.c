@@ -76,6 +76,16 @@
 #define MAGNUS_QUIC_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_QUIC_PROXY_CONNECT_TIMEOUT_SECONDS 5
 #define MAGNUS_QUIC_PROXY_READ_TIMEOUT_SECONDS 10
+/* Same value as magnus.c's own (`#define`-local, not shared) MAGNUS_
+ * PROXY_MAX_ATTEMPTS -- roadmap 4g's own retry-on-connect-failure,
+ * mirroring magnus_h2_proxy_connect_failed()'s identical semantics: at
+ * most this many total connect attempts (the original plus retries
+ * against a freshly-selected endpoint) before giving up with a clean
+ * status-coded error, exactly the same "just don't share the literal
+ * define, keep the value in sync by convention" reasoning
+ * magnus_now_ms_local()'s own comment gives for not threading every
+ * such small constant across src/magnus_static.h. */
+#define MAGNUS_QUIC_PROXY_MAX_ATTEMPTS 2
 /* Bounded, linear-scan table (see this file's own top comment on why
  * that style, same as everywhere else here) mapping an upstream
  * connection's own fd to the magnus_quic_stream_t that owns it --
@@ -161,16 +171,20 @@ typedef struct {
      * magnus_quic_http_stream_free() checks to call free() instead of
      * munmap() on cleanup. */
     bool body_is_malloc;
-    /* Proxy dispatch (roadmap 4d) -- see magnus_quic.h's own scope note
-     * for what is deliberately not here yet: retry on connect failure,
-     * upstream connection pooling/reuse, session affinity, response
-     * caching. A single attempt against one selected endpoint, a fresh
-     * connection every time. */
+    /* Proxy dispatch (roadmap 4d, retry-on-connect-failure added 4g) --
+     * see magnus_quic.h's own scope note for what is deliberately still
+     * not here: upstream connection pooling/reuse, session affinity,
+     * response caching. */
     bool is_proxy;
     int upstream_fd;
     bool upstream_connected;
     size_t endpoint_index;
     bool cluster_endpoint_counted;
+    /* How many total connect attempts this stream has made so far
+     * (the original plus any retries) -- roadmap 4g, the h3 analogue of
+     * magnus_h2_stream's own `attempt` field, bounded by
+     * MAGNUS_QUIC_PROXY_MAX_ATTEMPTS the same way. */
+    int attempt;
     time_t connect_started;
     time_t last_activity;
     char *proxy_request;
@@ -296,6 +310,23 @@ magnus_now_ms_local(void)
     return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
 }
 
+/* `connection->remote_addr`'s own IPv4 address, or 0.0.0.0 for anything
+ * else (this codebase's QUIC listener only ever binds IPv4 -- see
+ * magnus_quic_create_listener() -- so the else branch is defensive, not
+ * an expected-to-bite case) -- fed to magnus_cluster_select() (endpoint
+ * selection) and MAGNUS_ROUTE_MATCH_SOURCE_CIDR route conditions
+ * (roadmap 4f) alike, the one place this cast lives rather than
+ * repeated at each of its own several call sites. */
+static struct in_addr
+magnus_quic_client_ip(const magnus_quic_connection_t *connection)
+{
+    struct in_addr client_ip;
+    if (connection->remote_addr.ss_family == AF_INET)
+        return ((const struct sockaddr_in *) &connection->remote_addr)->sin_addr;
+    client_ip.s_addr = 0;
+    return client_ip;
+}
+
 static int
 magnus_quic_cid_find(const uint8_t *data, size_t datalen)
 {
@@ -359,13 +390,17 @@ magnus_quic_slot_alloc(void)
     return -1;
 }
 
-/* Forward declarations -- both defined with the rest of proxy dispatch
- * (roadmap 4d) further down; magnus_quic_http_stream_free() and
- * magnus_quic_tick() below both need one ahead of that point in file
- * order. */
+/* Forward declarations -- all defined with the rest of proxy dispatch
+ * (roadmap 4d) further down; magnus_quic_http_stream_free(),
+ * magnus_quic_tick(), and magnus_quic_proxy_fail() (roadmap 4g's own
+ * retry-on-connect-failure) below all need one ahead of that point in
+ * file order. */
 static void magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream);
 static void magnus_quic_proxy_tick(time_t now);
 static void magnus_quic_flush(int listener_fd, int slot);
+static int magnus_quic_proxy_connect_endpoint(
+    magnus_quic_connection_t *connection, magnus_quic_stream_t *stream,
+    size_t endpoint_index);
 
 /* Unmaps whatever magnus_quic_http_dispatch_static() mapped (if
  * anything -- a HEAD request or a zero-length file never map one) and
@@ -790,18 +825,32 @@ magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream)
  * malformed/oversized/unparseable upstream response, an upstream read
  * timeout) -- exactly the class magnus_proxy_connect_failed()'s own
  * centralized magnus_cluster_result(false) call covers for h1, and
- * magnus_h2_proxy_fail() covers for h2. Recording it here, once, keeps
- * every one of this function's callers from having to remember to do it
- * themselves -- the gap this comment replaces (found live: a killed
- * upstream correctly produced its 502 but never actually degraded
- * /metrics' own magnus_upstream_healthy, since only the *synchronous*
- * connect()-failed branch in magnus_quic_proxy_start() recorded a
- * failure -- the far more common asynchronous EINPROGRESS-then-EPOLLOUT
- * failure path here never did). A stream that already reached
+ * magnus_h2_proxy_fail()/magnus_h2_proxy_connect_failed() covers for
+ * h2. Recording the failure here, once, keeps every one of this
+ * function's callers from having to remember to do it themselves --
+ * the gap this comment used to describe before roadmap 4g (found live:
+ * a killed upstream correctly produced its 502 but never actually
+ * degraded /metrics' own magnus_upstream_healthy, since only the
+ * *synchronous* connect()-failed branch recorded a failure -- the far
+ * more common asynchronous EINPROGRESS-then-EPOLLOUT failure path here
+ * never did). A stream that already reached
  * magnus_quic_proxy_receive_headers() successfully has already recorded
  * its own success (see that function's own magnus_cluster_result(true)
  * call) before any of *this* function's callers can run, so there is no
- * double-counting risk from always recording a failure here. */
+ * double-counting risk from always recording a failure here.
+ *
+ * Roadmap 4g: also retries against a freshly-selected endpoint, bounded
+ * by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total attempts, exactly the same
+ * shape magnus_h2_proxy_connect_failed()'s own retry has -- this is the
+ * *asynchronous*-failure counterpart to magnus_quic_proxy_start()'s own
+ * synchronous-failure retry loop, so between the two, every pre-header
+ * failure this stream can hit gets the same retry budget regardless of
+ * which stage detected it. Every accumulated per-attempt field
+ * (header_accum/headers_received/proxy_request_sent/
+ * upstream_headers_sent) is reset before the retry connect -- stale
+ * from the failed attempt, and magnus_quic_proxy_teardown_upstream()
+ * itself does not touch them (it only ever closes the fd and stops
+ * counting this stream against the endpoint's own active_requests). */
 static void
 magnus_quic_proxy_fail(magnus_quic_connection_t *connection,
                        magnus_quic_stream_t *stream, const char *status)
@@ -809,6 +858,23 @@ magnus_quic_proxy_fail(magnus_quic_connection_t *connection,
     magnus_cluster_result(&magnus_cluster, stream->endpoint_index, false,
                           magnus_now_ms_local());
     magnus_quic_proxy_teardown_upstream(stream);
+    if (stream->attempt < MAGNUS_QUIC_PROXY_MAX_ATTEMPTS) {
+        int endpoint = magnus_cluster_select(&magnus_cluster,
+                                             magnus_now_ms_local(), NULL,
+                                             magnus_quic_client_ip(connection));
+        if (endpoint >= 0) {
+            stream->attempt++;
+            stream->header_accum = 0;
+            stream->headers_received = false;
+            stream->proxy_request_sent = 0;
+            stream->upstream_headers_sent = false;
+            if (magnus_quic_proxy_connect_endpoint(connection, stream,
+                                                   (size_t) endpoint) == 0)
+                return;
+            magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                                  magnus_now_ms_local());
+        }
+    }
     magnus_quic_http_submit_status(connection, stream, status);
 }
 
@@ -1285,22 +1351,28 @@ magnus_quic_handle_upstream_event(int fd, uint32_t flags)
  * outbound HTTP/1.1 proxy request (an h3 analogue of
  * magnus_proxy_pick_and_start()'s own request-building, GET/HEAD only
  * -- see this section's own top comment for why no body), then selects
- * a healthy cluster endpoint and connects. `Connection: close` to the
- * upstream unconditionally -- this increment never pools a connection
- * for reuse (see this section's own top comment), so there is nothing
- * to keep it open for, and it lets EOF unambiguously frame a response
- * with no Content-Length the same way HTTP/1.1 itself would.
- * `forward_path` is the caller's to decide (roadmap 4d's own literal
- * "/proxy"-prefix-stripped path, or roadmap 4f's own route-matched
- * unstripped stream->parsed.target -- see magnus_quic_http_dispatch()'s
- * own comment on why a route match always wins when both apply,
- * matching magnus_proxy_pick_and_start()'s identical h1/h2 precedent). */
+ * a healthy cluster endpoint and connects -- retrying against a freshly
+ * selected endpoint on a *synchronous* connect failure (roadmap 4g;
+ * the far more common asynchronous failure, detected later via epoll,
+ * is magnus_quic_proxy_fail()'s own retry to handle, not this
+ * function's), bounded by MAGNUS_QUIC_PROXY_MAX_ATTEMPTS total attempts
+ * -- the same shape magnus_h2_proxy_start()'s own `for (;;)` connect
+ * loop already has, session affinity aside (roadmap 4d/4f/4g all still
+ * defer it, see this section's own top comment). `Connection: close` to
+ * the upstream unconditionally -- this increment never pools a
+ * connection for reuse, so there is nothing to keep it open for, and it
+ * lets EOF unambiguously frame a response with no Content-Length the
+ * same way HTTP/1.1 itself would. `forward_path` is the caller's to
+ * decide (roadmap 4d's own literal "/proxy"-prefix-stripped path, or
+ * roadmap 4f's own route-matched unstripped stream->parsed.target --
+ * see magnus_quic_http_dispatch()'s own comment on why a route match
+ * always wins when both apply, matching magnus_proxy_pick_and_start()'s
+ * identical h1/h2 precedent). */
 static void
 magnus_quic_proxy_start(magnus_quic_connection_t *connection,
                         magnus_quic_stream_t *stream,
                         const char *forward_path)
 {
-    int endpoint;
     struct in_addr client_ip;
     int written;
 
@@ -1326,21 +1398,26 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     }
     stream->proxy_request_length = (size_t) written;
 
-    if (connection->remote_addr.ss_family == AF_INET)
-        client_ip = ((struct sockaddr_in *) &connection->remote_addr)->sin_addr;
-    else
-        client_ip.s_addr = 0;
-    endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms_local(),
-                                     NULL, client_ip);
-    if (endpoint < 0) {
-        magnus_quic_http_submit_status(connection, stream, "502");
-        return;
-    }
-    if (magnus_quic_proxy_connect_endpoint(connection, stream,
-                                           (size_t) endpoint) != 0) {
+    client_ip = magnus_quic_client_ip(connection);
+    stream->attempt = 0;
+    for (;;) {
+        int endpoint = magnus_cluster_select(&magnus_cluster,
+                                             magnus_now_ms_local(), NULL,
+                                             client_ip);
+        if (endpoint < 0) {
+            magnus_quic_http_submit_status(connection, stream, "502");
+            return;
+        }
+        stream->attempt++;
+        if (magnus_quic_proxy_connect_endpoint(connection, stream,
+                                               (size_t) endpoint) == 0)
+            return;
         magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
                               magnus_now_ms_local());
-        magnus_quic_http_submit_status(connection, stream, "502");
+        if (stream->attempt >= MAGNUS_QUIC_PROXY_MAX_ATTEMPTS) {
+            magnus_quic_http_submit_status(connection, stream, "502");
+            return;
+        }
     }
 }
 
@@ -1562,10 +1639,7 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
                                         : stream->parsed.target;
     if (forward_path[0] == '\0') forward_path = "/";
 
-    if (connection->remote_addr.ss_family == AF_INET)
-        client_ip = ((struct sockaddr_in *) &connection->remote_addr)->sin_addr;
-    else
-        client_ip.s_addr = 0;
+    client_ip = magnus_quic_client_ip(connection);
 
     /* Roadmap 4f: host/path-prefix/method/header/header_prefix/cookie/
      * query/source-CIDR route matching, reusing magnus_route_matches()

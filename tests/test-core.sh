@@ -4230,4 +4230,61 @@ backend_pid=
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch ok (Phase 4b/4c/4d/4e/4f, see src/magnus_quic.h)"
+
+# Phase 4g: retry-on-connect-failure -- the first endpoint refuses
+# every connection, so a request must transparently retry against the
+# second (live) endpoint and still complete successfully instead of
+# surfacing 502, mirroring M3's own identical h1/h2 retry budget
+# (magnus_proxy_connect_failed()/magnus_h2_proxy_connect_failed(), same
+# MAGNUS_PROXY_MAX_ATTEMPTS=2 -- see magnus_quic_proxy_start()'s and
+# magnus_quic_proxy_fail()'s own comments for the synchronous/
+# asynchronous split this mirrors).
+port_quic_retry_upstream=$((port + 110))
+port_quic_retry_dead=$((port + 111))
+python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'good backend'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+http.server.HTTPServer(('127.0.0.1', $port_quic_retry_upstream), Handler) \
+    .serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_quic_retry_upstream/" \
+    >/dev/null && break
+  sleep 1
+done
+port_quic_retry=$((port + 112))
+port_quic_retry_udp=$((port + 113))
+"$binary" --port "$port_quic_retry" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_retry_udp" \
+  --upstream "127.0.0.1:$port_quic_retry_dead" \
+  --upstream "127.0.0.1:$port_quic_retry_upstream" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_retry/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+retried_ok=0
+for attempt in 1 2 3 4; do
+  "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_retry_udp" \
+    /proxy/anything | grep -qE '^status: 200$' && retried_ok=$((retried_ok + 1))
+done
+test "$retried_ok" -ge 1
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry ok (Phase 4b/4c/4d/4e/4f/4g, see src/magnus_quic.h)"
