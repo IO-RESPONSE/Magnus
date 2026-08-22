@@ -50,6 +50,14 @@ typedef struct {
     char etag[128];
     char last_modified[64];
     char vary[128];
+    /* Proxy dispatch response compression (roadmap 2a-2) -- captured the
+     * same "already walking every header anyway" way as the fields just
+     * above. `content_type` feeds magnus_content_type_compressible()'s
+     * own eligibility check; `has_content_encoding` excludes a response
+     * the upstream *already* encoded (gzip or otherwise) from being
+     * compressed a second time. */
+    char content_type[128];
+    bool has_content_encoding;
 } magnus_proxy_response_info_t;
 
 /* Parses a raw upstream HTTP response header block (a status line followed
@@ -82,6 +90,22 @@ typedef struct {
  * not safe to hand to every other client a shared cache entry serves).
  * magnus_cache_store()'s own `headers_block` is exactly `out[0..*out_cacheable_prefix_length)`.
  *
+ * `compressed_content_length` (roadmap 2a-2) is `(size_t) -1` for every
+ * caller that just wants the upstream's own response relayed as-is (the
+ * only mode that existed before this parameter) -- any other value asks
+ * this call to instead emit `Content-Length: <that value>\r\nContent-
+ * Encoding: gzip\r\nVary: Accept-Encoding\r\n` in place of the upstream's
+ * own (verbatim, unmodified) Content-Length line, for a caller that has
+ * already compressed the body itself and knows its real length. Intended
+ * for exactly one calling pattern: sanitize once, normally, to learn the
+ * *uncompressed* length/content-type/etc. and decide whether to even
+ * attempt compression; buffer and compress the body separately; then
+ * call this function a *second* time, on a fresh copy of the same raw
+ * header block, with the compressed length now known. Never valid to
+ * pass together with a non-NULL `out_cacheable_prefix_length` -- a
+ * compressed response is never stored in the cache this way (see
+ * CHANGELOG.md's own 2a-2 entry for why); callers doing so pass NULL.
+ *
  * Returns the number of bytes written to `out` (excluding the NUL
  * terminator) on success, or -1 if the status line is malformed, a
  * Content-Length was malformed or duplicated, or `out` is too small to
@@ -90,6 +114,7 @@ int magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                            char *out, size_t out_capacity,
                                            const char *affinity_cookie_value,
                                            bool client_wants_close,
+                                           size_t compressed_content_length,
                                            magnus_proxy_response_info_t *info,
                                            size_t *out_cacheable_prefix_length);
 

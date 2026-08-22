@@ -1,5 +1,91 @@
 # Changelog
 
+## 1.37.0
+
+### Added
+
+- **Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2): a
+  `"/proxy"` (or route-matched `action=proxy`) response now negotiates
+  gzip the same way static-file serving already has since 2a --
+  `Accept-Encoding: gzip`, a compressible `Content-Type`, and a body
+  within the same 256-byte..8-MiB window `magnus_compress_static()`
+  already uses -- except the body has to be fetched from a live
+  upstream first, not read from an mmap'd file.** Unlike every earlier
+  Phase 2/4 proxy-dispatch feature this session shipped (pooling,
+  caching, affinity, retry), this one genuinely changes the relay's own
+  timing, not just its side bookkeeping: the *entire* upstream body must
+  be captured and compressed before anything about the response reaches
+  the client, so a new `proxy_compress_pending` flag gates
+  `magnus_handle_upstream()`'s recv loop and `magnus_proxy_flush()`'s
+  own write loops directly rather than running alongside them the way
+  `cache_capture`'s pure side-observation does.
+
+  `magnus_proxy_sanitize_response_headers()` (the shared, cross-protocol
+  header rewriter h1/h2/h3 proxy dispatch all already use) gained a
+  `compressed_content_length` parameter: `(size_t) -1` for every
+  existing caller (h1's own two other call sites, h2, h3 -- unaffected,
+  still just relaying whatever the upstream declared, as before), any
+  other value to drop the upstream's own verbatim `Content-Length` line
+  and instead emit the real compressed length plus `Content-Encoding:
+  gzip` and a `Vary: Accept-Encoding` line. The calling shape is:
+  sanitize once, normally, to learn the *uncompressed* framing/content-
+  type and decide whether to even attempt compression; buffer the body
+  separately (`magnus_proxy_compress_capture()`, the same growable-
+  doubling shape `magnus_proxy_cache_capture()` already has); then
+  sanitize a *second* time, on a fresh copy of the same raw upstream
+  header block (stashed in the new `proxy_compress_raw_headers`, since
+  the first sanitize call tokenizes its own scratch copy in place), once
+  the real compressed length is known
+  (`magnus_proxy_finish_compression()`, called from
+  `magnus_proxy_flush()`'s own "response complete" branch the moment the
+  full body is captured). `magnus_gzip_compress()` only ever fails on an
+  allocation failure (never on well-formed input), so that one case
+  falls back to relaying the captured bytes uncompressed rather than
+  losing the response outright -- ownership of the capture buffer
+  transfers straight into the new `proxy_compressed_body` field (a
+  dynamically-sized heap buffer `magnus_proxy_flush()`'s second write
+  loop now sends from instead of the fixed 16 KiB `proxy_buffer`
+  whenever non-NULL, since a compressed body can be up to 8 MiB) with no
+  extra copy.
+
+  A response the upstream *already* sent with its own `Content-Encoding`
+  is never compressed a second time (`magnus_proxy_response_info_t`
+  gained `content_type`/`has_content_encoding`, captured the same
+  "already walking every header anyway" way `cache_control`/`vary`/etc.
+  already are). A cached response is still never compressed on serve
+  (unchanged from 4i's own explicit "reuses whatever the origin itself
+  sent" choice) -- `cache_capture` and `proxy_compress_capture` are
+  entirely independent buffers fed from the identical raw bytes, so
+  caching and compression coexist for the same response without either
+  affecting the other.
+
+  Every other proxy-dispatch feature this session shipped keeps working
+  unmodified alongside compression: `complete_by_length`/
+  `proxy_upstream_poolable` are computed once, at header time, from the
+  *uncompressed* response and never touched by anything compression
+  does, so pool-checkin/teardown, cache storage, and session affinity
+  all reach exactly the decision they always would have.
+
+  HTTP/2 and HTTP/3 proxy dispatch remain on the ordinary uncompressed
+  relay for now -- the same "narrow the first cut, extend later"
+  pattern every earlier Phase 2/4 feature in this codebase has already
+  used once; see `src/magnus_quic.h`'s own deferred-items list.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; a dedicated `tests/test-core.sh` block fetches a real,
+  compressible file through `"/proxy"` with and without
+  `Accept-Encoding: gzip` and confirms the decompressed body matches the
+  original byte-for-byte, confirms a non-compressible content-type
+  (`image/png`) and a body under the 256-byte floor both stay
+  uncompressed even when the client offers gzip, and `tests/test-proxy.c`
+  gained direct unit coverage of the new `compressed_content_length`
+  parameter (exactly one `Content-Length` line, never two; `Content-
+  Encoding`/`Vary: Accept-Encoding` added; an upstream's own unrelated
+  `Vary` value passes through independently, not merged). Docker image
+  rebuilt and a live container tested directly (not just the host
+  binary) -- both the compressed and plain proxied responses confirmed
+  byte-for-byte correct against the running container.
+
 ## 1.36.0
 
 ### Added

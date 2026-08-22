@@ -1865,6 +1865,80 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 
+# Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2): unlike the
+# static-file gzip block just above, this must go all the way through a
+# real upstream fetch -- the compressed bytes come from a body that only
+# exists once relayed through magnus_proxy_finish_compression()'s own
+# buffer-then-compress path, not an mmap'd file. A response the client
+# never asked to compress (no Accept-Encoding), a non-compressible
+# content-type (image/png, gated exactly like the static-file path
+# already is), and a body under MAGNUS_COMPRESSION_MIN_SIZE all stay on
+# the ordinary streaming relay -- only the one eligible case takes the
+# buffered path.
+port_compress_proxy_upstream=$((port + 128))
+port_compress_proxy=$((port + 129))
+compress_proxy_root="$web_root/compress-proxy"
+mkdir -p "$compress_proxy_root"
+for line in $(seq 1 200); do
+  printf '<p>Magnus proxy compression regression line %s</p>\n' "$line"
+done >"$compress_proxy_root/page.html"
+printf '\211PNG\r\n\032\nnot-really-an-image-but-a-binary-mime-type\n' \
+  >"$compress_proxy_root/image.png"
+printf '<html>tiny</html>' >"$compress_proxy_root/tiny.html"
+python3 -m http.server "$port_compress_proxy_upstream" --bind 127.0.0.1 \
+  --directory "$compress_proxy_root" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_compress_proxy_upstream/page.html" >/dev/null \
+    && break
+  sleep 1
+done
+"$binary" --port "$port_compress_proxy" --root "$web_root" \
+  --upstream "127.0.0.1:$port_compress_proxy_upstream" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_compress_proxy/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+plain_headers="$web_root/compress-proxy-plain.headers"
+gzip_headers="$web_root/compress-proxy-gzip.headers"
+decoded_body="$web_root/compress-proxy-decoded.html"
+
+curl --fail --silent --dump-header "$plain_headers" --output "$decoded_body" \
+  "http://127.0.0.1:$port_compress_proxy/proxy/page.html"
+! grep -qi '^content-encoding: gzip' "$plain_headers"
+cmp "$compress_proxy_root/page.html" "$decoded_body"
+
+curl --fail --silent --compressed --dump-header "$gzip_headers" \
+  --output "$decoded_body" \
+  "http://127.0.0.1:$port_compress_proxy/proxy/page.html"
+grep -qi '^content-encoding: gzip' "$gzip_headers"
+grep -qi '^vary: Accept-Encoding' "$gzip_headers"
+cmp "$compress_proxy_root/page.html" "$decoded_body"
+curl --fail --silent -H 'Accept-Encoding: gzip' \
+  "http://127.0.0.1:$port_compress_proxy/proxy/page.html" \
+  | gzip -dc | cmp "$compress_proxy_root/page.html" -
+
+curl --fail --silent -H 'Accept-Encoding: gzip' \
+  --dump-header "$gzip_headers" --output /dev/null \
+  "http://127.0.0.1:$port_compress_proxy/proxy/image.png"
+! grep -qi '^content-encoding: gzip' "$gzip_headers"
+
+curl --fail --silent -H 'Accept-Encoding: gzip' \
+  --dump-header "$gzip_headers" --output /dev/null \
+  "http://127.0.0.1:$port_compress_proxy/proxy/tiny.html"
+! grep -qi '^content-encoding: gzip' "$gzip_headers"
+
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
 # Real IP (roadmap 2b): PROXY protocol v1/v2 and Forwarded/X-Forwarded-For
 # resolution, gated on trusted_proxies -- exercised via config-file mode
 # (proving the config key, not just the CLI flag equivalent) with the

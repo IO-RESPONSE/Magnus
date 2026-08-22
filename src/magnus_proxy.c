@@ -51,6 +51,7 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                        char *out, size_t out_capacity,
                                        const char *affinity_cookie_value,
                                        bool client_wants_close,
+                                       size_t compressed_content_length,
                                        magnus_proxy_response_info_t *info,
                                        size_t *out_cacheable_prefix_length)
 {
@@ -66,11 +67,14 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     bool upstream_wants_close = false;
     unsigned long content_length = 0;
     bool has_set_cookie = false;
+    bool has_content_encoding = false;
+    bool compressing = compressed_content_length != (size_t) -1;
     char cache_control[sizeof(info->cache_control)] = "";
     char expires[sizeof(info->expires)] = "";
     char etag[sizeof(info->etag)] = "";
     char last_modified[sizeof(info->last_modified)] = "";
     char vary[sizeof(info->vary)] = "";
+    char content_type[sizeof(info->content_type)] = "";
 
     (void) header_length;
     line = strtok_r(raw, "\r\n", &saveptr);
@@ -144,9 +148,27 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
             strncpy(last_modified, value, sizeof(last_modified) - 1);
         } else if (strcasecmp(name, "vary") == 0) {
             strncpy(vary, value, sizeof(vary) - 1);
+        } else if (strcasecmp(name, "content-type") == 0) {
+            strncpy(content_type, value, sizeof(content_type) - 1);
+        } else if (strcasecmp(name, "content-encoding") == 0) {
+            /* Presence alone matters (roadmap 2a-2) -- a response the
+             * upstream already encoded itself is never eligible for a
+             * second, magnus-applied encoding on top; the value itself
+             * still passes through to the client below like any other
+             * ordinary header, same reasoning as set-cookie above. */
+            has_content_encoding = true;
         }
 
         if (magnus_proxy_is_hop_by_hop(name)) continue;
+        /* Roadmap 2a-2: the upstream's own Content-Length line is
+         * dropped here, not forwarded, when this call is building the
+         * *compressed* response's own header block (compressing ==
+         * true) -- the real, compressed length is written once, after
+         * this loop, alongside Content-Encoding/Vary below, instead.
+         * Forwarding both would be a duplicate Content-Length header,
+         * which magnus_http_parse() (and every other well-behaved HTTP
+         * parser) must reject. */
+        if (compressing && strcasecmp(name, "content-length") == 0) continue;
 
         written = snprintf(out + total, out_capacity - total, "%s\r\n", line);
         if (written < 0 || (size_t) written >= out_capacity - total) return -1;
@@ -162,6 +184,21 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
      * from a stored entry -- see this function's own doc comment on
      * out_cacheable_prefix_length. */
     if (out_cacheable_prefix_length != NULL) *out_cacheable_prefix_length = total;
+
+    /* Roadmap 2a-2: the real, compressed Content-Length -- the upstream's
+     * own line was dropped, not forwarded, above. A second, separate
+     * `Vary: Accept-Encoding` line is emitted unconditionally rather than
+     * merged into an upstream-supplied Vary value that may have already
+     * passed through above -- two Vary header fields are semantically
+     * equivalent to one comma-joined line (RFC 9110 5.3), just not as
+     * tidy; narrowed for a later increment, not a correctness gap. */
+    if (compressing) {
+        written = snprintf(out + total, out_capacity - total,
+                           "Content-Length: %zu\r\nContent-Encoding: gzip\r\n"
+                           "Vary: Accept-Encoding\r\n", compressed_content_length);
+        if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+        total += (size_t) written;
+    }
 
     if (affinity_cookie_value != NULL) {
         written = snprintf(out + total, out_capacity - total,
@@ -183,6 +220,8 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     strcpy(info->etag, etag);
     strcpy(info->last_modified, last_modified);
     strcpy(info->vary, vary);
+    strcpy(info->content_type, content_type);
+    info->has_content_encoding = has_content_encoding;
 
     written = snprintf(out + total, out_capacity - total,
                        "Connection: %s\r\nX-Magnus-Via: magnus-proxy/0.1\r\n\r\n",

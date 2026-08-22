@@ -1357,7 +1357,11 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
             true /* client_wants_close: N/A for h3, same reasoning as h2
                   * -- see magnus_quic_proxy_submit_response()'s own
                   * comment on why the Connection header this produces
-                  * is dropped either way */, &info,
+                  * is dropped either way */,
+            (size_t) -1 /* compressed_content_length: roadmap 2a-2 is
+                         * HTTP/1.1 proxy dispatch only in this first
+                         * increment -- see CHANGELOG.md's own entry */,
+            &info,
             &cacheable_prefix_length /* roadmap 4i: bytes of `sanitized`
                                        * that are safe for
                                        * magnus_cache_store() -- see

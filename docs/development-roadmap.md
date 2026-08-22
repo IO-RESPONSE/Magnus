@@ -439,6 +439,19 @@ connection-pool and common-request-model decisions).
     Accept-Encoding` prevents a future cache from mixing representations.
     Proxied-response compression, Brotli/zstd, and streaming/chunked
     compression for files above 8 MiB remain separate future increments.
+    - **2a-2 — proxy dispatch response compression, HTTP/1.1. Shipped in
+      1.37.0.** The same gzip negotiation as 2a's own, now for a
+      `"/proxy"` response fetched live from an upstream rather than read
+      from an mmap'd file -- genuinely changes the relay's own timing
+      (the whole body must be captured and compressed before anything
+      reaches the client), unlike every earlier proxy-dispatch feature
+      this codebase shipped, which only ever added side bookkeeping
+      alongside an unchanged streaming relay. `magnus_proxy_sanitize_
+      response_headers()` (the shared h1/h2/h3 header rewriter) gained a
+      `compressed_content_length` override parameter for exactly this.
+      Pooling/caching/affinity keep working unmodified alongside it.
+      HTTP/2 and HTTP/3 proxy dispatch remain uncompressed -- a later
+      increment. See `CHANGELOG.md` 1.37.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route
