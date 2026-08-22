@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.29.0
+
+### Added
+
+- **HTTP/3 static-file gzip compression (roadmap Phase 4e): the same
+  scope compression 2a shipped for HTTP/1.1 and HTTP/2 in 1.11.0, now
+  extended to the third protocol.** A new `magnus_quic_compress_static()`
+  in `src/magnus_quic.c` reuses `magnus_accepts_gzip()`/
+  `magnus_content_type_compressible()`/`magnus_gzip_compress()`
+  (`src/magnus_compression.h`, already linked into the binary for
+  HTTP/1.1 and HTTP/2) rather than reusing `magnus_compress_static()`
+  directly, since that function's signature takes a
+  `magnus_http_request_t *` purely to reach
+  `magnus_http_header_find(request, "accept-encoding")` -- pulling in
+  `magnus_http.h` just for that would have coupled this module to a
+  request shape it does not otherwise use anywhere; `magnus_quic_stream_t`
+  already carries its own flat `accept_encoding` field, captured
+  straight off `accept-encoding`'s own QPACK static-table token
+  (`NGHTTP3_QPACK_TOKEN_ACCEPT_ENCODING`) the same way `:method`/`:path`/
+  `:authority` already are via theirs. Same 256-byte..8-MiB eligibility
+  window, same compressible-MIME-type gate, same `Vary: Accept-Encoding`
+  as 2a; the compressed body reuses `mmap_base`/`mmap_length`/
+  `body_is_malloc` (4c's own "one pair of fields covers a file mapping
+  or a malloc()ed body" pattern) rather than a third near-identical
+  field pair. A HEAD response still reports the *compressed*
+  Content-Length, matching `magnus_h2_dispatch_static()`'s own ordering
+  (compute compression eligibility before branching on `head_only`, not
+  after).
+- `tests/quic-handshake-check.c` gained `content-encoding`/`vary`
+  response-header capture and an optional fourth CLI argument
+  (`gzip`) that sends `Accept-Encoding: gzip` on the request, driving
+  `tests/test-core.sh`'s new Phase 4e block: a compressible (`text/html`)
+  fixture round-tripped byte-exact through `gunzip`, the same fixture
+  requested without `Accept-Encoding` coming back uncompressed, and a
+  binary (`image/png`) fixture staying uncompressed even when the
+  client does offer gzip.
+
+Deliberately still HTTP/1.1-and-HTTP/2-only, not a QUIC-specific gap:
+proxied-response compression (2a's own scope note already excludes it
+on every protocol), Brotli/zstd, and streaming/chunked compression for
+files above the 8 MiB bound -- see `src/magnus_quic.h`'s own top
+comment.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 gzip-compressed GET -- round-tripped through
+`gunzip` back to the exact original bytes -- against the running
+container itself, not just the host binary, plus the same
+uncompressed/binary-MIME negative checks): image size unchanged in
+kind from 1.28.0 (no new runtime dependency -- compression reuses zlib
+already linked in for HTTP/1.1 and HTTP/2).
+
 ## 1.28.0
 
 ### Added

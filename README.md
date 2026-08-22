@@ -242,11 +242,17 @@ independently by IORESPONSE.
   HTTP/2 already share, so a killed backend produces the same clean
   502 and the same `magnus_upstream_healthy` degradation regardless of
   which protocol the client used. The `route` table's own
-  host/path-prefix/header/cookie/query/source-CIDR matching, retry-on-
-  connect-failure, upstream connection pooling, session affinity,
-  response caching, and compression over HTTP/3 remain later
-  increments -- see `src/magnus_quic.h`
-- Container image: 10,350,250 bytes (~9.87 MiB), non-root, read-only rootfs
+  host/path-prefix/header/cookie/query/source-CIDR matching,
+  retry-on-connect-failure, upstream connection pooling, session
+  affinity, and response caching remain later increments -- see
+  `src/magnus_quic.h`
+- HTTP/3 static-file gzip compression (roadmap Phase 4e): the same
+  scope compression 2a shipped for HTTP/1.1 and HTTP/2, extended to
+  the third protocol -- same eligibility window, same
+  `Vary: Accept-Encoding`. Proxied-response compression, Brotli/zstd,
+  and streaming compression above the 8 MiB bound remain deferred on
+  every protocol, not a QUIC-specific gap
+- Container image: 10,350,746 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

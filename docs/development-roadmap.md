@@ -924,15 +924,18 @@ connection-pool and common-request-model decisions).
   admin isolation extended to the QUIC listener) in 1.27.0, 4d (HTTP/3
   `"/proxy"` dispatch to a real HTTP/1.1 upstream, reusing the same
   cluster/passive-health and response-sanitization primitives HTTP/1.1
-  and HTTP/2 already share) in 1.28.0** — see `CHANGELOG.md`
-  1.25.0/1.26.0/1.27.0/1.28.0 and `src/magnus_quic.h` for the exact
-  scope and what's deliberately still missing (compression over
-  HTTP/3; the `route` table's own host/path-prefix/header/cookie/
-  query/source-CIDR matching, retry-on-connect-failure, connection
-  pooling, session affinity, and response caching for HTTP/3 proxy
-  dispatch specifically, the same way 1e-2 extended HTTP/2 past its own
-  1e-1/1e-4 start; no retry-based address validation, no migration, no
-  0-RTT at the transport level).
+  and HTTP/2 already share) in 1.28.0, 4e (HTTP/3 static-file gzip
+  compression, the same scope compression 2a shipped for HTTP/1.1 and
+  HTTP/2) in 1.29.0** — see `CHANGELOG.md` 1.25.0/1.26.0/1.27.0/
+  1.28.0/1.29.0 and `src/magnus_quic.h` for the exact scope and what's
+  deliberately still missing (proxied-response compression, Brotli/
+  zstd, and streaming compression above 2a's own 8 MiB bound, on every
+  protocol, not a QUIC-specific gap; the `route` table's own
+  host/path-prefix/header/cookie/query/source-CIDR matching,
+  retry-on-connect-failure, connection pooling, session affinity, and
+  response caching for HTTP/3 proxy dispatch specifically, the same way
+  1e-2 extended HTTP/2 past its own 1e-1/1e-4 start; no retry-based
+  address validation, no migration, no 0-RTT at the transport level).
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and

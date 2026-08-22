@@ -1,5 +1,6 @@
 #include "magnus_quic.h"
 #include "magnus_static.h"
+#include "magnus_compression.h"
 #include "magnus_proxy.h"
 
 #include <ngtcp2/ngtcp2.h>
@@ -121,6 +122,15 @@ typedef struct {
     char method[8];
     char path[256];
     char authority[256];
+    /* accept-encoding (roadmap 4e): captured in
+     * magnus_quic_http_recv_header() via its own QPACK static-table
+     * token (NGHTTP3_QPACK_TOKEN_ACCEPT_ENCODING), the same way :path/
+     * :method/:authority are captured via theirs -- fed to
+     * magnus_accepts_gzip() exactly like HTTP/1.1's own
+     * magnus_http_header_find(request, "accept-encoding") and HTTP/2's
+     * stream->parsed equivalent, so all three protocols negotiate
+     * compression by the same rule. */
+    char accept_encoding[256];
     bool head_only;
     /* The whole file, mmap()ed once at dispatch and handed to nghttp3
      * as a single vec (magnus_quic_http_read_file()) rather than
@@ -1339,6 +1349,57 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     }
 }
 
+/* gzip-compresses fd's whole contents into a fresh malloc()ed buffer,
+ * the h3 analogue of magnus_compress_static() -- duplicated rather
+ * than reused directly because that function takes a
+ * `magnus_http_request_t *` purely to reach
+ * magnus_http_header_find(request, "accept-encoding"), and pulling in
+ * magnus_http.h just for that would coupled this module to a request
+ * shape it does not otherwise use anywhere (magnus_quic_stream_t
+ * already carries its own flat accept_encoding field, captured
+ * straight off the QPACK static-table token -- see that field's own
+ * comment). Same eligibility rule (256 bytes..8 MiB, compressible MIME
+ * type, client advertises gzip) and the same "buffer the whole file,
+ * compress once, exact Content-Length" shape 2a already established
+ * for HTTP/1.1 and HTTP/2. Returns true and fills `*output`/
+ * `*output_length` on success (caller owns the buffer); false leaves
+ * both untouched and the caller falls back to the uncompressed path,
+ * exactly like magnus_compress_static()'s own every-failure-mode
+ * contract. */
+static bool
+magnus_quic_compress_static(int fd, const struct stat *metadata,
+                            const char *content_type,
+                            const char *accept_encoding,
+                            unsigned char **output, size_t *output_length)
+{
+    unsigned char *input;
+    size_t length;
+    size_t offset = 0;
+    if (metadata->st_size < MAGNUS_COMPRESSION_MIN_SIZE
+        || metadata->st_size > MAGNUS_COMPRESSION_MAX_SIZE
+        || !magnus_content_type_compressible(content_type)
+        || !magnus_accepts_gzip(accept_encoding)) return false;
+    length = (size_t) metadata->st_size;
+    input = malloc(length);
+    if (input == NULL) return false;
+    while (offset < length) {
+        ssize_t got = pread(fd, input + offset, length - offset,
+                            (off_t) offset);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            free(input);
+            return false;
+        }
+        offset += (size_t) got;
+    }
+    if (magnus_gzip_compress(input, length, output, output_length) != 0) {
+        free(input);
+        return false;
+    }
+    free(input);
+    return true;
+}
+
 /* Serves stream->path as a static file -- the fallback once
  * magnus_quic_http_dispatch() below has ruled out /healthz and
  * /metrics. Method/head_only validation already happened there, same
@@ -1351,8 +1412,12 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     struct stat metadata;
     const char *content_type;
     char content_length[32];
-    nghttp3_nv headers[4];
+    nghttp3_nv headers[6];
+    size_t header_count = 4;
     int fd;
+    unsigned char *compressed = NULL;
+    size_t compressed_length = 0;
+    bool use_gzip;
 
     fd = magnus_open_static(stream->path, &metadata);
     if (fd < 0) {
@@ -1360,17 +1425,47 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
         return;
     }
     content_type = magnus_content_type(stream->path);
+    /* Computed unconditionally, ahead of the head_only check below --
+     * a HEAD response still needs the *compressed* Content-Length to
+     * be accurate (what a subsequent GET would actually transfer),
+     * exactly like magnus_h2_dispatch_static()'s own ordering. */
+    use_gzip = magnus_quic_compress_static(fd, &metadata, content_type,
+                                           stream->accept_encoding,
+                                           &compressed, &compressed_length);
     snprintf(content_length, sizeof(content_length), "%lld",
-            (long long) metadata.st_size);
+            use_gzip ? (long long) compressed_length
+                     : (long long) metadata.st_size);
     headers[0] = magnus_quic_nv(":status", "200");
     headers[1] = magnus_quic_nv("server", "Magnus/" MAGNUS_VERSION);
     headers[2] = magnus_quic_nv("content-type", content_type);
     headers[3] = magnus_quic_nv("content-length", content_length);
+    if (use_gzip) {
+        headers[4] = magnus_quic_nv("content-encoding", "gzip");
+        headers[5] = magnus_quic_nv("vary", "Accept-Encoding");
+        header_count = 6;
+    }
     if (stream->head_only) {
         close(fd);
+        free(compressed);
         (void) nghttp3_conn_submit_response(connection->http3_conn,
-                                            stream->stream_id, headers, 4,
-                                            NULL);
+                                            stream->stream_id, headers,
+                                            header_count, NULL);
+        return;
+    }
+    if (use_gzip) {
+        /* The whole compressed body is already sitting in memory --
+         * exactly the same shape /healthz//metrics (roadmap 4c) already
+         * reuse mmap_base/mmap_length/body_is_malloc for (see that
+         * flag's own comment); reused here rather than given a
+         * near-identical sibling field pair. */
+        close(fd);
+        stream->mmap_base = compressed;
+        stream->mmap_length = compressed_length;
+        stream->body_is_malloc = true;
+        nghttp3_data_reader reader = { .read_data = magnus_quic_http_read_file };
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers,
+                                            header_count, &reader);
         return;
     }
     if (metadata.st_size > 0) {
@@ -1398,8 +1493,8 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     {
         nghttp3_data_reader reader = { .read_data = magnus_quic_http_read_file };
         (void) nghttp3_conn_submit_response(connection->http3_conn,
-                                            stream->stream_id, headers, 4,
-                                            &reader);
+                                            stream->stream_id, headers,
+                                            header_count, &reader);
     }
 }
 
@@ -1586,6 +1681,11 @@ magnus_quic_http_recv_header(nghttp3_conn *conn, int64_t stream_id,
             ? v.len : sizeof(stream->authority) - 1;
         memcpy(stream->authority, v.base, length);
         stream->authority[length] = '\0';
+    } else if (token == NGHTTP3_QPACK_TOKEN_ACCEPT_ENCODING) {
+        size_t length = v.len < sizeof(stream->accept_encoding) - 1
+            ? v.len : sizeof(stream->accept_encoding) - 1;
+        memcpy(stream->accept_encoding, v.base, length);
+        stream->accept_encoding[length] = '\0';
     }
     return 0;
 }

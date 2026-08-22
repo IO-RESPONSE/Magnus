@@ -3958,6 +3958,16 @@ printf '%s\n' 'magnus quic static file' >"$web_root/quic-hello.txt"
 for line_number in $(seq 1 5000); do
   printf 'line-%05d-abcdefghijklmnopqrstuvwxyz\n' "$line_number"
 done >"$web_root/quic-large.txt"
+# Phase 4e fixtures: a compressible (text/html) file well above the
+# 256-byte minimum, and a binary (image/png) one of the same rough
+# size -- the same shape the existing h1/h2 compression test above
+# uses, so all three protocols are exercised against comparable
+# fixtures.
+for line_number in $(seq 1 200); do
+  printf '<p>magnus quic compression regression line %s</p>\n' "$line_number"
+done >"$web_root/quic-compress.html"
+printf '\211PNG\r\n\032\nnot-really-an-image-but-a-binary-mime-type\n' \
+  >"$web_root/quic-compress.png"
 port_quic=$((port + 100))
 port_quic_udp=$((port + 101))
 "$binary" --port "$port_quic" --root "$web_root" \
@@ -3997,6 +4007,33 @@ tail -n +3 "$web_root/quic-metrics-out" \
 # first-ever accept path.
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
   /quic-hello.txt | grep -qE '^status: 200$'
+# Phase 4e: HTTP/3 static-file gzip compression, sharing
+# magnus_accepts_gzip()/magnus_content_type_compressible()/
+# magnus_gzip_compress() (src/magnus_compression.h) with the HTTP/1.1
+# and HTTP/2 static paths -- same 256B..8MiB eligibility window, same
+# compressible-MIME-type gate, same Vary: Accept-Encoding.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-compress.html gzip > "$web_root/quic-compress-gzip-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-gzip-out"
+grep -qE '^content-encoding: gzip$' "$web_root/quic-compress-gzip-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-gzip-out"
+tail -n +5 "$web_root/quic-compress-gzip-out" | gunzip \
+  | diff - "$web_root/quic-compress.html"
+# Without Accept-Encoding: gzip, the same resource comes back
+# uncompressed -- negotiation actually depends on the request, not a
+# blanket "always compress compressible types."
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-compress.html > "$web_root/quic-compress-plain-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-plain-out"
+! grep -q '^content-encoding:' "$web_root/quic-compress-plain-out"
+tail -n +3 "$web_root/quic-compress-plain-out" \
+  | diff - "$web_root/quic-compress.html"
+# A binary MIME type stays uncompressed even when the client offers
+# gzip -- the content-type gate, not just the Accept-Encoding one.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-compress.png gzip > "$web_root/quic-compress-png-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-png-out"
+! grep -q '^content-encoding:' "$web_root/quic-compress-png-out"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
@@ -4118,4 +4155,4 @@ curl -k --fail --silent "https://127.0.0.1:$port_quic_proxy/metrics" \
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads ok (Phase 4b/4c/4d, see src/magnus_quic.h)"
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression ok (Phase 4b/4c/4d/4e, see src/magnus_quic.h)"

@@ -52,8 +52,11 @@ static ngtcp2_conn *g_conn;
 static nghttp3_conn *g_httpconn;
 static bool g_handshake_confirmed;
 static const char *g_request_path; /* NULL: handshake-only mode */
+static bool g_request_accept_gzip; /* roadmap 4e: send Accept-Encoding: gzip */
 static bool g_request_submitted;
 static char g_response_status[8];
+static char g_response_content_encoding[32]; /* roadmap 4e */
+static char g_response_vary[32]; /* roadmap 4e */
 static uint8_t *g_response_body;
 static size_t g_response_body_len;
 static bool g_response_done;
@@ -239,6 +242,18 @@ http_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t token,
             ? v.len : sizeof(g_response_status) - 1;
         memcpy(g_response_status, v.base, length);
         g_response_status[length] = '\0';
+    } else if (token == NGHTTP3_QPACK_TOKEN_CONTENT_ENCODING) {
+        nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+        size_t length = v.len < sizeof(g_response_content_encoding) - 1
+            ? v.len : sizeof(g_response_content_encoding) - 1;
+        memcpy(g_response_content_encoding, v.base, length);
+        g_response_content_encoding[length] = '\0';
+    } else if (token == NGHTTP3_QPACK_TOKEN_VARY) {
+        nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+        size_t length = v.len < sizeof(g_response_vary) - 1
+            ? v.len : sizeof(g_response_vary) - 1;
+        memcpy(g_response_vary, v.base, length);
+        g_response_vary[length] = '\0';
     }
     return 0;
 }
@@ -287,7 +302,8 @@ setup_httpconn(void)
     nghttp3_settings settings;
     int64_t control_stream_id, qpack_encoder_stream_id, qpack_decoder_stream_id;
     int64_t request_stream_id;
-    nghttp3_nv headers[4];
+    nghttp3_nv headers[5];
+    size_t header_count = 4;
 
     if (g_httpconn || !g_request_path) return 0;
 
@@ -338,8 +354,13 @@ setup_httpconn(void)
     headers[3] = (nghttp3_nv) { .name = (const uint8_t *) ":path",
         .value = (const uint8_t *) g_request_path, .namelen = 5,
         .valuelen = strlen(g_request_path) };
-    if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers, 4,
-                                    NULL, NULL) != 0) {
+    if (g_request_accept_gzip) {
+        headers[4] = (nghttp3_nv) { .name = (const uint8_t *) "accept-encoding",
+            .value = (const uint8_t *) "gzip", .namelen = 15, .valuelen = 4 };
+        header_count = 5;
+    }
+    if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers,
+                                    header_count, NULL, NULL) != 0) {
         fprintf(stderr, "quic-handshake-check: nghttp3_conn_submit_request "
                         "failed\n");
         return -1;
@@ -443,13 +464,15 @@ main(int argc, char **argv)
     ngtcp2_tstamp deadline;
     static const unsigned char alpn_h3[] = { 2, 'h', '3' };
 
-    if (argc != 3 && argc != 4) {
-        fprintf(stderr, "usage: %s <host> <port> [request-path]\n", argv[0]);
+    if (argc != 3 && argc != 4 && argc != 5) {
+        fprintf(stderr,
+            "usage: %s <host> <port> [request-path] [gzip]\n", argv[0]);
         return 2;
     }
     host = argv[1];
     port = strtoul(argv[2], NULL, 10);
-    if (argc == 4) g_request_path = argv[3];
+    if (argc >= 4) g_request_path = argv[3];
+    if (argc == 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
 
     g_response_body = malloc(QUIC_HANDSHAKE_CHECK_MAX_BODY);
     if (!g_response_body) {
@@ -643,8 +666,23 @@ main(int argc, char **argv)
 
     printf("status: %s\n", g_response_status);
     printf("content-length: %zu\n", g_response_body_len);
+    /* Printed only when actually present (roadmap 4e) -- every existing
+     * caller's own `tail -n +3` (skip exactly status + content-length)
+     * stays correct for a non-gzip response; magnus_quic.c only ever
+     * sends these two together (never one without the other), so a
+     * caller expecting a compressed response uses `tail -n +5` instead. */
+    if (g_response_content_encoding[0] != '\0')
+        printf("content-encoding: %s\n", g_response_content_encoding);
+    if (g_response_vary[0] != '\0')
+        printf("vary: %s\n", g_response_vary);
     fwrite(g_response_body, 1, g_response_body_len, stdout);
-    if (g_response_body_len == 0 || g_response_body[g_response_body_len - 1] != '\n')
+    /* Skipped for a compressed body (roadmap 4e): gzip's own trailing
+     * bytes are effectively random, so this readability nicety would
+     * silently corrupt the stream for a caller that pipes the body
+     * straight into gunzip. */
+    if (g_response_content_encoding[0] == '\0'
+        && (g_response_body_len == 0
+            || g_response_body[g_response_body_len - 1] != '\n'))
         printf("\n");
     return 0;
 }
