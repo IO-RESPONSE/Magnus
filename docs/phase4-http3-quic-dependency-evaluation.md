@@ -86,13 +86,20 @@ flagged below rather than glossed over.
 Per Section 23's prohibition on unverified claims, none of the following
 are asserted as settled:
 
-1. **`libngtcp2_crypto_ossl`'s "experimental" status**: needs a standalone
-   spike (connect + handshake + one stream, outside the Magnus codebase)
-   against the host's actual OpenSSL 3.5.5 before Phase 4 work starts on
-   Magnus itself, to find out firsthand whether the buffer-lifetime
-   constraint the OpenSSL QUIC TLS API imposes is compatible with Magnus's
-   existing per-connection buffer reuse, or whether it forces a design
-   change.
+1. **`libngtcp2_crypto_ossl`'s "experimental" status** — spiked
+   2026-08-22, see `docs/phase4-spike-results.md` for the full run. The
+   part this spike *can* settle from outside `src/` is settled: ngtcp2
+   1.19.0 + `libngtcp2_crypto_ossl` (EPEL RPM) + nghttp3 1.19.0
+   (source-built) complete a real QUIC v1 handshake and an HTTP/3
+   GET/200 round trip against the host's actual OpenSSL 3.5.5, across
+   two independent connections, with no crash, hang, or unexpected error
+   in either process's log. The part this spike *cannot* settle from
+   outside `src/` stays open: whether the OpenSSL QUIC TLS API's
+   "keep crypto data intact until told otherwise" constraint is
+   compatible with Magnus's own per-connection buffer reuse specifically
+   — the ngtcp2 example client/server manage their own buffers
+   independently of Magnus's model, so that question only gets a real
+   answer once Phase 4 code exists inside `magnus.c` to ask it against.
 2. **Binary size impact**: unmeasured. Current image is ~9 MiB; ngtcp2 +
    nghttp3 need to be built and statically/dynamically linked into a real
    `build-image.sh` run before any size claim is made, the same way the
@@ -110,7 +117,11 @@ are asserted as settled:
 
 ## 6. Next step if this evaluation is accepted
 
-Item 1's standalone spike, *outside* `src/`, before any change to
+Item 1's standalone spike (outside `src/`, before any change to
 `magnus.c`, `Makefile`, or the container build — matching the "prove it
 works in isolation first" pattern already used for the Real IP and stream
-PROXY-protocol work. Not started by this document.
+PROXY-protocol work) is done; see `docs/phase4-spike-results.md`. What
+remains before Phase 4 code lands in `magnus.c`: item 2 (binary size,
+needs a real `build-image.sh` run once there's something to link) and
+the buffer-lifetime question item 1 flagged as only answerable from
+inside the real integration.
