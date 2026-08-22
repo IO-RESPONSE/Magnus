@@ -6815,7 +6815,9 @@ magnus_build_metrics(char *out, size_t out_capacity)
         "magnus_upstream_endpoints_total %zu\n"
         "magnus_upstream_endpoints_healthy %zu\n"
         "# TYPE magnus_quic_retry_total counter\n"
-        "magnus_quic_retry_total %llu\n",
+        "magnus_quic_retry_total %llu\n"
+        "# TYPE magnus_quic_migration_total counter\n"
+        "magnus_quic_migration_total %llu\n",
         (unsigned long long) magnus_connections_total,
         (unsigned long long) magnus_connections_active,
         (unsigned long long) magnus_requests_total,
@@ -6824,7 +6826,7 @@ magnus_build_metrics(char *out, size_t out_capacity)
         (unsigned long long) magnus_bytes_sent,
         (unsigned long long) magnus_rate_limited_total,
         magnus_cluster.count, healthy,
-        magnus_quic_retry_total());
+        magnus_quic_retry_total(), magnus_quic_migration_total());
     for (size_t index = 0; index < magnus_cluster.count
          && written < out_capacity; index++) {
         int line = snprintf(out + written, out_capacity - written,

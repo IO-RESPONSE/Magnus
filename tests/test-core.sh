@@ -4692,4 +4692,48 @@ test "$retry_after" -gt "$retry_before"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k, see src/magnus_quic.h)"
+
+# Phase 4l: connection migration / reactive path validation (RFC 9000
+# 9.3). quic-handshake-check's own "migrate" mode (see its file header)
+# completes one request, then rebinds to a fresh local UDP port and
+# completes a SECOND, independent request over the SAME QUIC connection
+# from there -- proving the read-path fix in
+# magnus_quic_listener_service() (feed the packet's own actual
+# recvfrom() path, not the connection's last-known one) actually lets
+# ngtcp2's own PATH_CHALLENGE/PATH_RESPONSE validation run, not just
+# that it compiles. magnus_quic_migration_total (the new /metrics
+# counter magnus_quic_path_validation() increments) reads 0 before any
+# path change and increases by the time the migrated request completes
+# -- the same "shared counter, read back over HTTP/1.1" proof 4k's own
+# block above already established for its own counter, applied to this
+# one instead.
+port_quic_migrate=$((port + 126))
+port_quic_migrate_udp=$((port + 127))
+"$binary" --port "$port_quic_migrate" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_migrate_udp" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_migrate/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+migration_before=$(curl -k --http1.1 --fail --silent \
+  "https://127.0.0.1:$port_quic_migrate/metrics" \
+  | sed -n 's/^magnus_quic_migration_total //p')
+test "$migration_before" = 0
+
+migrate_status=$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_migrate_udp" /healthz - - migrate | head -1)
+test "$migrate_status" = "status: 200"
+
+migration_after=$(curl -k --http1.1 --fail --silent \
+  "https://127.0.0.1:$port_quic_migrate/metrics" \
+  | sed -n 's/^magnus_quic_migration_total //p')
+test "$migration_after" -gt "$migration_before"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l, see src/magnus_quic.h)"

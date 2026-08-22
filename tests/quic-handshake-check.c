@@ -56,6 +56,15 @@ static const char *g_request_path; /* NULL: handshake-only mode */
 static bool g_request_accept_gzip; /* roadmap 4e: send Accept-Encoding: gzip */
 static const char *g_request_cookie; /* roadmap 4h: send Cookie: <this> */
 static bool g_request_submitted;
+/* roadmap 4l: after the first request completes, rebind to a fresh
+ * local UDP port and issue a second request over the SAME ngtcp2
+ * connection from there -- simulates the simplest, most common real
+ * migration scenario (NAT rebinding: the client's own 4-tuple changes
+ * mid-connection, with no explicit ngtcp2_conn_initiate_migration()
+ * call needed on either side, since the server is the one that must
+ * notice and validate the new path; see magnus_quic_path_validation()'s
+ * own comment in src/magnus_quic.c). */
+static bool g_migrate;
 static char g_response_status[8];
 static char g_response_content_encoding[32]; /* roadmap 4e */
 static char g_response_vary[32]; /* roadmap 4e */
@@ -318,15 +327,60 @@ http_acked_stream_data_cb(nghttp3_conn *conn, int64_t stream_id,
     return 0;
 }
 
+/* roadmap 4l: split out of setup_httpconn() below so a second,
+ * post-migration request can open a fresh bidi stream and submit
+ * again without re-creating the http3 connection or its control/QPACK
+ * streams (nghttp3_conn already supports many requests per
+ * connection -- that is the entire premise roadmap 4j's own
+ * connection pooling relies on for h1/h2). */
+static int
+submit_request(void)
+{
+    int64_t request_stream_id;
+    nghttp3_nv headers[6];
+    size_t header_count = 4;
+
+    if (ngtcp2_conn_open_bidi_stream(g_conn, &request_stream_id, NULL) != 0) {
+        fprintf(stderr, "quic-handshake-check: open_bidi_stream failed\n");
+        return -1;
+    }
+    headers[0] = (nghttp3_nv) { .name = (const uint8_t *) ":method",
+        .value = (const uint8_t *) "GET", .namelen = 7, .valuelen = 3 };
+    headers[1] = (nghttp3_nv) { .name = (const uint8_t *) ":scheme",
+        .value = (const uint8_t *) "https", .namelen = 7, .valuelen = 5 };
+    headers[2] = (nghttp3_nv) { .name = (const uint8_t *) ":authority",
+        .value = (const uint8_t *) "localhost", .namelen = 10, .valuelen = 9 };
+    headers[3] = (nghttp3_nv) { .name = (const uint8_t *) ":path",
+        .value = (const uint8_t *) g_request_path, .namelen = 5,
+        .valuelen = strlen(g_request_path) };
+    if (g_request_accept_gzip) {
+        headers[header_count] = (nghttp3_nv) {
+            .name = (const uint8_t *) "accept-encoding",
+            .value = (const uint8_t *) "gzip", .namelen = 15, .valuelen = 4 };
+        header_count++;
+    }
+    if (g_request_cookie != NULL) {
+        headers[header_count] = (nghttp3_nv) { .name = (const uint8_t *) "cookie",
+            .value = (const uint8_t *) g_request_cookie, .namelen = 6,
+            .valuelen = strlen(g_request_cookie) };
+        header_count++;
+    }
+    if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers,
+                                    header_count, NULL, NULL) != 0) {
+        fprintf(stderr, "quic-handshake-check: nghttp3_conn_submit_request "
+                        "failed\n");
+        return -1;
+    }
+    g_request_submitted = true;
+    return 0;
+}
+
 static int
 setup_httpconn(void)
 {
     nghttp3_callbacks callbacks;
     nghttp3_settings settings;
     int64_t control_stream_id, qpack_encoder_stream_id, qpack_decoder_stream_id;
-    int64_t request_stream_id;
-    nghttp3_nv headers[6];
-    size_t header_count = 4;
 
     if (g_httpconn || !g_request_path) return 0;
 
@@ -364,39 +418,7 @@ setup_httpconn(void)
         return -1;
     }
 
-    if (ngtcp2_conn_open_bidi_stream(g_conn, &request_stream_id, NULL) != 0) {
-        fprintf(stderr, "quic-handshake-check: open_bidi_stream failed\n");
-        return -1;
-    }
-    headers[0] = (nghttp3_nv) { .name = (const uint8_t *) ":method",
-        .value = (const uint8_t *) "GET", .namelen = 7, .valuelen = 3 };
-    headers[1] = (nghttp3_nv) { .name = (const uint8_t *) ":scheme",
-        .value = (const uint8_t *) "https", .namelen = 7, .valuelen = 5 };
-    headers[2] = (nghttp3_nv) { .name = (const uint8_t *) ":authority",
-        .value = (const uint8_t *) "localhost", .namelen = 10, .valuelen = 9 };
-    headers[3] = (nghttp3_nv) { .name = (const uint8_t *) ":path",
-        .value = (const uint8_t *) g_request_path, .namelen = 5,
-        .valuelen = strlen(g_request_path) };
-    if (g_request_accept_gzip) {
-        headers[header_count] = (nghttp3_nv) {
-            .name = (const uint8_t *) "accept-encoding",
-            .value = (const uint8_t *) "gzip", .namelen = 15, .valuelen = 4 };
-        header_count++;
-    }
-    if (g_request_cookie != NULL) {
-        headers[header_count] = (nghttp3_nv) { .name = (const uint8_t *) "cookie",
-            .value = (const uint8_t *) g_request_cookie, .namelen = 6,
-            .valuelen = strlen(g_request_cookie) };
-        header_count++;
-    }
-    if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers,
-                                    header_count, NULL, NULL) != 0) {
-        fprintf(stderr, "quic-handshake-check: nghttp3_conn_submit_request "
-                        "failed\n");
-        return -1;
-    }
-    g_request_submitted = true;
-    return 0;
+    return submit_request();
 }
 
 static int
@@ -471,6 +493,82 @@ flush(int fd)
     }
 }
 
+static bool
+phase1_done(void)
+{
+    return g_handshake_confirmed && (!g_request_path || g_response_done);
+}
+
+static bool
+phase2_done(void)
+{
+    return g_response_done;
+}
+
+/* Drives the connection (retransmission/idle-timeout expiry, reading
+ * whatever arrives on `fd`, flushing whatever that produces) until
+ * `is_done()` reports true or `deadline` passes -- the exact loop
+ * `main()` always ran inline for the single-path case; factored out
+ * here (roadmap 4l) so a post-migration second wait can reuse it
+ * unchanged against a *different* fd and path once the first request
+ * has already completed. `path` is passed through to
+ * ngtcp2_conn_read_pkt() unchanged from what the caller set up --
+ * this client, unlike magnus_quic.c's own server-side fix this tool
+ * exists to exercise, never needs to update it mid-loop: it only ever
+ * has one path active at a time, and migrates by tearing down and
+ * rebuilding path/fd together between calls, not by tracking a
+ * changing path within one. */
+static int
+run_event_loop(int fd, ngtcp2_path *path, ngtcp2_tstamp deadline,
+               bool (*is_done)(void))
+{
+    while (now_ns() < deadline) {
+        ngtcp2_tstamp expiry;
+        ngtcp2_tstamp ts;
+        int timeout_ms = 200;
+        struct pollfd pfd;
+
+        if (is_done()) return 0;
+
+        expiry = ngtcp2_conn_get_expiry(g_conn);
+        ts = now_ns();
+        if (expiry != UINT64_MAX && expiry <= ts) {
+            if (ngtcp2_conn_handle_expiry(g_conn, ts) != 0) {
+                fprintf(stderr, "quic-handshake-check: handle_expiry failed\n");
+                return -1;
+            }
+            flush(fd);
+            continue;
+        }
+        if (expiry != UINT64_MAX) {
+            ngtcp2_tstamp remaining_ns = expiry - ts;
+            int64_t remaining_ms = (int64_t) (remaining_ns / NGTCP2_MILLISECONDS);
+            if (remaining_ms >= 0 && remaining_ms < timeout_ms)
+                timeout_ms = (int) remaining_ms;
+        }
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
+            uint8_t buffer[65536];
+            ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+            if (received > 0) {
+                int rv = ngtcp2_conn_read_pkt(g_conn, path, NULL, buffer,
+                                             (size_t) received, now_ns());
+                if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
+                    fprintf(stderr, "quic-handshake-check: read_pkt: %s\n",
+                           ngtcp2_strerror(rv));
+                    return -1;
+                }
+                flush(fd);
+            }
+        }
+    }
+    return 0; /* deadline reached -- caller checks is_done()/response state
+                * itself, same as before this was factored out */
+}
+
 int
 main(int argc, char **argv)
 {
@@ -494,17 +592,23 @@ main(int argc, char **argv)
     ngtcp2_tstamp deadline;
     static const unsigned char alpn_h3[] = { 2, 'h', '3' };
 
-    if (argc < 3 || argc > 6) {
+    if (argc < 3 || argc > 7) {
         fprintf(stderr,
-            "usage: %s <host> <port> [request-path] [gzip|-] [cookie]\n",
-            argv[0]);
+            "usage: %s <host> <port> [request-path] [gzip|-] [cookie] "
+            "[migrate]\n", argv[0]);
         return 2;
     }
     host = argv[1];
     port = strtoul(argv[2], NULL, 10);
     if (argc >= 4) g_request_path = argv[3];
     if (argc >= 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
-    if (argc == 6) g_request_cookie = argv[5];
+    /* "-" is a no-op sentinel here too (matching argv[4]'s own "gzip|-"
+     * convention) -- needed so a caller that wants the trailing
+     * "migrate" flag (roadmap 4l) but no cookie does not have to send
+     * a literal, meaningless "Cookie: -" header just to keep the
+     * cookie slot's position. */
+    if (argc >= 6 && strcmp(argv[5], "-") != 0) g_request_cookie = argv[5];
+    if (argc == 7) g_migrate = strcmp(argv[6], "migrate") == 0;
 
     g_response_body = malloc(QUIC_HANDSHAKE_CHECK_MAX_BODY);
     if (!g_response_body) {
@@ -633,50 +737,7 @@ main(int argc, char **argv)
 
     deadline = now_ns() + (ngtcp2_tstamp) QUIC_HANDSHAKE_CHECK_DEADLINE_SECONDS
         * NGTCP2_SECONDS;
-    while (now_ns() < deadline) {
-        ngtcp2_tstamp expiry;
-        ngtcp2_tstamp ts;
-        int timeout_ms = 200;
-        struct pollfd pfd;
-
-        if (g_handshake_confirmed && (!g_request_path || g_response_done))
-            break;
-
-        expiry = ngtcp2_conn_get_expiry(g_conn);
-        ts = now_ns();
-        if (expiry != UINT64_MAX && expiry <= ts) {
-            if (ngtcp2_conn_handle_expiry(g_conn, ts) != 0) {
-                fprintf(stderr, "quic-handshake-check: handle_expiry failed\n");
-                return 1;
-            }
-            flush(fd);
-            continue;
-        }
-        if (expiry != UINT64_MAX) {
-            ngtcp2_tstamp remaining_ns = expiry - ts;
-            int64_t remaining_ms = (int64_t) (remaining_ns / NGTCP2_MILLISECONDS);
-            if (remaining_ms >= 0 && remaining_ms < timeout_ms)
-                timeout_ms = (int) remaining_ms;
-        }
-
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
-            uint8_t buffer[65536];
-            ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-            if (received > 0) {
-                int rv = ngtcp2_conn_read_pkt(g_conn, &path, NULL, buffer,
-                                             (size_t) received, now_ns());
-                if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
-                    fprintf(stderr, "quic-handshake-check: read_pkt: %s\n",
-                           ngtcp2_strerror(rv));
-                    return 1;
-                }
-                flush(fd);
-            }
-        }
-    }
+    if (run_event_loop(fd, &path, deadline, phase1_done) != 0) return 1;
 
     if (!g_handshake_confirmed) {
         fprintf(stderr, "quic-handshake-check: handshake not confirmed within "
@@ -694,6 +755,88 @@ main(int argc, char **argv)
                         "complete within %d seconds\n", g_request_path,
                QUIC_HANDSHAKE_CHECK_DEADLINE_SECONDS);
         return 1;
+    }
+
+    if (g_migrate) {
+        /* roadmap 4l: rebind to a fresh local UDP port -- the simplest,
+         * most common real migration scenario (NAT rebinding). No
+         * ngtcp2_conn_initiate_migration() call is needed on this side:
+         * the SAME connection ID keeps being used, from a new source
+         * port, and it is the SERVER's job to notice and validate the
+         * new path (see src/magnus_quic.c's own
+         * magnus_quic_path_validation() comment) -- which is exactly
+         * the behavior this mode exists to prove actually happens, not
+         * merely compiles. A second, independent HTTP/3 request is
+         * then submitted on the same g_conn/g_httpconn and must
+         * complete entirely over the new path for this to pass. */
+        int new_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (new_fd < 0) {
+            perror("quic-handshake-check: migrate socket");
+            return 1;
+        }
+        if (connect(new_fd, (struct sockaddr *) &address, sizeof(address))
+            < 0) {
+            perror("quic-handshake-check: migrate connect");
+            return 1;
+        }
+        local_addrlen = sizeof(local_addr);
+        if (getsockname(new_fd, (struct sockaddr *) &local_addr,
+                        &local_addrlen) < 0) {
+            perror("quic-handshake-check: migrate getsockname");
+            return 1;
+        }
+        path.local.addrlen = local_addrlen; /* path.local.addr already
+                                              * points at &local_addr,
+                                              * just refreshed in place */
+        close(fd);
+        fd = new_fd;
+
+        /* ngtcp2_conn_initiate_migration()'s own doc comment is explicit:
+         * "Only client can initiate migration" -- simply reading packets
+         * whose `path` differs from what this connection was created
+         * with (as this file did before this fix) is not enough for a
+         * CLIENT connection; unlike the SERVER side (which reacts to
+         * whatever path a packet's own recvfrom() reports, no explicit
+         * app call needed -- see this mode's own top comment and
+         * src/magnus_quic.c's read-path fix), the client side is
+         * required to register its own path change explicitly before
+         * ngtcp2 will treat data arriving there as real (rather than
+         * silently decoding-but-discarding it, which is exactly what
+         * was observed before this call was added: read_pkt succeeded
+         * with no error, yet recv_stream_data_cb never fired for the
+         * new stream). This starts ngtcp2's own path validation on the
+         * new path from the client's side too -- the client and server
+         * each independently validate the SAME new path, meeting in the
+         * middle via PATH_CHALLENGE/PATH_RESPONSE either one of them
+         * could have initiated first. */
+        if (ngtcp2_conn_initiate_migration(g_conn, &path, now_ns()) != 0) {
+            fprintf(stderr,
+                   "quic-handshake-check: initiate_migration failed\n");
+            return 1;
+        }
+
+        g_response_done = false;
+        g_response_body_len = 0;
+        g_response_status[0] = '\0';
+        g_response_content_encoding[0] = '\0';
+        g_response_vary[0] = '\0';
+        g_response_set_cookie[0] = '\0';
+        g_response_x_cache[0] = '\0';
+
+        if (submit_request() != 0) return 1;
+        flush(fd);
+
+        deadline = now_ns()
+            + (ngtcp2_tstamp) QUIC_HANDSHAKE_CHECK_DEADLINE_SECONDS
+            * NGTCP2_SECONDS;
+        if (run_event_loop(fd, &path, deadline, phase2_done) != 0) return 1;
+
+        if (!g_response_done) {
+            fprintf(stderr, "quic-handshake-check: post-migration request "
+                            "to '%s' did not complete within %d seconds\n",
+                   g_request_path, QUIC_HANDSHAKE_CHECK_DEADLINE_SECONDS);
+            return 1;
+        }
     }
 
     printf("status: %s\n", g_response_status);

@@ -287,7 +287,15 @@ independently by IORESPONSE.
   no-token `Initial` floods. A new `magnus_quic_retry_total` counter on
   `/metrics` (the same shared `magnus_build_metrics()` every protocol
   already reports through) makes the exchange externally observable
-- Container image: 10,354,335 bytes (~9.88 MiB), non-root, read-only rootfs
+- QUIC connection migration / reactive path validation (roadmap Phase
+  4l, RFC 9000 9.3): magnus now correctly notices and validates a
+  client's mid-connection address change (NAT rebinding, or a genuine
+  client-initiated migration) via ngtcp2's own PATH_CHALLENGE/
+  PATH_RESPONSE exchange, fixing a read-path bug that previously kept
+  ngtcp2 from ever observing the change at all. A new
+  `magnus_quic_migration_total` `/metrics` counter tracks successful
+  validations
+- Container image: 10,354,445 bytes (~9.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.36.0
+
+### Added
+
+- **QUIC connection migration / reactive server-side path validation
+  (roadmap Phase 4l, RFC 9000 9.3): magnus now correctly notices and
+  validates a client's mid-connection address change (NAT rebinding,
+  or a genuine client-initiated migration) instead of being unable to
+  see it happen at all.** The bug this closes: `magnus_quic_listener_
+  service()`'s existing-connection read path was feeding
+  `ngtcp2_conn_read_pkt()` the *connection*'s last-known
+  `local_addr`/`remote_addr` on every packet, rather than the specific
+  packet's own just-received `recvfrom()` address -- meaning ngtcp2
+  itself could never observe a path change in the first place,
+  regardless of what actually arrived on the wire. Fixed by feeding
+  the real, per-packet received addresses instead (a no-op in the
+  common, non-migrating case, where the two happen to be identical).
+  This alone was not sufficient, though: `magnus_quic_path_validation()`
+  (new; wired via `callbacks.path_validation`) initially observed every
+  attempted validation *failing*, traced -- via a from-scratch,
+  packet-level investigation (`tcpdump` on loopback, plus temporary
+  trace instrumentation on both ends, since removed) -- to
+  ngtcp2's own documented contract: "only client can initiate
+  migration". A client whose local socket changes without an explicit
+  `ngtcp2_conn_initiate_migration()` call has its *own* incoming data
+  on the new path silently decoded-but-discarded by ngtcp2 (no error,
+  no callback, no visible symptom beyond the response simply never
+  arriving) until it registers the change itself. `callbacks.
+  get_path_challenge_data` (already required and already wired since
+  4a) turned out to be all the *server* side ever needed -- no new
+  server callback beyond `path_validation` itself was required for the
+  reactive/passive server behavior this increment targets.
+
+  A new lifetime counter, `magnus_quic_migration_total` (`/metrics`,
+  the same shared `magnus_build_metrics()` every protocol already
+  reports through), increments once per successful path validation.
+  `tests/quic-handshake-check.c` gained a permanent `migrate` mode
+  (its own `submit_request()`/`run_event_loop()` helpers factored out
+  of what was previously inline-only-once code, so a second,
+  independent HTTP/3 request can be submitted and awaited after
+  rebinding to a fresh local UDP port and calling
+  `ngtcp2_conn_initiate_migration()` on the same connection) --
+  `tests/test-core.sh` gained a dedicated Phase 4l block using it: the
+  counter reads 0 against a fresh instance, and increases once a
+  migrated request completes, read back over HTTP/1.1 to prove it is
+  one shared counter, not a QUIC-only one -- the same proof shape 4k's
+  own block already established for its own counter.
+
+  Deliberately out of scope still: 0-RTT, and active/preferred-address
+  migration triggers a client might initiate for its own reasons other
+  than reacting to a changed local address -- this increment is
+  specifically the *server*'s own reactive/passive validation of
+  whatever path a client's packets are actually observed arriving
+  from, the RFC 9000 9.3 mechanism every server-side QUIC stack needs
+  regardless of why a client's address changed.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; the Docker image rebuilt against the pinned ngtcp2 v1.19.0 and
+  a live container tested directly (not just the host binary) --
+  `quic-handshake-check --migrate` completing a full post-migration
+  HTTP/3 request/response against the running container, with
+  `magnus_quic_migration_total` incrementing to confirm it. Size
+  unchanged in kind from 1.35.0 (no new runtime dependency).
+
 ## 1.35.0
 
 ### Added

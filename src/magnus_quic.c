@@ -352,6 +352,12 @@ static int magnus_quic_listener_fd = -1;
  * uses. Not reset by magnus_quic_shutdown() -- a lifetime total,
  * matching every other *_total counter magnus_build_metrics() reports. */
 static unsigned long long magnus_quic_retry_total_count;
+/* Roadmap 4l: incremented once per successful path validation --
+ * see magnus_quic_path_validation()'s own comment. Same shape as
+ * magnus_quic_retry_total_count immediately above (static counter +
+ * one-line getter, magnus_quic_migration_total() below, crossing into
+ * magnus_build_metrics() in magnus.c). */
+static unsigned long long magnus_quic_migration_total_count;
 
 /* --- small helpers ------------------------------------------------- */
 
@@ -746,6 +752,42 @@ magnus_quic_handshake_completed(ngtcp2_conn *conn, void *user_data)
         connection->handshake_logged = true;
         fprintf(stderr, "magnus: quic handshake confirmed\n");
     }
+    return 0;
+}
+
+/* Roadmap 4l: fires once ngtcp2 finishes validating a path -- in
+ * practice, for this server (which never initiates its own path
+ * validation, only reacts to one a client's own address change
+ * triggers), this means a client was observed sending from a new
+ * 4-tuple on an already-established connection (NAT rebinding, or a
+ * genuine client-side migration) and has now proven, via
+ * PATH_CHALLENGE/PATH_RESPONSE (RFC 9000 8.2/9.3), that it can
+ * actually receive traffic there -- the exact same address-ownership
+ * proof roadmap 4k's own Retry already requires of a brand new
+ * connection's very first path, just applied to a path change
+ * mid-connection instead. Counted, not acted on beyond that: ngtcp2
+ * itself already handles switching outbound traffic to a newly
+ * validated path (magnus_quic_flush()'s own writev_stream() call picks
+ * up wherever ngtcp2 currently considers the connection's live path to
+ * be, every time it is called -- see the read-path comment in
+ * magnus_quic_listener_service() this callback exists alongside). A
+ * failed/aborted validation is not counted -- the client simply never
+ * gets switched to that path, the same as if nothing had been
+ * attempted. */
+static int
+magnus_quic_path_validation(ngtcp2_conn *conn, uint32_t flags,
+                            const ngtcp2_path *path,
+                            const ngtcp2_path *fallback_path,
+                            ngtcp2_path_validation_result res,
+                            void *user_data)
+{
+    (void) conn;
+    (void) flags;
+    (void) path;
+    (void) fallback_path;
+    (void) user_data;
+    if (res == NGTCP2_PATH_VALIDATION_RESULT_SUCCESS)
+        magnus_quic_migration_total_count++;
     return 0;
 }
 
@@ -2831,6 +2873,16 @@ magnus_quic_retry_total(void)
     return magnus_quic_retry_total_count;
 }
 
+/* Roadmap 4l: magnus_build_metrics() (magnus.c) reads this to publish
+ * magnus_quic_migration_total -- see
+ * magnus_quic_migration_total_count's own comment for why a getter,
+ * not the counter itself, crosses the translation-unit boundary. */
+unsigned long long
+magnus_quic_migration_total(void)
+{
+    return magnus_quic_migration_total_count;
+}
+
 static int
 magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
                        socklen_t local_addrlen,
@@ -2929,6 +2981,7 @@ magnus_quic_accept_new(int listener_fd, const struct sockaddr *local_addr,
         ngtcp2_crypto_get_path_challenge_data_cb;
     callbacks.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
     callbacks.handshake_completed = magnus_quic_handshake_completed;
+    callbacks.path_validation = magnus_quic_path_validation;
 
     ngtcp2_settings_default(&settings);
     settings.initial_ts = magnus_quic_timestamp();
@@ -3127,10 +3180,38 @@ magnus_quic_listener_service(int listener_fd)
             ngtcp2_path path;
             int rv;
 
-            path.local.addr = (ngtcp2_sockaddr *) &connection->local_addr;
-            path.local.addrlen = connection->local_addrlen;
-            path.remote.addr = (ngtcp2_sockaddr *) &connection->remote_addr;
-            path.remote.addrlen = connection->remote_addrlen;
+            /* Roadmap 4l: the network path this *specific* packet
+             * actually arrived on -- this call's own local_addr/
+             * remote_addr from recvfrom() above, not
+             * connection->local_addr/remote_addr (only the path ngtcp2
+             * last confirmed valid). Before this fix, this was fed
+             * connection->local_addr/remote_addr right back here
+             * regardless of where the packet actually came from, which
+             * meant ngtcp2 could never even notice a path change --
+             * see magnus_quic_path_validation()'s own comment below,
+             * and src/magnus_quic.h's "connection migration" note.
+             * Feeding the true received path lets ngtcp2's own
+             * built-in server-side reactive path validation
+             * (PATH_CHALLENGE/PATH_RESPONSE, RFC 9000 9.3 -- the exact
+             * mechanism callbacks.get_path_challenge_data already sets
+             * up) detect and validate a NAT-rebound or migrated client
+             * on its own, including the anti-amplification byte-count
+             * limit RFC 9000 8 requires on an unvalidated path, which
+             * ngtcp2 also only enforces correctly when told the truth
+             * here. magnus_quic_flush()'s own writev_stream() call
+             * already writes each outgoing packet's *actual* path back
+             * into connection->local_addr/remote_addr as an output
+             * parameter (its own path.local/remote pointers alias that
+             * same storage), so a validated migration's new address is
+             * picked up there automatically -- no separate bookkeeping
+             * needed on the send side for this. In the common,
+             * non-migrating case (the client's own 4-tuple never
+             * changes) this is a no-op: the freshly received address
+             * is numerically identical to what was already stored. */
+            path.local.addr = (ngtcp2_sockaddr *) &local_addr;
+            path.local.addrlen = local_addrlen;
+            path.remote.addr = (ngtcp2_sockaddr *) &remote_addr;
+            path.remote.addrlen = remote_addrlen;
             path.user_data = NULL;
 
             rv = ngtcp2_conn_read_pkt(connection->conn, &path, NULL, buffer,
