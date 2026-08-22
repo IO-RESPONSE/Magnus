@@ -228,9 +228,16 @@ independently by IORESPONSE.
   table, GET/HEAD only, reusing the identical path-resolution/MIME
   logic the HTTP/1.1 and HTTP/2 static paths already use
   (`src/magnus_static.h`) so all three protocols agree on it by
-  construction; proxy dispatch and compression over HTTP/3 remain a
-  later increment -- see `src/magnus_quic.h`
-- Container image: 10,346,895 bytes (~9.87 MiB), non-root, read-only rootfs
+  construction
+- HTTP/3 `/healthz`/`/metrics` (roadmap Phase 4c): same
+  `magnus_build_metrics()` every protocol's `/metrics` reports from, so
+  none can drift into different numbers for the same process;
+  `/metrics` is withdrawn once `--admin-socket`/`admin_socket` is
+  configured -- same isolation boundary the main TCP listener already
+  applies -- while `/healthz` stays public. Proxy dispatch and
+  compression over HTTP/3 remain a later increment -- see
+  `src/magnus_quic.h`
+- Container image: 10,347,248 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

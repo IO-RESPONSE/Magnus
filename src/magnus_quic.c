@@ -110,6 +110,15 @@ typedef struct {
      * verified against (docs/phase4-spike-results.md) exactly. */
     void *mmap_base;
     size_t mmap_length;
+    /* /healthz and /metrics (roadmap 4c) reuse mmap_base/mmap_length as
+     * a generic "response body pointer + length" rather than adding a
+     * second pair of fields -- their body is a small malloc()ed copy
+     * (magnus_build_metrics() writes into a stack buffer that does not
+     * outlive the dispatch call, so it must be copied somewhere that
+     * does), not a file mapping, so this flag is what
+     * magnus_quic_http_stream_free() checks to call free() instead of
+     * munmap() on cleanup. */
+    bool body_is_malloc;
 } magnus_quic_stream_t;
 
 typedef struct {
@@ -215,7 +224,10 @@ magnus_quic_slot_alloc(void)
 static void
 magnus_quic_http_stream_free(magnus_quic_stream_t *stream)
 {
-    if (stream->mmap_base) munmap(stream->mmap_base, stream->mmap_length);
+    if (stream->mmap_base) {
+        if (stream->body_is_malloc) free(stream->mmap_base);
+        else munmap(stream->mmap_base, stream->mmap_length);
+    }
     free(stream);
 }
 
@@ -455,18 +467,19 @@ magnus_quic_handshake_completed(ngtcp2_conn *conn, void *user_data)
     return 0;
 }
 
-/* --- HTTP/3 (roadmap Phase 4b, see magnus_quic.h) ---------------------
+/* --- HTTP/3 (roadmap Phase 4b/4c, see magnus_quic.h) -------------------
  *
- * Scoped the same way HTTP/2's own first increment (roadmap 1e-1) was:
- * static-file GET/HEAD only. No proxy dispatch, no /healthz//metrics
- * over h3, no compression -- those are what nghttp2's own later
- * increments (1e-2, 1e-4) added on top of an identical starting point,
- * and h3 can follow the same path in its own later increments rather
+ * 4b scoped this the same way HTTP/2's own first increment (roadmap
+ * 1e-1) was: static-file GET/HEAD only. 4c adds /healthz and /metrics
+ * (roadmap 1e-4's own next increment on the h2 side) -- still no proxy
+ * dispatch or compression over h3, which is what 1e-2 added on the h2
+ * side and h3 can follow the same path for in a later increment rather
  * than trying to reach parity in one step. Reuses magnus.c's own
- * magnus_open_static()/magnus_content_type() (magnus_static.h) so both
- * protocols agree on path resolution/traversal safety and MIME typing
- * by construction, the same reasoning magnus_h2_dispatch_static()'s own
- * comment gives for doing the same on the h2 side. */
+ * magnus_open_static()/magnus_content_type()/magnus_build_metrics()
+ * (magnus_static.h) so every protocol agrees on path resolution/
+ * traversal safety, MIME typing, and metrics content by construction,
+ * the same reasoning magnus_h2_dispatch_static()'s own comment gives
+ * for doing the same on the h2 side. */
 
 static nghttp3_nv
 magnus_quic_nv(const char *name, const char *value)
@@ -500,22 +513,67 @@ magnus_quic_http_read_file(nghttp3_conn *conn, int64_t stream_id,
     (void) stream_id;
     (void) veccnt;
     (void) conn_user_data;
-    /* The whole file in one vec, EOF immediately -- see
-     * magnus_quic_stream_t's own comment on why this is mmap'd rather
-     * than read in chunks. A zero-length file is valid input (vec.len
-     * 0, base non-NULL) and nghttp3 handles it correctly as "no body". */
+    /* The whole body in one vec, EOF immediately -- whatever
+     * stream->mmap_base/mmap_length currently point at (a static
+     * file's mmap, roadmap 4b, or a /healthz//metrics malloc()ed copy,
+     * roadmap 4c -- magnus_quic_stream_t's own comment on
+     * body_is_malloc has the full story on why one pair of fields
+     * covers both). A zero-length body is valid input (vec.len 0, base
+     * non-NULL or NULL) and nghttp3 handles it correctly as "no body". */
     vec[0].base = stream->mmap_base;
     vec[0].len = stream->mmap_length;
     *pflags |= NGHTTP3_DATA_FLAG_EOF;
     return 1;
 }
 
-/* Serves stream->path as a static file -- called once a request's
- * headers and (if any) body have both been fully received (the
- * end_stream nghttp3 callback below), exactly the same trigger point
- * magnus_h2_dispatch()'s own non-early-response path uses. No request
- * body is ever read for GET/HEAD, so in practice this fires as soon as
- * headers finish for the only two methods this increment accepts. */
+/* /healthz and /metrics (roadmap 4c): `body` is copied into a malloc()ed
+ * buffer that outlives this call (unlike the caller's own stack buffer
+ * for /metrics -- magnus_build_metrics() writes into one that does not),
+ * reusing magnus_quic_http_read_file() as the data-reader exactly like
+ * the static-file path does, just over a copy instead of an mmap. */
+static void
+magnus_quic_http_submit_text(magnus_quic_connection_t *connection,
+                             magnus_quic_stream_t *stream, const char *status,
+                             const char *content_type, const char *body)
+{
+    size_t length = strlen(body);
+    char content_length[32];
+    nghttp3_nv headers[4];
+
+    snprintf(content_length, sizeof(content_length), "%zu", length);
+    headers[0] = magnus_quic_nv(":status", status);
+    headers[1] = magnus_quic_nv("server", "Magnus/" MAGNUS_VERSION);
+    headers[2] = magnus_quic_nv("content-type", content_type);
+    headers[3] = magnus_quic_nv("content-length", content_length);
+    if (stream->head_only) {
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers, 4,
+                                            NULL);
+        return;
+    }
+    if (length > 0) {
+        stream->mmap_base = malloc(length);
+        if (stream->mmap_base == NULL) {
+            magnus_quic_http_submit_status(connection, stream, "500");
+            return;
+        }
+        memcpy(stream->mmap_base, body, length);
+        stream->mmap_length = length;
+        stream->body_is_malloc = true;
+    }
+    {
+        nghttp3_data_reader reader = { .read_data = magnus_quic_http_read_file };
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers, 4,
+                                            &reader);
+    }
+}
+
+/* Serves stream->path as a static file -- the fallback once
+ * magnus_quic_http_dispatch() below has ruled out /healthz and
+ * /metrics. Method/head_only validation already happened there, same
+ * as magnus_h2_dispatch()'s own single validation pass ahead of its
+ * own healthz/metrics/static branches. */
 static void
 magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
                                  magnus_quic_stream_t *stream)
@@ -526,12 +584,6 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     nghttp3_nv headers[4];
     int fd;
 
-    stream->head_only = strcmp(stream->method, "HEAD") == 0;
-    if (stream->path[0] == '\0'
-        || (strcmp(stream->method, "GET") != 0 && !stream->head_only)) {
-        magnus_quic_http_submit_status(connection, stream, "400");
-        return;
-    }
     fd = magnus_open_static(stream->path, &metadata);
     if (fd < 0) {
         magnus_quic_http_submit_status(connection, stream, "404");
@@ -579,6 +631,52 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
                                             stream->stream_id, headers, 4,
                                             &reader);
     }
+}
+
+/* Entry point from the end_stream nghttp3 callback below, once a
+ * request's headers and (if any) body have both been fully received --
+ * exactly the same trigger point magnus_h2_dispatch()'s own non-early-
+ * response path uses. Method/path validation, then /healthz, then
+ * /metrics, then static -- literal "/healthz"/"/metrics" wins over a
+ * same-named file exactly like magnus_h2_dispatch()'s own comment
+ * documents for the h2 side. No request body is ever read for GET/
+ * HEAD, so in practice this fires as soon as headers finish for the
+ * only two methods this increment accepts. */
+static void
+magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
+                          magnus_quic_stream_t *stream)
+{
+    stream->head_only = strcmp(stream->method, "HEAD") == 0;
+    if (stream->path[0] == '\0'
+        || (strcmp(stream->method, "GET") != 0 && !stream->head_only)) {
+        magnus_quic_http_submit_status(connection, stream, "400");
+        return;
+    }
+    if (strcmp(stream->path, "/healthz") == 0) {
+        magnus_quic_http_submit_text(connection, stream, "200", "text/plain",
+                                     "magnus: ok\n");
+        return;
+    }
+    /* Withdrawn once --admin-socket/admin_socket is configured -- same
+     * access-control boundary the main TCP listener already applies
+     * (roadmap 1e-4), extended to the QUIC listener too. Falls through
+     * to the static-file path below when withdrawn, same as a request
+     * for any other path that happens not to exist. */
+    if (strcmp(stream->path, "/metrics") == 0 && !magnus_admin_enabled) {
+        /* Matches magnus.c's own MAGNUS_METRICS_BUFFER -- not shared
+         * via magnus_static.h because that constant's own sizing is
+         * coupled to magnus.c's unrelated MAGNUS_OUTPUT_LIMIT (see its
+         * own comment there); magnus_build_metrics() itself documents
+         * that any buffer at least this large truncates safely rather
+         * than overflows, so the two do not need to be the exact same
+         * named constant to stay correct. */
+        char metrics[16384];
+        magnus_build_metrics(metrics, sizeof(metrics));
+        magnus_quic_http_submit_text(connection, stream, "200",
+                                     "text/plain; version=0.0.4", metrics);
+        return;
+    }
+    magnus_quic_http_dispatch_static(connection, stream);
 }
 
 static int
@@ -699,7 +797,7 @@ magnus_quic_http_end_stream(nghttp3_conn *conn, int64_t stream_id,
     (void) conn;
     (void) stream_id;
     if (stream == NULL) return 0;
-    magnus_quic_http_dispatch_static(connection, stream);
+    magnus_quic_http_dispatch(connection, stream);
     return 0;
 }
 

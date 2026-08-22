@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.27.0
+
+### Added
+
+- **HTTP/3 `/healthz` and `/metrics` (roadmap Phase 4c): the same next
+  increment 1e-4 was on the HTTP/2 side, after 1e-1's own static-only
+  start -- built on 1.26.0's HTTP/3 static-file GET/HEAD.** Both reuse
+  the exact primitives HTTP/1.1 and HTTP/2 already share
+  (`magnus_build_metrics()`, now also declared non-`static` in
+  `src/magnus_static.h`): no protocol can drift into reporting
+  different numbers for the same process. `magnus_quic.c`'s request
+  dispatch gained one shared entry point
+  (`magnus_quic_http_dispatch()`) ahead of the 4b static-file path:
+  literal `/healthz`/`/metrics` win over a same-named file, matching
+  `magnus_h2_dispatch()`'s own documented precedence on the h2 side.
+- Admin channel isolation (roadmap 1e-4) now applies to the QUIC
+  listener too: once `--admin-socket`/`admin_socket` is configured,
+  `/metrics` over HTTP/3 is withdrawn (falls through to the static
+  path, 404s like any other nonexistent path) while `/healthz` stays
+  public -- the same access-control boundary the main TCP listener
+  already had, extended rather than left as a QUIC-specific gap.
+- `magnus_quic_stream_t`'s `mmap_base`/`mmap_length` fields (1.26.0's
+  own file-serving mechanism) are now reused generically as "response
+  body pointer + length" for `/healthz`/`/metrics`'s malloc()ed text
+  too, distinguished by a new `body_is_malloc` flag so
+  `magnus_quic_http_stream_free()` calls the right one of `free()`/
+  `munmap()` on cleanup -- one code path serves both kinds of response
+  body instead of a second, near-identical one.
+- `tests/test-core.sh`'s Phase 4 block gained real-content checks (not
+  just status) for `/healthz`/`/metrics` over HTTP/3, plus a dedicated
+  admin-isolation check (a second magnus instance with
+  `--admin-socket`, confirming `/metrics` 404s there while `/healthz`
+  still answers).
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean; a live HTTP/3 `/healthz`/`/metrics` request against the running
+container itself, not just the host binary): image size unchanged in
+kind from 1.26.0 (no new runtime dependency -- `/healthz`/`/metrics`
+reuse code already linked in).
+
 ## 1.26.0
 
 ### Added

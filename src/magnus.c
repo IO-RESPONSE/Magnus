@@ -1143,7 +1143,9 @@ static double magnus_latency_sum_ms;
  * the regular (TCP) listener entirely -- /healthz stays there too, since
  * that is what a load balancer on the public port needs to reach. */
 static int magnus_admin_listener = -1;
-static bool magnus_admin_enabled;
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c (HTTP/3 /metrics, roadmap Phase 4c) needs this. */
+bool magnus_admin_enabled;
 static char magnus_admin_socket_path[MAGNUS_CONFIG_PATH_MAX];
 
 /* Kept only so magnus_quic_init() (called once, at startup, after
@@ -1234,7 +1236,8 @@ static nghttp2_ssize magnus_h2_read_io_buffer(nghttp2_session *session,
                                               uint32_t *data_flags,
                                               nghttp2_data_source *source,
                                               void *user_data);
-static void magnus_build_metrics(char *out, size_t out_capacity);
+/* magnus_build_metrics() itself is declared non-static in
+ * magnus_static.h (included above) -- see that header's own comment. */
 static uint64_t magnus_now_ms(void);
 static int magnus_proxy_pick_and_start(int epoll_fd,
                                        magnus_connection_t *connection,
@@ -6766,10 +6769,11 @@ magnus_prepare_response(magnus_connection_t *connection, unsigned status,
 
 /* Renders the Prometheus text-exposition-format /metrics body into
  * `out` (an at-least-MAGNUS_METRICS_BUFFER-byte buffer), NUL-terminated.
- * Shared by both the HTTP/1.1 dispatch path below and the HTTP/2 one
- * (magnus_h2_dispatch_metrics(), roadmap 1e-4) so the two protocols
- * cannot drift into reporting different numbers for the same process. */
-static void
+ * Shared by the HTTP/1.1 dispatch path below, the HTTP/2 one (roadmap
+ * 1e-4), and the HTTP/3 one (magnus_quic.c, roadmap 4c -- declared
+ * non-static in magnus_static.h for exactly that reuse) so no protocol
+ * can drift into reporting different numbers for the same process. */
+void
 magnus_build_metrics(char *out, size_t out_capacity)
 {
     size_t written;

@@ -3935,12 +3935,13 @@ wait "$backend19_pid" 2>/dev/null || true
 backend19_pid=
 echo "udp: UDP passthrough (round_robin/stickiness/ip_hash/session-cap) ok"
 
-# Phase 4 (roadmap): a real ngtcp2 handshake, then a real HTTP/3
-# GET/404 against magnus's own QUIC listener's static-file dispatch
-# (4b), using the in-repo tests/quic-handshake-check.c client (see its
-# own file header, and docs/phase4-spike-results.md for the external-
-# reference-client verification this automated version followed up
-# on). No proxy/compression over h3 yet -- see src/magnus_quic.h.
+# Phase 4 (roadmap): a real ngtcp2 handshake, then real HTTP/3 requests
+# against magnus's own QUIC listener's static-file (4b) and /healthz//
+# /metrics (4c) dispatch, using the in-repo tests/quic-handshake-check.c
+# client (see its own file header, and docs/phase4-spike-results.md for
+# the external-reference-client verification this automated version
+# followed up on). No proxy dispatch or compression over h3 yet -- see
+# src/magnus_quic.h.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 1 -subj '/CN=localhost' \
   -keyout "$web_root/quic-server.key" -out "$web_root/quic-server.crt" \
@@ -3978,6 +3979,19 @@ printf '%s\n' "$quic_small_out" | tail -n +3 \
   /quic-large.txt | tail -n +3 | diff - "$web_root/quic-large.txt"
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
   /quic-does-not-exist.txt | grep -qE '^status: 404$'
+# Phase 4c: /healthz and /metrics, sharing magnus_build_metrics() with
+# the HTTP/1.1 and HTTP/2 paths (magnus_static.h) -- checked for real
+# content, not just status, so a future change that made this endpoint
+# return the *wrong* body without erroring would still fail here.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /healthz > "$web_root/quic-healthz-out"
+grep -qE '^status: 200$' "$web_root/quic-healthz-out"
+tail -n +3 "$web_root/quic-healthz-out" | grep -qE '^magnus: ok$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /metrics > "$web_root/quic-metrics-out"
+grep -qE '^status: 200$' "$web_root/quic-metrics-out"
+tail -n +3 "$web_root/quic-metrics-out" \
+  | grep -qE '^magnus_requests_total [0-9]+$'
 # A second, independent connection after the first's already been torn
 # down exercises the listener handling that cleanly, not just a
 # first-ever accept path.
@@ -3986,4 +4000,29 @@ printf '%s\n' "$quic_small_out" | tail -n +3 \
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static GET/404, byte-exact large payload ok (Phase 4b, see src/magnus_quic.h)"
+
+# Phase 4c: admin channel isolation extended to the QUIC listener, same
+# access-control boundary the main TCP listener already applies
+# (roadmap 1e-4) -- /metrics withdrawn (falls through to the static
+# path, 404s the same as any other nonexistent path), /healthz stays
+# public.
+port_quic_admin=$((port + 102))
+port_quic_admin_udp=$((port + 103))
+"$binary" --port "$port_quic_admin" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_admin_udp" \
+  --admin-socket "$web_root/quic-admin.sock" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_quic_admin/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_admin_udp" \
+  /metrics | grep -qE '^status: 404$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_admin_udp" \
+  /healthz | grep -qE '^status: 200$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, byte-exact large payload ok (Phase 4b/4c, see src/magnus_quic.h)"
