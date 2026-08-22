@@ -10,6 +10,7 @@
 #include "magnus_proxy.h"
 #include "magnus_quic.h"
 #include "magnus_realip.h"
+#include "magnus_static.h"
 #include "magnus_route.h"
 #include "magnus_sni.h"
 #include "magnus_ws.h"
@@ -39,7 +40,8 @@
 #include <openssl/ssl.h>
 #include <nghttp2/nghttp2.h>
 
-#define MAGNUS_VERSION "1.25.0"
+/* MAGNUS_VERSION itself now lives in magnus_quic.h (included below) --
+ * see that header's own comment on why. */
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
@@ -471,7 +473,10 @@ typedef struct {
 static volatile sig_atomic_t magnus_running = 1;
 static magnus_phase_engine_t magnus_phases;
 static magnus_connection_t *magnus_connections[MAGNUS_MAX_FDS];
-static int magnus_root_fd = -1;
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c (HTTP/3, roadmap Phase 4b) needs this and the two
+ * functions below it directly. */
+int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
 static magnus_cluster_t magnus_cluster;
 static bool magnus_upstream_enabled;
@@ -2849,7 +2854,7 @@ magnus_tls_handshake(int epoll_fd, magnus_connection_t *connection)
     return -1;
 }
 
-static const char *
+const char *
 magnus_content_type(const char *path)
 {
     const char *extension = strrchr(path, '.');
@@ -2902,7 +2907,7 @@ magnus_compress_static(int fd, const struct stat *metadata,
     return 1;
 }
 
-static int
+int
 magnus_open_static(const char *target, struct stat *metadata)
 {
     char path[256];

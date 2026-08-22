@@ -2,20 +2,20 @@ CC ?= cc
 CFLAGS ?= -O2 -pipe -std=c17 -Wall -Wextra -Werror -Wpedantic
 CPPFLAGS ?= -D_GNU_SOURCE -D_FORTIFY_SOURCE=2
 LDFLAGS ?= -Wl,-z,relro,-z,now
-# ngtcp2/ngtcp2_crypto_ossl (Phase 4a, roadmap): see
+# ngtcp2/ngtcp2_crypto_ossl/nghttp3 (Phase 4, roadmap): see
 # docs/phase4-http3-quic-dependency-evaluation.md for why this stack and
 # docs/phase4-spike-results.md for it verified working against this
-# host's OpenSSL. EPEL packages both for EL10; the Dockerfile's own
-# Debian 13 builder needs ngtcp2 built from source instead of its apt
-# package, since Debian's version (1.11.0) is below the >=1.12.0 floor
-# libngtcp2_crypto_ossl needs for OpenSSL 3.5+ -- see Dockerfile.
-# nghttp3 is deliberately NOT linked yet: 4a is transport-only (see
-# src/magnus_quic.h), no code calls into it, and Section 5's own
-# framework is "record a dependency when it's actually adopted, not
-# before" -- it lands here (and in Dockerfile/THIRD_PARTY_NOTICES.md)
-# in 4b, once HTTP/3 request handling actually uses it.
+# host's OpenSSL. EPEL packages ngtcp2/ngtcp2-crypto-ossl for EL10;
+# nghttp3 has no EL package and needs a source build. The Dockerfile's
+# own Debian 13 builder needs ngtcp2 built from source too (instead of
+# its apt package): Debian's version (1.11.0) is below the >=1.12.0
+# floor libngtcp2_crypto_ossl needs for OpenSSL 3.5+ -- see Dockerfile.
+# nghttp3 joined this list in 4b (HTTP/3 request/response, src/
+# magnus_quic.c) -- 4a linked nothing from it (confirmed via the
+# shipped binary's own dynamic dependency list), per Section 5's own
+# "record a dependency when it's actually adopted, not before" rule.
 LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lngtcp2 \
-          -lngtcp2_crypto_ossl
+          -lngtcp2_crypto_ossl -lnghttp3
 
 SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_compression.c \
@@ -207,14 +207,15 @@ build/fuzz-sni: tests/fuzz-sni.c src/magnus_sni.c src/magnus_sni.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-sni.c src/magnus_sni.c -o $@
 
-# Standalone QUIC client (Phase 4a regression coverage, tests/test-core.sh
-# drives it against a running magnus) -- not a unit test binary invoked
-# directly by the `test` target above, same reason the Python slowloris/
-# malformed-request helpers inside test-core.sh aren't either.
+# Standalone QUIC/HTTP-3 client (Phase 4 regression coverage,
+# tests/test-core.sh drives it against a running magnus) -- not a unit
+# test binary invoked directly by the `test` target above, same reason
+# the Python slowloris/malformed-request helpers inside test-core.sh
+# aren't either.
 build/quic-handshake-check: tests/quic-handshake-check.c
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/quic-handshake-check.c $(LDFLAGS) \
-		-lssl -lcrypto -lngtcp2 -lngtcp2_crypto_ossl -o $@
+		-lssl -lcrypto -lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -o $@
 
 clean:
 	rm -rf build

@@ -3935,15 +3935,28 @@ wait "$backend19_pid" 2>/dev/null || true
 backend19_pid=
 echo "udp: UDP passthrough (round_robin/stickiness/ip_hash/session-cap) ok"
 
-# Phase 4a (roadmap): a real ngtcp2 handshake against magnus's own QUIC
-# listener, using the in-repo tests/quic-handshake-check.c client (see
-# its own file header, and docs/phase4-spike-results.md for the
-# external-reference-client verification this automated version
-# followed up on). No HTTP/3 request/response yet -- see src/magnus_quic.h.
+# Phase 4 (roadmap): a real ngtcp2 handshake, then a real HTTP/3
+# GET/404 against magnus's own QUIC listener's static-file dispatch
+# (4b), using the in-repo tests/quic-handshake-check.c client (see its
+# own file header, and docs/phase4-spike-results.md for the external-
+# reference-client verification this automated version followed up
+# on). No proxy/compression over h3 yet -- see src/magnus_quic.h.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 1 -subj '/CN=localhost' \
   -keyout "$web_root/quic-server.key" -out "$web_root/quic-server.crt" \
   2>>"$log"
+printf '%s\n' 'magnus quic static file' >"$web_root/quic-hello.txt"
+# Position-dependent content, not a repeated byte -- this is the exact
+# shape that caught a real bug the hard way (magnus_quic.c's own
+# magnus_quic_stream_t comment): a chunked read_data callback let bytes
+# get silently skipped/reordered while the total length stayed correct,
+# which a same-byte-repeated fixture could never have caught since any
+# reordering of identical bytes is indistinguishable. seq 1 5000 is
+# ~150 KB, comfortably more than one packet and more than
+# src/magnus_quic.c's own former per-chunk buffer size was.
+for line_number in $(seq 1 5000); do
+  printf 'line-%05d-abcdefghijklmnopqrstuvwxyz\n' "$line_number"
+done >"$web_root/quic-large.txt"
 port_quic=$((port + 100))
 port_quic_udp=$((port + 101))
 "$binary" --port "$port_quic" --root "$web_root" \
@@ -3954,14 +3967,23 @@ for attempt in 1 2 3 4 5; do
   curl --fail --silent "http://127.0.0.1:$port_quic/healthz" >/dev/null && break
   sleep 1
 done
-# Twice: the second run exercises the listener handling a second,
-# independent connection cleanly after the first one's already been
-# torn down, not just a first-ever accept path.
+quic_small_out=$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_udp" /quic-hello.txt)
+printf '%s\n' "$quic_small_out" | grep -qE '^status: 200$'
+printf '%s\n' "$quic_small_out" | tail -n +3 \
+  | diff - "$web_root/quic-hello.txt"
+# The large-file, byte-exact regression check for the bug described
+# above.
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
-  | grep -qE '^quic-handshake-check: ok$'
+  /quic-large.txt | tail -n +3 | diff - "$web_root/quic-large.txt"
 "$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
-  | grep -qE '^quic-handshake-check: ok$'
+  /quic-does-not-exist.txt | grep -qE '^status: 404$'
+# A second, independent connection after the first's already been torn
+# down exercises the listener handling that cleanly, not just a
+# first-ever accept path.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-hello.txt | grep -qE '^status: 200$'
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake ok (Phase 4a -- transport only, see src/magnus_quic.h)"
+echo "quic: handshake + HTTP/3 static GET/404, byte-exact large payload ok (Phase 4b, see src/magnus_quic.h)"

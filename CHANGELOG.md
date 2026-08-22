@@ -1,5 +1,85 @@
 # Changelog
 
+## 1.26.0
+
+### Added
+
+- **HTTP/3 static-file GET/HEAD (roadmap Phase 4b): nghttp3 wired
+  directly on top of the Phase 4a QUIC transport, scoped the same way
+  HTTP/2's own first increment (roadmap 1e-1) was -- static files only,
+  no proxy dispatch or compression over h3 yet.** Once a server's own
+  1-RTT TX key is available (`ngtcp2_callbacks.recv_tx_key`, the
+  earliest point 1-RTT application data can go out), `magnus_quic.c`
+  now builds an `nghttp3_conn`, opens the three control/QPACK
+  unidirectional streams RFC 9114 6.2 requires, and accepts client
+  request (bidirectional) streams up to a new
+  `MAGNUS_QUIC_MAX_BIDI_STREAMS` (100, matching this codebase's
+  existing informal h2 concurrency sizing). A request's `:method`/
+  `:path` drive `magnus_open_static()`/`magnus_content_type()` --
+  exposed non-`static` from `magnus.c` via new `src/magnus_static.h`
+  for exactly this reuse, so HTTP/1.1, HTTP/2, and now HTTP/3 all agree
+  on path-resolution/traversal-safety and MIME typing by construction
+  rather than each maintaining their own copy.
+- `tests/quic-handshake-check.c` (Phase 4a's handshake-only client)
+  gained a client-side HTTP/3 stack of its own: given a third argument,
+  it now issues one real GET and prints the response status/body,
+  driving `tests/test-core.sh`'s new Phase 4b block (200/404, and a
+  ~150 KB byte-exact download -- see "Fixed" below for exactly what
+  that download-size test is a regression guard for).
+
+### Fixed (found during this increment's own verification, not by review)
+
+- A first version of the static-file response body used a fixed-size
+  buffer refilled via `pread()` inside the `nghttp3_read_data_callback`,
+  advancing the file offset on every call. `nghttp3_conn_writev_stream()`
+  can legitimately call that callback again for the same stream before
+  a previously-returned chunk has actually finished being written onto
+  the wire (observed directly: a second call arrived having only
+  flushed 645 of a first 16384-byte chunk) -- since the callback had no
+  way to know how much of what it last returned was actually consumed,
+  this silently skipped/reordered response bytes while the total
+  Content-Length stayed correct (same length, wrong content -- a
+  same-repeated-byte test fixture could never have caught this, which
+  is why the new automated regression test above uses position-dependent
+  content instead). Fixed by `mmap()`-ing the whole file once at
+  dispatch and handing nghttp3 the same immutable mapping every time,
+  regardless of how many times or in what order it's asked for --
+  matching the reference implementation's own static-file path
+  (docs/phase4-spike-results.md) exactly, and sidestepping the
+  "how much did you actually send" question entirely rather than
+  tracking it by hand.
+- The per-stream `magnus_quic_stream_t` struct was never freed on a
+  stream's normal completion (only a whole-connection error-path
+  sweep freed any that were still around) -- a real per-request memory
+  leak under ordinary, successful traffic. Fixed by freeing it from the
+  ngtcp2-level `stream_close` callback too, once nghttp3's own
+  `close_stream` call for that stream returns.
+- The Docker image build failed against Debian 13's own pinned nghttp3
+  release (v1.9.0, the latest actual tag -- nghttp3 versions its own
+  releases independently of, and behind, ngtcp2's): two APIs the first
+  version of this code used
+  (`nghttp3_conn_get_stream_user_data`, `nghttp3_callbacks.rand`) do not
+  exist in that release, only in the newer development snapshot the
+  EPEL-packaged development-host build happened to resolve. Fixed by
+  using the *ngtcp2*-level per-stream user-data association instead
+  (`ngtcp2_conn_set_stream_user_data`/`ngtcp2_conn_get_stream_user_data`,
+  stable since ngtcp2 v1.17.0, well below this project's own v1.19.0
+  pin) and simply not setting `.rand` at all, which nghttp3's own docs
+  describe as "optional due to backward compatibility" -- both fixes
+  are correct on every nghttp3 version this project builds against, not
+  version-specific workarounds. Found by the image build itself
+  failing, not by reading changelogs first.
+
+### Known gaps (Phase 4b's own deliberately narrow scope, see
+`src/magnus_quic.h`)
+
+- No proxy dispatch, `/healthz`/`/metrics`, or compression over HTTP/3
+  -- static GET/HEAD only, the same scope 1e-1 had for HTTP/2 before
+  1e-2/1e-4 extended it.
+- No request body handling (a GET/HEAD request is never expected to
+  carry one; a request that does is not specifically rejected, just
+  never read).
+
 ## 1.25.0
 
 ### Added

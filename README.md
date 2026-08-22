@@ -222,9 +222,15 @@ independently by IORESPONSE.
   `libngtcp2_crypto_ossl`, terminating TLS 1.3 with the same
   certificate/key the HTTPS listener uses) integrated into Magnus's own
   epoll reactor rather than a bundled event loop; ALPN negotiates `h3`
-  so a real client's handshake completes normally, but there is no
-  HTTP/3 request/response layer yet -- see `src/magnus_quic.h`
-- Container image: 10,067,919 bytes (~9.60 MiB), non-root, read-only rootfs
+  so a real client's handshake completes normally
+- HTTP/3 static-file serving (roadmap Phase 4b, on top of the QUIC
+  transport above): nghttp3 wired directly into the same connection
+  table, GET/HEAD only, reusing the identical path-resolution/MIME
+  logic the HTTP/1.1 and HTTP/2 static paths already use
+  (`src/magnus_static.h`) so all three protocols agree on it by
+  construction; proxy dispatch and compression over HTTP/3 remain a
+  later increment -- see `src/magnus_quic.h`
+- Container image: 10,346,895 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

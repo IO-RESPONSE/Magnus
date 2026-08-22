@@ -32,8 +32,15 @@ distributions:
   (`libngtcp2`, `libngtcp2_crypto_ossl`) -- see
   `docs/phase4-http3-quic-dependency-evaluation.md` for why this stack was
   chosen and `docs/phase4-spike-results.md` for it verified working.
-  Transport-only in this release (roadmap Phase 4a, see `src/magnus_quic.h`);
-  no HTTP/3 request handling yet.
+
+## nghttp3
+
+- Upstream: https://github.com/ngtcp2/nghttp3
+- License: MIT License
+- Used for: HTTP/3 framing and QPACK (RFC 9114) over the QUIC transport
+  above (`libnghttp3`) -- static-file GET/HEAD only in this release
+  (roadmap Phase 4b, see `src/magnus_quic.h`); no proxy dispatch or
+  compression over HTTP/3 yet.
 
 Each component's upstream license and copyright notice must be preserved
 unchanged in every distribution that bundles the corresponding library.

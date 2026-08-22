@@ -919,11 +919,14 @@ connection-pool and common-request-model decisions).
   `docs/phase4-http3-quic-dependency-evaluation.md` (ngtcp2 + nghttp3
   chosen) and `docs/phase4-spike-results.md` (standalone verification
   against a real OpenSSL 3.5 before any of it touched `magnus.c`).
-  **4a (transport/handshake only) shipped in 1.25.0** — see
-  `CHANGELOG.md` 1.25.0 and `src/magnus_quic.h` for the exact scope and
-  what's deliberately still missing (no HTTP/3 request handling, no
-  retry-based address validation, no migration, no 0-RTT). 4b (nghttp3,
-  actual HTTP/3 request/response) is next, not started.
+  **4a (transport/handshake only) shipped in 1.25.0, 4b (HTTP/3
+  static-file GET/HEAD) shipped in 1.26.0** — see `CHANGELOG.md` 1.25.0/
+  1.26.0 and `src/magnus_quic.h` for the exact scope and what's
+  deliberately still missing (no proxy dispatch or compression over
+  HTTP/3, no retry-based address validation, no migration, no 0-RTT).
+  A later increment extends HTTP/3 to proxy dispatch and
+  `/healthz`/`/metrics`, the same way 1e-2/1e-4 extended HTTP/2 past
+  its own static-only 1e-1 start; not started.
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and
