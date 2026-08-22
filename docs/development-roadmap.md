@@ -921,13 +921,18 @@ connection-pool and common-request-model decisions).
   against a real OpenSSL 3.5 before any of it touched `magnus.c`).
   **4a (transport/handshake only) shipped in 1.25.0, 4b (HTTP/3
   static-file GET/HEAD) in 1.26.0, 4c (HTTP/3 `/healthz`/`/metrics`,
-  admin isolation extended to the QUIC listener) in 1.27.0** — see
-  `CHANGELOG.md` 1.25.0/1.26.0/1.27.0 and `src/magnus_quic.h` for the
-  exact scope and what's deliberately still missing (no proxy dispatch
-  or compression over HTTP/3, no retry-based address validation, no
-  migration, no 0-RTT). A later increment extends HTTP/3 to proxy
-  dispatch, the same way 1e-2 extended HTTP/2 past its own 1e-1/1e-4
-  start; not started.
+  admin isolation extended to the QUIC listener) in 1.27.0, 4d (HTTP/3
+  `"/proxy"` dispatch to a real HTTP/1.1 upstream, reusing the same
+  cluster/passive-health and response-sanitization primitives HTTP/1.1
+  and HTTP/2 already share) in 1.28.0** — see `CHANGELOG.md`
+  1.25.0/1.26.0/1.27.0/1.28.0 and `src/magnus_quic.h` for the exact
+  scope and what's deliberately still missing (compression over
+  HTTP/3; the `route` table's own host/path-prefix/header/cookie/
+  query/source-CIDR matching, retry-on-connect-failure, connection
+  pooling, session affinity, and response caching for HTTP/3 proxy
+  dispatch specifically, the same way 1e-2 extended HTTP/2 past its own
+  1e-1/1e-4 start; no retry-based address validation, no migration, no
+  0-RTT at the transport level).
 - **Phase 5 — FastCGI/SCGI/uWSGI, Runtime API expansion, zero-downtime
   binary upgrade.** The upgrade mechanism (inherited listener FD hand-off,
   old-process drain) touches `magnusd`'s supervision model directly and

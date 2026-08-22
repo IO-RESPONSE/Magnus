@@ -1,5 +1,119 @@
 # Changelog
 
+## 1.28.0
+
+### Added
+
+- **HTTP/3 `"/proxy"` dispatch to a real HTTP/1.1 upstream (roadmap
+  Phase 4d): the same next increment 2a was on the HTTP/2 side, after
+  4a-4c's own transport/static-file/healthz-metrics build-up.** A new
+  "HTTP/3 proxy dispatch" section in `src/magnus_quic.c` builds the
+  outbound HTTP/1.1 request (the literal `"/proxy"` prefix stripped,
+  matching `magnus_proxy_pick_and_start()`'s own documented contract
+  for h1/h2 exactly, with one deliberate small improvement: a bare
+  `/proxy` request forwards `"/"` rather than importing that precedent's
+  own empty-request-target edge case unchanged), selects a cluster
+  endpoint via the existing `magnus_cluster_select()`/`magnus_cluster_result()`
+  passive-health machinery (`src/magnus_policy.h`, shared with h1/h2),
+  connects non-blocking, relays the response headers through the
+  existing shared `magnus_proxy_sanitize_response_headers()`
+  (`src/magnus_proxy.h`, also shared with h1/h2), and streams the body
+  back over HTTP/3 with `nghttp3`'s pull-model `read_data` callback.
+  502 on connect failure or a malformed/oversized upstream response,
+  504 on a read timeout, an abrupt stream reset if the failure happens
+  after headers were already submitted (no fresh status code is
+  possible by then) -- the same three-way error shape h1/h2 already
+  use. `magnus_static.h` gained `magnus_endpoint_sockaddr()` and
+  `magnus_global_epoll_fd` (the epoll instance every fd in this
+  process, including a QUIC proxy stream's own upstream fd despite the
+  QUIC connection itself having no fd, is registered against) for this
+  reuse; `magnus.c`'s main epoll loop gained one new dispatch check
+  (`magnus_quic_handle_upstream_event()`) ahead of its existing
+  `magnus_connections[fd]` fallback.
+- `tests/test-core.sh`'s Phase 4 block gained a dedicated proxy-dispatch
+  section: GET through to a real backend (small and a ~130 KB/5000-line
+  byte-exact streamed response -- see "Fixed" below for exactly what
+  that download is a regression guard for), the backend's own 404
+  relayed through unmodified, and a clean 502 (plus the
+  `magnus_upstream_healthy` passive-health signal it feeds) once the
+  backend is killed outright.
+
+### Fixed (found during this increment's own verification, not by review)
+
+- **Response-body memory corruption under real QUIC flow control** --
+  the same *class* of bug 1.26.0's own "Fixed" section already
+  describes for the static-file path, but reintroduced here in a new
+  form because nghttp3's `read_data` callback has a stricter contract
+  than it first appears: per its own documentation, memory handed back
+  through a `nghttp3_vec` must stay valid until `nghttp3_acked_stream_data`
+  confirms the *peer* has acknowledged it -- not merely until
+  `ngtcp2_conn_writev_stream()` has copied it into an outgoing packet.
+  The first version of `magnus_quic_proxy_read_body()` reused a single
+  `stream->body_buffer` (refilled from the upstream socket only once
+  nghttp3 had "consumed" it), the same shape as
+  `magnus_h2_read_io_buffer`'s own safe-for-nghttp2 pattern -- safe
+  there because nghttp2's `read_callback` copies bytes out of the
+  buffer synchronously within the same call, but wrong here: under
+  `NGTCP2_ERR_STREAM_DATA_BLOCKED` (QUIC-level per-stream flow
+  control), `magnus_quic_flush()`'s own loop can return having only
+  partially transmitted -- or not transmitted at all -- a chunk nghttp3
+  still holds a reference to for eventual retransmission, while the
+  proxy code had already gone on to overwrite that same memory with a
+  fresh `recv()`. Reproduced directly (both by hand and by the new
+  automated test above): two response lines spliced together
+  mid-word, same total byte count as expected but scrambled content --
+  the exact same "same length, wrong content" signature 1.26.0's own
+  bug had, in a different code path, which is why the new regression
+  test above uses the same position-dependent-content trick that one
+  did. Fixed by replacing the single reused buffer with one fresh
+  `malloc()`ed chunk in flight at a time
+  (`stream->body_chunk`/`body_chunk_length`/`body_chunk_offered`),
+  freed only once `nghttp3_acked_stream_data` reports the currently
+  in-flight chunk's end offset has actually been acknowledged.
+- **A killed upstream correctly produced its 502, but never actually
+  degraded `/metrics`' own `magnus_upstream_healthy`.** Found by the
+  same automated test's own final assertion, immediately after the bug
+  above was fixed. Root cause: `magnus_quic_proxy_start()`'s
+  synchronous-`connect()`-failed branch was the *only* place in the
+  new proxy code calling `magnus_cluster_result(..., false, ...)` --
+  but a `connect()` to a genuinely closed local port almost always
+  returns `EINPROGRESS`, not an immediate error, so the far more common
+  case in practice is the *asynchronous* failure detected later via
+  `getsockopt(SO_ERROR)` once epoll reports the fd writable, and that
+  path (`magnus_quic_proxy_handle_upstream()`, and every other
+  pre-header failure funneled through the shared `magnus_quic_proxy_fail()`
+  helper) never recorded a passive-health failure at all -- unlike h1's
+  own `magnus_proxy_connect_failed()`, which centralizes exactly this
+  so every failure site gets it "for free." Fixed by moving the
+  `magnus_cluster_result(..., false, ...)` call into
+  `magnus_quic_proxy_fail()` itself, matching that h1 precedent.
+- The new proxy-dispatch test block's own backend fixture didn't answer
+  `GET /` with 200, so `magnus`'s own periodic active health check
+  (`magnus_health_tick()`, default probe path `/`) intermittently
+  raced the test's explicit backend-kill/502 sequence: whichever
+  active-check tick happened to land while the backend was still up
+  but before the deliberate kill could itself spuriously flip the
+  endpoint unhealthy for a full cooldown window, depending on exactly
+  when it fired relative to the test's own requests -- a ~30% flake
+  rate reproduced directly by looping the test block. Fixed by giving
+  the fixture a `/` handler too, so only the test's own deliberate
+  failure ever counts.
+
+Image rebuilt and verified end-to-end (make test, make sanitize both
+clean -- including no leaked `body_chunk` allocations under ASan; a
+live HTTP/3 proxy GET/404/502 round trip, byte-exact large-payload
+transfer, and passive-health-degradation check against the running
+container itself, not just the host binary): image size unchanged in
+kind from 1.27.0 (no new runtime dependency -- proxy dispatch reuses
+`libngtcp2`/`libnghttp3` already linked in, plus the same
+`magnus_proxy.c`/`magnus_policy.c` h1/h2 already use).
+
+Deliberately still not here (each its own future increment): the
+`route` table's own host/path-prefix/header/cookie/query/source-CIDR
+matching, retry-on-connect-failure, upstream connection pooling,
+session affinity, and response caching for HTTP/3 proxy dispatch --
+see `src/magnus_quic.h`'s own top comment for the full list.
+
 ## 1.27.0
 
 ### Added

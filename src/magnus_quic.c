@@ -1,5 +1,6 @@
 #include "magnus_quic.h"
 #include "magnus_static.h"
+#include "magnus_proxy.h"
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -11,12 +12,15 @@
 #include <openssl/ssl.h>
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -58,6 +62,32 @@
  * concurrency the same informal way for now). */
 #define MAGNUS_QUIC_MAX_BIDI_STREAMS 100
 
+/* Proxy dispatch (roadmap 4d) -- deliberately independent of magnus.c's
+ * own MAGNUS_PROXY_BUFFER/MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/
+ * MAGNUS_PROXY_READ_TIMEOUT_SECONDS, same reasoning as
+ * MAGNUS_METRICS_BUFFER's own local redefinition: these need to be
+ * *reasonable*, not byte-for-byte identical to the h1/h2 path's own
+ * constants, to stay correct. Values matched anyway, since there is no
+ * reason for this increment's defaults to differ from the rest of the
+ * codebase's. */
+#define MAGNUS_QUIC_PROXY_BUFFER 16384
+#define MAGNUS_QUIC_PROXY_HEADER_LIMIT MAGNUS_QUIC_PROXY_BUFFER
+#define MAGNUS_QUIC_PROXY_SANITIZED_LIMIT 4096
+#define MAGNUS_QUIC_PROXY_CONNECT_TIMEOUT_SECONDS 5
+#define MAGNUS_QUIC_PROXY_READ_TIMEOUT_SECONDS 10
+/* Bounded, linear-scan table (see this file's own top comment on why
+ * that style, same as everywhere else here) mapping an upstream
+ * connection's own fd to the magnus_quic_stream_t that owns it --
+ * needed because, unlike every *client*-facing QUIC stream (which lives
+ * entirely inside ngtcp2/nghttp3's own per-connection state), a proxy
+ * dispatch's upstream leg is an ordinary TCP fd that must be registered
+ * on magnus.c's shared epoll instance (magnus_global_epoll_fd, src/
+ * magnus_static.h) to ever be serviced at all -- a QUIC connection has
+ * no fd of its own for that epoll registration to piggyback on (see
+ * magnus_quic.h's own top comment). Sized to match magnus.c's own
+ * MAGNUS_MAX_FDS so every fd this process could ever open has a slot. */
+#define MAGNUS_QUIC_MAX_FDS 65536
+
 typedef struct {
     bool in_use;
     ngtcp2_conn *conn;
@@ -90,6 +120,7 @@ typedef struct {
     int64_t stream_id;
     char method[8];
     char path[256];
+    char authority[256];
     bool head_only;
     /* The whole file, mmap()ed once at dispatch and handed to nghttp3
      * as a single vec (magnus_quic_http_read_file()) rather than
@@ -119,6 +150,83 @@ typedef struct {
      * magnus_quic_http_stream_free() checks to call free() instead of
      * munmap() on cleanup. */
     bool body_is_malloc;
+    /* Proxy dispatch (roadmap 4d) -- see magnus_quic.h's own scope note
+     * for what is deliberately not here yet: retry on connect failure,
+     * upstream connection pooling/reuse, session affinity, response
+     * caching. A single attempt against one selected endpoint, a fresh
+     * connection every time. */
+    bool is_proxy;
+    int upstream_fd;
+    bool upstream_connected;
+    size_t endpoint_index;
+    bool cluster_endpoint_counted;
+    time_t connect_started;
+    time_t last_activity;
+    char *proxy_request;
+    size_t proxy_request_length;
+    size_t proxy_request_sent;
+    bool upstream_headers_sent;
+    /* Accumulates the upstream's raw status-line+header block (may
+     * arrive split across several recv() calls) until the terminating
+     * blank line is found -- separate from the body-streaming buffer
+     * below because the two have different growth/backpressure needs
+     * (this one only ever needs to hold up to MAGNUS_QUIC_PROXY_HEADER_LIMIT
+     * once, the body buffer refills indefinitely). */
+    char *header_buffer;
+    size_t header_accum;
+    bool headers_received;
+    bool response_headers_submitted;
+    bool has_response_length;
+    size_t response_length;
+    size_t response_received;
+    bool upstream_poolable; /* computed, but never acted on in this
+                             * increment -- no pool to check into (see
+                             * this struct's own top comment) -- kept so
+                             * a later increment adding pooling has
+                             * nothing to change here. */
+    bool upstream_eof;
+    bool response_complete;
+    /* One chunk in flight at a time -- NOT the same shape as
+     * magnus_h2_read_io_buffer()'s single reused buffer, and
+     * deliberately so: found the hard way, not by review, that
+     * reusing one buffer here corrupts a real proxied response under
+     * real QUIC flow-control backpressure. nghttp3's own documented
+     * contract for nghttp3_read_data_callback is stricter than
+     * nghttp2's: the memory a read_data call hands off "must [stay
+     * retained] until they are safe to free... notified by
+     * nghttp3_acked_stream_data" -- i.e. until the *peer has
+     * acknowledged* that stream data, not merely until
+     * ngtcp2_conn_writev_stream() has copied it into a packet (nghttp2's
+     * own read_callback model guarantees that synchronously within one
+     * call; nghttp3's does not, since ngtcp2 itself may hold onto the
+     * exact vec pointer for retransmission until acked). Marking a
+     * chunk "safe to reuse" the moment read_data merely *handed it to
+     * nghttp3* (this file's own first version) let
+     * magnus_quic_proxy_stream_response() overwrite it with fresh
+     * recv() bytes while ngtcp2 could still be holding it unacked under
+     * flow control -- reproduced directly with a 220 KB streamed
+     * response through a small stream flow-control window: two lines
+     * spliced together mid-word, total length still correct. Each
+     * recv() now gets its own fresh allocation instead of reusing one
+     * buffer, freed only once magnus_quic_proxy_acked() below confirms
+     * the peer has actually acknowledged it -- the same "just don't
+     * reuse memory before its real lifetime ends" fix roadmap 4b's own
+     * mmap change made for the static-file path, adapted here for
+     * memory that (unlike an mmap'd file) genuinely does need to be
+     * freed once, not held for the whole stream's life. */
+    uint8_t *body_chunk;
+    size_t body_chunk_length;
+    bool body_chunk_offered;
+    uint64_t body_chunk_end_offset;
+    uint64_t body_offered_total;
+    uint64_t body_acked_total;
+    /* True after magnus_quic_proxy_read_body() last returned
+     * NGHTTP3_ERR_WOULDBLOCK (nothing buffered, response not complete
+     * yet) -- magnus_quic_proxy_stream_response() calls
+     * nghttp3_conn_resume_stream() the next time it actually offers a
+     * new chunk, exactly once per such wait, per nghttp3's own
+     * documented contract for that error code. */
+    bool nghttp3_wants_resume;
 } magnus_quic_stream_t;
 
 typedef struct {
@@ -133,6 +241,16 @@ static magnus_quic_cid_entry_t magnus_quic_cids[MAGNUS_QUIC_MAX_CIDS];
 static SSL_CTX *magnus_quic_ssl_ctx;
 static uint8_t magnus_quic_static_secret[32];
 static bool magnus_quic_initialized;
+/* Indexed by fd -- see MAGNUS_QUIC_MAX_FDS's own comment. Each entry's
+ * magnus_quic_connection_t* lets an upstream fd event find its way back
+ * to the QUIC connection whose flush()/writev_stream() calls actually
+ * push the response onward, without needing a reverse map from stream
+ * back to connection (magnus_quic_stream_t itself carries none). */
+static magnus_quic_stream_t *magnus_quic_upstream_owner[MAGNUS_QUIC_MAX_FDS];
+static magnus_quic_connection_t *magnus_quic_upstream_connection[MAGNUS_QUIC_MAX_FDS];
+/* See magnus_quic_create_listener()'s own comment on why this is
+ * cached rather than threaded through as a parameter everywhere. */
+static int magnus_quic_listener_fd = -1;
 
 /* --- small helpers ------------------------------------------------- */
 
@@ -149,6 +267,22 @@ magnus_quic_timestamp(void)
      * timers are exactly the class of bug this avoids). */
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ngtcp2_tstamp) ts.tv_sec * NGTCP2_SECONDS + (ngtcp2_tstamp) ts.tv_nsec;
+}
+
+/* A millisecond-resolution monotonic clock reading, same source and
+ * shape as magnus.c's own (`static`) magnus_now_ms() -- kept as a
+ * separate, un-exported local helper rather than one more symbol
+ * threaded across src/magnus_static.h, since magnus_cluster_select()/
+ * magnus_cluster_result() (roadmap 4d) only need *a* reasonable
+ * monotonic ms clock, not the identical one magnus.c's own proxy path
+ * happens to use -- same reasoning as MAGNUS_METRICS_BUFFER's own
+ * local redefinition. */
+static uint64_t
+magnus_now_ms_local(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
 }
 
 static int
@@ -214,6 +348,14 @@ magnus_quic_slot_alloc(void)
     return -1;
 }
 
+/* Forward declarations -- both defined with the rest of proxy dispatch
+ * (roadmap 4d) further down; magnus_quic_http_stream_free() and
+ * magnus_quic_tick() below both need one ahead of that point in file
+ * order. */
+static void magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream);
+static void magnus_quic_proxy_tick(time_t now);
+static void magnus_quic_flush(int listener_fd, int slot);
+
 /* Unmaps whatever magnus_quic_http_dispatch_static() mapped (if
  * anything -- a HEAD request or a zero-length file never map one) and
  * frees `stream` itself. The one place both the normal-completion path
@@ -228,6 +370,19 @@ magnus_quic_http_stream_free(magnus_quic_stream_t *stream)
         if (stream->body_is_malloc) free(stream->mmap_base);
         else munmap(stream->mmap_base, stream->mmap_length);
     }
+    /* Proxy dispatch (roadmap 4d): declared further down (defined after
+     * this function in file order -- forward-declared here rather than
+     * reordering every proxy function ahead of every static-file/
+     * healthz/metrics one just to satisfy single-pass compilation).
+     * A stream freed here mid-flight (client aborted, or the whole
+     * connection is tearing down -- see magnus_quic_stream_close()'s
+     * and magnus_quic_slot_free()'s own comments on the two paths that
+     * reach this function) still needs its upstream leg, if any, torn
+     * down the same as a clean completion would have. */
+    if (stream->is_proxy) magnus_quic_proxy_teardown_upstream(stream);
+    free(stream->header_buffer);
+    free(stream->body_chunk);
+    free(stream->proxy_request);
     free(stream);
 }
 
@@ -569,6 +724,621 @@ magnus_quic_http_submit_text(magnus_quic_connection_t *connection,
     }
 }
 
+/* --- HTTP/3 proxy dispatch (roadmap Phase 4d) --------------------------
+ *
+ * A literal "/proxy" path prefix relayed to the same plain
+ * magnus_cluster every HTTP/1.1 and HTTP/2 "/proxy" request already
+ * uses (src/magnus_static.h), translated into an HTTP/1.1 request and
+ * back via magnus_proxy_sanitize_response_headers() -- the exact same
+ * hop-by-hop-stripping/framing logic every other protocol's own proxy
+ * path already shares, so no protocol can drift into forwarding a
+ * response differently from the others.
+ *
+ * Deliberately its own narrower first increment, the same "narrow the
+ * first cut, extend later" call every other new protocol surface in
+ * this codebase has made (Phase 1e's own HTTP/2 work, Phase 3's L4
+ * work, and 4a/4b/4c immediately before this): a single attempt against
+ * one selected endpoint (no retry budget), a fresh connection every
+ * time (no magnus_upstream_pool reuse), no session affinity cookie, no
+ * response caching. GET/HEAD only -- magnus_quic_http_dispatch()'s own
+ * method validation already guarantees that by the time this runs, so
+ * no request body relay is needed either. Each of those is a real,
+ * separately-scoped later increment, not silently missing. */
+
+static char *
+magnus_quic_proxy_find_header_end(char *buffer, size_t length)
+{
+    size_t index;
+    for (index = 3; index < length; index++) {
+        if (buffer[index - 3] == '\r' && buffer[index - 2] == '\n'
+            && buffer[index - 1] == '\r' && buffer[index] == '\n')
+            return &buffer[index + 1];
+    }
+    return NULL;
+}
+
+static void
+magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream)
+{
+    if (stream->upstream_fd < 0) return;
+    epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL, stream->upstream_fd, NULL);
+    magnus_quic_upstream_owner[stream->upstream_fd] = NULL;
+    magnus_quic_upstream_connection[stream->upstream_fd] = NULL;
+    close(stream->upstream_fd);
+    stream->upstream_fd = -1;
+    if (stream->cluster_endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_cluster, stream->endpoint_index);
+        stream->cluster_endpoint_counted = false;
+    }
+}
+
+/* Ends a proxy-dispatched stream before any response headers have gone
+ * out -- the h3 analogue of magnus_h2_proxy_fail()/magnus_proxy_fail().
+ * Every call site here is, by this function's own contract, a pre-header
+ * failure (connect refused/timed out, a mid-request send() error, a
+ * malformed/oversized/unparseable upstream response, an upstream read
+ * timeout) -- exactly the class magnus_proxy_connect_failed()'s own
+ * centralized magnus_cluster_result(false) call covers for h1, and
+ * magnus_h2_proxy_fail() covers for h2. Recording it here, once, keeps
+ * every one of this function's callers from having to remember to do it
+ * themselves -- the gap this comment replaces (found live: a killed
+ * upstream correctly produced its 502 but never actually degraded
+ * /metrics' own magnus_upstream_healthy, since only the *synchronous*
+ * connect()-failed branch in magnus_quic_proxy_start() recorded a
+ * failure -- the far more common asynchronous EINPROGRESS-then-EPOLLOUT
+ * failure path here never did). A stream that already reached
+ * magnus_quic_proxy_receive_headers() successfully has already recorded
+ * its own success (see that function's own magnus_cluster_result(true)
+ * call) before any of *this* function's callers can run, so there is no
+ * double-counting risk from always recording a failure here. */
+static void
+magnus_quic_proxy_fail(magnus_quic_connection_t *connection,
+                       magnus_quic_stream_t *stream, const char *status)
+{
+    magnus_cluster_result(&magnus_cluster, stream->endpoint_index, false,
+                          magnus_now_ms_local());
+    magnus_quic_proxy_teardown_upstream(stream);
+    magnus_quic_http_submit_status(connection, stream, status);
+}
+
+/* Ends a proxy-dispatched stream after response headers were already
+ * submitted -- no fresh status is possible any more (same reasoning as
+ * magnus_h2_proxy_abort()), so the stream's write side is shut down
+ * abruptly instead; the client sees this as a truncated response, the
+ * same as an abruptly closed HTTP/1.1 connection mid-body. */
+static void
+magnus_quic_proxy_abort(magnus_quic_connection_t *connection,
+                        magnus_quic_stream_t *stream)
+{
+    magnus_quic_proxy_teardown_upstream(stream);
+    (void) ngtcp2_conn_shutdown_stream_write(connection->conn, 0,
+                                             stream->stream_id,
+                                             NGHTTP3_H3_INTERNAL_ERROR);
+}
+
+static int
+magnus_quic_proxy_attach_upstream(magnus_quic_connection_t *connection,
+                                  magnus_quic_stream_t *stream,
+                                  size_t endpoint_index, int fd)
+{
+    struct epoll_event event;
+    if (fd < 0 || fd >= MAGNUS_QUIC_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    stream->upstream_fd = fd;
+    stream->upstream_connected = false;
+    stream->endpoint_index = endpoint_index;
+    magnus_cluster_endpoint_begin(&magnus_cluster, endpoint_index);
+    stream->cluster_endpoint_counted = true;
+    stream->connect_started = time(NULL);
+    stream->last_activity = stream->connect_started;
+    magnus_quic_upstream_owner[fd] = stream;
+    magnus_quic_upstream_connection[fd] = connection;
+    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
+                                   .data.fd = fd };
+    if (epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        magnus_quic_upstream_owner[fd] = NULL;
+        magnus_quic_upstream_connection[fd] = NULL;
+        close(fd);
+        stream->upstream_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static int
+magnus_quic_proxy_connect_endpoint(magnus_quic_connection_t *connection,
+                                   magnus_quic_stream_t *stream,
+                                   size_t endpoint_index)
+{
+    struct sockaddr_in address;
+    int fd;
+    int result;
+
+    if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_QUIC_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    if (magnus_quic_proxy_attach_upstream(connection, stream, endpoint_index,
+                                          fd) != 0)
+        return -1;
+    if (result == 0) stream->upstream_connected = true;
+    return 0;
+}
+
+/* nghttp3 read_data callback for a proxy-dispatched stream's response
+ * body -- hands off stream->body_chunk *once* (see magnus_quic_stream_t's
+ * own comment on why one chunk at a time, freed only once acked, rather
+ * than a reused buffer). Returns NGHTTP3_ERR_WOULDBLOCK, per nghttp3's
+ * own documented contract for this callback, whenever there is no
+ * not-yet-offered chunk but the response is not known complete yet --
+ * magnus_quic_proxy_stream_response() calls nghttp3_conn_resume_stream()
+ * the next time it actually offers a new one. */
+static nghttp3_ssize
+magnus_quic_proxy_read_body(nghttp3_conn *conn, int64_t stream_id,
+                            nghttp3_vec *vec, size_t veccnt, uint32_t *pflags,
+                            void *conn_user_data, void *stream_user_data)
+{
+    magnus_quic_stream_t *stream = stream_user_data;
+    (void) conn;
+    (void) stream_id;
+    (void) veccnt;
+    (void) conn_user_data;
+    if (stream->body_chunk != NULL && !stream->body_chunk_offered) {
+        vec[0].base = stream->body_chunk;
+        vec[0].len = stream->body_chunk_length;
+        stream->body_chunk_offered = true;
+        stream->body_offered_total += stream->body_chunk_length;
+        stream->body_chunk_end_offset = stream->body_offered_total;
+        if (stream->response_complete) *pflags |= NGHTTP3_DATA_FLAG_EOF;
+        return 1;
+    }
+    if (stream->body_chunk == NULL && stream->response_complete) {
+        *pflags |= NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
+    stream->nghttp3_wants_resume = true;
+    return NGHTTP3_ERR_WOULDBLOCK;
+}
+
+/* Converts a magnus_proxy_sanitize_response_headers() text block into
+ * HTTP/3 response headers and submits them -- the h3 analogue of
+ * magnus_h2_proxy_submit_response(), same reasoning for dropping the
+ * `Connection` header sanitize always appends (forbidden by RFC 9114
+ * 4.2 the same way RFC 9113 8.2.2 forbids it for h2; an h3 stream's
+ * lifetime is governed by its own FIN/reset, not a client-facing
+ * keep-alive/close choice per response) and lowercasing every other
+ * field name (an HTTP/1.x upstream's casing is not guaranteed to
+ * already be, and both h2 and h3 field names must be). */
+static void
+magnus_quic_proxy_submit_response(magnus_quic_connection_t *connection,
+                                  magnus_quic_stream_t *stream,
+                                  unsigned status, char *sanitized)
+{
+    nghttp3_nv headers[24];
+    char name_storage[24][64];
+    size_t count = 0;
+    char status_text[8];
+    char *saveptr = NULL;
+    char *line;
+    nghttp3_data_reader reader = { .read_data = magnus_quic_proxy_read_body };
+
+    snprintf(status_text, sizeof(status_text), "%u", status);
+    headers[count] = magnus_quic_nv(":status", status_text);
+    count++;
+
+    strtok_r(sanitized, "\r\n", &saveptr); /* status line, already captured */
+    for (line = strtok_r(NULL, "\r\n", &saveptr);
+         line != NULL && count < sizeof(headers) / sizeof(headers[0]);
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
+        char *colon = strchr(line, ':');
+        char *value;
+        size_t name_length;
+        if (colon == NULL) continue;
+        name_length = (size_t) (colon - line);
+        if (name_length == 0 || name_length >= sizeof(name_storage[0]))
+            continue;
+        memcpy(name_storage[count], line, name_length);
+        name_storage[count][name_length] = '\0';
+        for (size_t i = 0; i < name_length; i++)
+            name_storage[count][i]
+                = (char) tolower((unsigned char) name_storage[count][i]);
+        if (strcmp(name_storage[count], "connection") == 0) continue;
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        headers[count] = magnus_quic_nv(name_storage[count], value);
+        count++;
+    }
+
+    stream->response_headers_submitted = true;
+    (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                        stream->stream_id, headers, count,
+                                        &reader);
+}
+
+/* Once the response is known fully received (Content-Length reached, or
+ * the upstream closed), tears the upstream leg down -- no pool to check
+ * into in this increment, see this section's own top comment -- and
+ * marks response_complete so magnus_quic_proxy_read_body() knows it is
+ * safe to report EOF once stream->body_chunk finishes draining. */
+static void
+magnus_quic_proxy_maybe_complete(magnus_quic_connection_t *connection,
+                                 magnus_quic_stream_t *stream)
+{
+    bool complete_by_length = stream->has_response_length
+        && stream->response_received >= stream->response_length;
+    if (!stream->upstream_eof && !complete_by_length) return;
+    stream->response_complete = true;
+    magnus_quic_proxy_teardown_upstream(stream);
+    if (stream->nghttp3_wants_resume) {
+        stream->nghttp3_wants_resume = false;
+        (void) nghttp3_conn_resume_stream(connection->http3_conn,
+                                          stream->stream_id);
+    }
+}
+
+/* The h3 analogue of magnus_h2_proxy_receive_headers(): accumulates the
+ * upstream response's status line + header block into stream->header_buffer
+ * (may arrive split across several recv() calls), then rewrites it via
+ * magnus_proxy_sanitize_response_headers() once the terminating blank
+ * line is found and submits it as this stream's h3 response. Leftover
+ * bytes already read past the header block become the first chunk of
+ * body. Returns true once headers were fully received (whether the
+ * outcome was a clean submit or a failure this stream is now done
+ * for), false while still waiting for more. */
+static bool
+magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
+                                  magnus_quic_stream_t *stream)
+{
+    char *body_start;
+    size_t header_length;
+    size_t leftover;
+    char header_copy[MAGNUS_QUIC_PROXY_HEADER_LIMIT + 1];
+    char sanitized[MAGNUS_QUIC_PROXY_SANITIZED_LIMIT];
+    magnus_proxy_response_info_t info;
+    int sanitized_length;
+
+    while (stream->header_accum < MAGNUS_QUIC_PROXY_HEADER_LIMIT) {
+        ssize_t received = recv(stream->upstream_fd,
+            stream->header_buffer + stream->header_accum,
+            MAGNUS_QUIC_PROXY_HEADER_LIMIT - stream->header_accum, 0);
+        if (received > 0) {
+            stream->header_accum += (size_t) received;
+            stream->last_activity = time(NULL);
+            if (magnus_quic_proxy_find_header_end(stream->header_buffer,
+                                                  stream->header_accum)
+                != NULL)
+                break;
+            continue;
+        }
+        if (received == 0) {
+            stream->upstream_eof = true;
+            break;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+        magnus_quic_proxy_fail(connection, stream, "502");
+        return true;
+    }
+
+    body_start = magnus_quic_proxy_find_header_end(stream->header_buffer,
+                                                    stream->header_accum);
+    if (body_start == NULL) {
+        if (stream->upstream_eof
+            || stream->header_accum == MAGNUS_QUIC_PROXY_HEADER_LIMIT) {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            return true;
+        }
+        return false;
+    }
+
+    header_length = (size_t) (body_start - stream->header_buffer);
+    leftover = stream->header_accum - header_length;
+    memcpy(header_copy, stream->header_buffer, header_length);
+    header_copy[header_length] = '\0';
+    sanitized_length = magnus_proxy_sanitize_response_headers(header_copy,
+        header_length, sanitized, sizeof(sanitized), NULL,
+        true /* client_wants_close: N/A for h3, same reasoning as h2 --
+              * see magnus_quic_proxy_submit_response()'s own comment on
+              * why the Connection header this produces is dropped
+              * either way */, &info, NULL);
+    if (sanitized_length < 0) {
+        magnus_quic_proxy_fail(connection, stream, "502");
+        return true;
+    }
+
+    if (info.has_content_length && leftover > info.content_length)
+        leftover = info.content_length;
+    if (leftover > 0) {
+        /* stream->body_chunk is necessarily NULL here (this is the
+         * very first body data this stream has ever seen) -- see
+         * magnus_quic_stream_t's own comment on why a fresh allocation
+         * per chunk, not a reused buffer. */
+        stream->body_chunk = malloc(leftover);
+        if (stream->body_chunk == NULL) {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            return true;
+        }
+        memcpy(stream->body_chunk, body_start, leftover);
+        stream->body_chunk_length = leftover;
+    }
+    stream->headers_received = true;
+    stream->upstream_poolable = info.upstream_poolable;
+    stream->has_response_length = info.has_content_length;
+    stream->response_length = info.content_length;
+    stream->response_received = leftover;
+
+    magnus_cluster_result(&magnus_cluster, stream->endpoint_index, true,
+                          magnus_now_ms_local());
+    magnus_quic_proxy_submit_response(connection, stream, info.status,
+                                      sanitized);
+    magnus_quic_proxy_maybe_complete(connection, stream);
+    return true;
+}
+
+/* Keeps stream->body_chunk filled from the upstream socket for
+ * magnus_quic_proxy_read_body() to pull from, once headers are already
+ * submitted -- respecting backpressure (never reads more while a chunk
+ * is still outstanding -- offered-but-unacked or not yet even offered,
+ * either way magnus_quic_stream_t's own body_chunk field is non-NULL,
+ * see its own comment for why *this* backpressure gate, not "nghttp3
+ * has not pulled it out yet", is the correct one here) and never
+ * reading past a declared Content-Length, exactly the same shape as
+ * magnus_h2_proxy_stream_response() minus the reused-buffer part. */
+static void
+magnus_quic_proxy_stream_response(magnus_quic_connection_t *connection,
+                                  magnus_quic_stream_t *stream)
+{
+    size_t want;
+    ssize_t received;
+    uint8_t buffer[MAGNUS_QUIC_PROXY_BUFFER];
+
+    if (stream->body_chunk != NULL) return; /* backpressure */
+    want = sizeof(buffer);
+    if (stream->has_response_length) {
+        size_t remaining = stream->response_length - stream->response_received;
+        if (remaining < want) want = remaining;
+    }
+    if (want == 0) {
+        magnus_quic_proxy_maybe_complete(connection, stream);
+        return;
+    }
+    received = recv(stream->upstream_fd, buffer, want, 0);
+    if (received > 0) {
+        stream->body_chunk = malloc((size_t) received);
+        if (stream->body_chunk == NULL) {
+            magnus_quic_proxy_abort(connection, stream);
+            return;
+        }
+        memcpy(stream->body_chunk, buffer, (size_t) received);
+        stream->body_chunk_length = (size_t) received;
+        stream->response_received += (size_t) received;
+        stream->last_activity = time(NULL);
+        if (stream->nghttp3_wants_resume) {
+            stream->nghttp3_wants_resume = false;
+            (void) nghttp3_conn_resume_stream(connection->http3_conn,
+                                              stream->stream_id);
+        }
+        magnus_quic_proxy_maybe_complete(connection, stream);
+        return;
+    }
+    if (received == 0) {
+        stream->upstream_eof = true;
+        magnus_quic_proxy_maybe_complete(connection, stream);
+        return;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+    magnus_quic_proxy_abort(connection, stream);
+}
+
+/* Called once per magnus_quic_tick()'s own per-second sweep (this
+ * codebase's existing cadence for every other periodic timeout check):
+ * connect and read timeouts for every proxy-dispatched stream currently
+ * holding an upstream fd open, the same two bounds
+ * MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/MAGNUS_PROXY_READ_TIMEOUT_SECONDS
+ * already enforce for HTTP/1.1 and HTTP/2 -- without this, a stuck
+ * upstream would hold *this one stream* open indefinitely (not the
+ * whole process -- every other connection/stream stays fine, this is
+ * single-threaded epoll -- but still a real, user-visible hang this
+ * increment should not ship without). Walks
+ * magnus_quic_upstream_owner[] directly (bounded, only ever as many
+ * live entries as there are concurrent proxy attempts) rather than
+ * every QUIC connection's own stream set, which magnus_quic.c has no
+ * enumerable list of at all (nghttp3 owns that). */
+static void
+magnus_quic_proxy_tick(time_t now)
+{
+    int fd;
+    for (fd = 0; fd < MAGNUS_QUIC_MAX_FDS; fd++) {
+        magnus_quic_stream_t *stream = magnus_quic_upstream_owner[fd];
+        magnus_quic_connection_t *connection;
+        if (stream == NULL) continue;
+        connection = magnus_quic_upstream_connection[fd];
+        if (!stream->upstream_connected
+            && now - stream->connect_started
+                   >= MAGNUS_QUIC_PROXY_CONNECT_TIMEOUT_SECONDS) {
+            magnus_quic_proxy_fail(connection, stream, "504");
+        } else if (stream->upstream_connected
+                  && now - stream->last_activity
+                         >= MAGNUS_QUIC_PROXY_READ_TIMEOUT_SECONDS) {
+            if (stream->response_headers_submitted)
+                magnus_quic_proxy_abort(connection, stream);
+            else
+                magnus_quic_proxy_fail(connection, stream, "504");
+        } else {
+            continue;
+        }
+        magnus_quic_flush(magnus_quic_listener_fd,
+                          (int) (connection - magnus_quic_connections));
+    }
+}
+
+/* Entry point for any epoll event on a proxy-dispatched stream's
+ * upstream fd -- the h3 analogue of magnus_h2_handle_upstream(). */
+static void
+magnus_quic_proxy_handle_upstream(magnus_quic_connection_t *connection,
+                                  magnus_quic_stream_t *stream, uint32_t flags)
+{
+    int slot = (int) (connection - magnus_quic_connections);
+
+    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        if (stream->response_headers_submitted)
+            magnus_quic_proxy_abort(connection, stream);
+        else
+            magnus_quic_proxy_fail(connection, stream, "502");
+        magnus_quic_flush(magnus_quic_listener_fd, slot);
+        return;
+    }
+    if (!stream->upstream_connected) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (getsockopt(stream->upstream_fd, SOL_SOCKET, SO_ERROR, &error,
+                       &length) < 0 || error != 0) {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            magnus_quic_flush(magnus_quic_listener_fd, slot);
+            return;
+        }
+        stream->upstream_connected = true;
+        stream->last_activity = time(NULL);
+    }
+    while (!stream->upstream_headers_sent) {
+        ssize_t sent = send(stream->upstream_fd,
+            stream->proxy_request + stream->proxy_request_sent,
+            stream->proxy_request_length - stream->proxy_request_sent,
+            MSG_NOSIGNAL);
+        if (sent > 0) {
+            stream->proxy_request_sent += (size_t) sent;
+            stream->last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        } else {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            magnus_quic_flush(magnus_quic_listener_fd, slot);
+            return;
+        }
+        if (stream->proxy_request_sent == stream->proxy_request_length)
+            stream->upstream_headers_sent = true;
+    }
+    if (!stream->headers_received) {
+        if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+            if (!magnus_quic_proxy_receive_headers(connection, stream)) {
+                struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                             .data.fd = stream->upstream_fd };
+                epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_MOD,
+                         stream->upstream_fd, &event);
+                return;
+            }
+        } else {
+            struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                         .data.fd = stream->upstream_fd };
+            epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_MOD, stream->upstream_fd,
+                     &event);
+            magnus_quic_flush(magnus_quic_listener_fd, slot);
+            return;
+        }
+    } else if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
+        magnus_quic_proxy_stream_response(connection, stream);
+    }
+    magnus_quic_flush(magnus_quic_listener_fd, slot);
+}
+
+/* Entry point from magnus.c's main epoll loop for any event on a fd
+ * magnus_quic_upstream_owner[] recognizes -- returns false (nothing
+ * handled) for any other fd, so the caller falls through to its own
+ * next check exactly like every other *_owner[]-dispatched handler
+ * there already does. */
+bool
+magnus_quic_handle_upstream_event(int fd, uint32_t flags)
+{
+    magnus_quic_stream_t *stream;
+    magnus_quic_connection_t *connection;
+    if (fd < 0 || fd >= MAGNUS_QUIC_MAX_FDS) return false;
+    stream = magnus_quic_upstream_owner[fd];
+    if (stream == NULL) return false;
+    connection = magnus_quic_upstream_connection[fd];
+    magnus_quic_proxy_handle_upstream(connection, stream, flags);
+    return true;
+}
+
+/* Entry point from magnus_quic_http_dispatch() below: builds the
+ * outbound HTTP/1.1 proxy request (an h3 analogue of
+ * magnus_proxy_pick_and_start()'s own request-building, GET/HEAD only
+ * -- see this section's own top comment for why no body), then selects
+ * a healthy cluster endpoint and connects. `Connection: close` to the
+ * upstream unconditionally -- this increment never pools a connection
+ * for reuse (see this section's own top comment), so there is nothing
+ * to keep it open for, and it lets EOF unambiguously frame a response
+ * with no Content-Length the same way HTTP/1.1 itself would. */
+static void
+magnus_quic_proxy_start(magnus_quic_connection_t *connection,
+                        magnus_quic_stream_t *stream)
+{
+    int endpoint;
+    struct in_addr client_ip;
+    int written;
+    /* The literal "/proxy" prefix itself is stripped before relaying --
+     * matching magnus_proxy_pick_and_start()'s own documented contract
+     * for the h1/h2 "reached here via the hardcoded prefix" case
+     * exactly (its own comment: "request->path with the literal
+     * '/proxy' prefix stripped"). Falls back to "/" for a bare
+     * "/proxy" request (nothing left after stripping) rather than
+     * forwarding an empty request-target, which HTTP/1.1 does not
+     * allow -- a deliberate small improvement over reusing that exact
+     * edge case here, not a behavior this new code path needs to
+     * import unchanged. */
+    const char *forward_path = stream->path + 6;
+    if (forward_path[0] == '\0') forward_path = "/";
+
+    /* No stream->body_chunk allocation here -- unlike the old
+     * stream->body_buffer, a chunk is allocated fresh per read by
+     * magnus_quic_proxy_stream_response() and freed once acked (see
+     * magnus_quic_stream_t's own comment), never pre-allocated. */
+    stream->header_buffer = malloc(MAGNUS_QUIC_PROXY_HEADER_LIMIT);
+    stream->proxy_request = malloc(512 + strlen(forward_path));
+    if (stream->header_buffer == NULL
+        || stream->proxy_request == NULL) {
+        magnus_quic_http_submit_status(connection, stream, "500");
+        return;
+    }
+    written = snprintf(stream->proxy_request,
+        512 + strlen(forward_path),
+        "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        stream->method, forward_path,
+        stream->authority[0] != '\0' ? stream->authority : "localhost");
+    if (written < 0) {
+        magnus_quic_http_submit_status(connection, stream, "500");
+        return;
+    }
+    stream->proxy_request_length = (size_t) written;
+
+    if (connection->remote_addr.ss_family == AF_INET)
+        client_ip = ((struct sockaddr_in *) &connection->remote_addr)->sin_addr;
+    else
+        client_ip.s_addr = 0;
+    endpoint = magnus_cluster_select(&magnus_cluster, magnus_now_ms_local(),
+                                     NULL, client_ip);
+    if (endpoint < 0) {
+        magnus_quic_http_submit_status(connection, stream, "502");
+        return;
+    }
+    if (magnus_quic_proxy_connect_endpoint(connection, stream,
+                                           (size_t) endpoint) != 0) {
+        magnus_cluster_result(&magnus_cluster, (size_t) endpoint, false,
+                              magnus_now_ms_local());
+        magnus_quic_http_submit_status(connection, stream, "502");
+    }
+}
+
 /* Serves stream->path as a static file -- the fallback once
  * magnus_quic_http_dispatch() below has ruled out /healthz and
  * /metrics. Method/head_only validation already happened there, same
@@ -676,19 +1446,49 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
                                      "text/plain; version=0.0.4", metrics);
         return;
     }
+    /* Roadmap 4d -- see that section's own top comment for exactly what
+     * "/proxy" dispatches to and what is deliberately not supported
+     * yet (the `route` table's own host/path-prefix/header/cookie/
+     * query/source-CIDR matching among them). */
+    if (magnus_upstream_enabled && strncmp(stream->path, "/proxy", 6) == 0) {
+        stream->is_proxy = true;
+        magnus_quic_proxy_start(connection, stream);
+        return;
+    }
     magnus_quic_http_dispatch_static(connection, stream);
 }
 
+/* nghttp3's own documented contract for a read_data callback's returned
+ * memory (see magnus_quic_stream_t's own comment, and
+ * magnus_quic_proxy_read_body()'s): it must stay valid until *this*
+ * callback confirms the peer has acknowledged it, not merely until
+ * ngtcp2 has copied it into an outgoing packet. For a proxy stream,
+ * once the currently in-flight chunk (stream->body_chunk, ending at
+ * stream->body_chunk_end_offset) is fully acked, it is freed and
+ * magnus_quic_proxy_stream_response() is retried immediately -- epoll
+ * will not necessarily refire on its own if the upstream socket's
+ * already-available bytes were fully drained while backpressure
+ * (stream->body_chunk != NULL) was blocking a further read. */
 static int
 magnus_quic_http_acked_stream_data(nghttp3_conn *conn, int64_t stream_id,
                                    uint64_t datalen, void *conn_user_data,
                                    void *stream_user_data)
 {
+    magnus_quic_connection_t *connection = conn_user_data;
+    magnus_quic_stream_t *stream = stream_user_data;
     (void) conn;
     (void) stream_id;
-    (void) datalen;
-    (void) conn_user_data;
-    (void) stream_user_data;
+    if (stream == NULL || !stream->is_proxy) return 0;
+    stream->body_acked_total += datalen;
+    if (stream->body_chunk != NULL
+        && stream->body_acked_total >= stream->body_chunk_end_offset) {
+        free(stream->body_chunk);
+        stream->body_chunk = NULL;
+        stream->body_chunk_length = 0;
+        stream->body_chunk_offered = false;
+        if (stream->upstream_fd >= 0)
+            magnus_quic_proxy_stream_response(connection, stream);
+    }
     return 0;
 }
 
@@ -730,6 +1530,12 @@ magnus_quic_http_begin_headers(nghttp3_conn *conn, int64_t stream_id,
     stream = calloc(1, sizeof(*stream));
     if (stream == NULL) return NGHTTP3_ERR_CALLBACK_FAILURE;
     stream->stream_id = stream_id;
+    /* Explicit, not left at calloc's 0 default -- 0 is a valid fd (this
+     * exact class of bug, magnus.c's own connection->upstream_fd
+     * silently defaulting to 0 instead of -1, was found and fixed once
+     * already during this project's Phase 4/M5 work; not repeating it
+     * here). */
+    stream->upstream_fd = -1;
     (void) nghttp3_conn_set_stream_user_data(conn, stream_id, stream);
     /* Also registered at the *ngtcp2* level (magnus_quic_stream_close()'s
      * own `stream_user_data` parameter, not a separate lookup) --
@@ -772,6 +1578,14 @@ magnus_quic_http_recv_header(nghttp3_conn *conn, int64_t stream_id,
             ? v.len : sizeof(stream->path) - 1;
         memcpy(stream->path, v.base, length);
         stream->path[length] = '\0';
+    } else if (token == NGHTTP3_QPACK_TOKEN__AUTHORITY) {
+        /* :authority (roadmap 4d) -- becomes the outbound Host header
+         * for a proxy-dispatched request; unused by the static/healthz/
+         * metrics paths (4b/4c), which never look at it. */
+        size_t length = v.len < sizeof(stream->authority) - 1
+            ? v.len : sizeof(stream->authority) - 1;
+        memcpy(stream->authority, v.base, length);
+        stream->authority[length] = '\0';
     }
     return 0;
 }
@@ -1052,6 +1866,15 @@ magnus_quic_create_listener(unsigned port)
         return -1;
     }
 
+    /* Cached for magnus_quic_handle_upstream_event() below (roadmap
+     * 4d): unlike magnus_quic_listener_service()/magnus_quic_tick(),
+     * which the caller already passes this fd into on every call,
+     * that entry point's own public signature (magnus_quic.h) takes
+     * only the upstream fd and its epoll flags -- matching every other
+     * *_owner[fd]-dispatched handler's own shape in magnus.c's main
+     * loop -- so this is the one place that fd has to come from
+     * instead. There is only ever one QUIC listener per process. */
+    magnus_quic_listener_fd = fd;
     return fd;
 }
 
@@ -1467,6 +2290,7 @@ magnus_quic_tick(int listener_fd, time_t now)
         }
         magnus_quic_flush(listener_fd, slot);
     }
+    magnus_quic_proxy_tick(now);
 }
 
 void

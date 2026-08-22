@@ -4025,4 +4025,97 @@ done
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, byte-exact large payload ok (Phase 4b/4c, see src/magnus_quic.h)"
+
+# Phase 4d: HTTP/3 "/proxy" dispatch relayed to a real HTTP/1.1
+# upstream -- the literal "/proxy" prefix stripped before forwarding
+# (magnus_quic_proxy_start()'s own documented contract, matching
+# magnus_proxy_pick_and_start()'s identical one for h1/h2), a
+# byte-exact large streamed response (the same shape of fixture that
+# caught 4b's own real bug, exercising this increment's backpressure/
+# resume_stream path under real load), the backend's own 404 relayed
+# through unmodified, and a clean 502 (plus the passive-health signal
+# it feeds) when no backend is reachable at all.
+port_quic_proxy_upstream=$((port + 104))
+python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            # magnus's own active health check (magnus_health_tick(),
+            # default path "/", expected status 200) probes this backend
+            # on its own schedule, independent of and concurrent with
+            # this script's own proxy requests -- answering it here
+            # keeps that probe passing so it cannot spuriously flip the
+            # endpoint unhealthy (magnus_cluster_result()'s own
+            # failure_threshold counts active-check failures and this
+            # script's own deliberate 502 case together) and race the
+            # explicit backend-kill/502 assertion below.
+            body = b'ok\n'
+        elif self.path == '/quic-proxy-small.txt':
+            body = b'magnus quic proxy file\n'
+        elif self.path == '/quic-proxy-large.txt':
+            body = b''.join(
+                f'proxy-line-{n:05d}-abcdefghijklmnopqrstuvwxyz\n'.encode()
+                for n in range(1, 5001))
+        else:
+            self.send_response(404)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+http.server.HTTPServer(('127.0.0.1', $port_quic_proxy_upstream), Handler) \
+    .serve_forever()
+" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_quic_proxy_upstream/quic-proxy-small.txt" \
+    >/dev/null && break
+  sleep 1
+done
+port_quic_proxy=$((port + 105))
+port_quic_proxy_udp=$((port + 106))
+"$binary" --port "$port_quic_proxy" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_proxy_udp" \
+  --upstream "127.0.0.1:$port_quic_proxy_upstream" \
+  --health-check-failure-threshold 1 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_quic_proxy/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
+  /proxy/quic-proxy-small.txt > "$web_root/quic-proxy-small-out"
+grep -qE '^status: 200$' "$web_root/quic-proxy-small-out"
+tail -n +3 "$web_root/quic-proxy-small-out" \
+  | grep -qE '^magnus quic proxy file$'
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
+  /proxy/quic-proxy-large.txt > "$web_root/quic-proxy-large-out"
+grep -qE '^status: 200$' "$web_root/quic-proxy-large-out"
+python3 -c "
+for n in range(1, 5001):
+    print(f'proxy-line-{n:05d}-abcdefghijklmnopqrstuvwxyz')
+" > "$web_root/quic-proxy-large-expected"
+tail -n +3 "$web_root/quic-proxy-large-out" \
+  | diff - "$web_root/quic-proxy-large-expected"
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
+  /proxy/quic-proxy-does-not-exist.txt | grep -qE '^status: 404$'
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_proxy_udp" \
+  /proxy/quic-proxy-small.txt | grep -qE '^status: 502$'
+curl -k --fail --silent "https://127.0.0.1:$port_quic_proxy/metrics" \
+  | grep -qE '^magnus_upstream_healthy\{endpoint="127\.0\.0\.1:'"$port_quic_proxy_upstream"'"\} 0$'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads ok (Phase 4b/4c/4d, see src/magnus_quic.h)"

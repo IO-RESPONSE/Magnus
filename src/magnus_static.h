@@ -15,6 +15,9 @@
  * rather than each maintaining its own copy, but magnus_quic.c calls
  * them across a real translation unit boundary rather than inline. */
 
+#include "magnus_policy.h"
+
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/stat.h>
@@ -49,5 +52,30 @@ extern bool magnus_admin_enabled;
  * so they cannot drift into reporting different counts for the same
  * process. */
 void magnus_build_metrics(char *out, size_t out_capacity);
+
+/* The plain (non-route-table) upstream cluster `--upstream`/`upstream=`
+ * configures -- what a literal "/proxy" path prefix dispatches to on
+ * every protocol, HTTP/3's new proxy dispatch (roadmap 4d) included.
+ * `magnus_upstream_enabled` is `magnus_cluster.count > 0`, kept as its
+ * own flag (not recomputed from the count each time) for the same
+ * reason every other protocol's own dispatch already reads it that way.
+ * Deliberately NOT the `route` table (host/path-prefix/header/cookie/
+ * query/source-CIDR matching, each with its own cluster) -- 4d's own
+ * scope note in src/magnus_quic.h covers why. */
+extern magnus_cluster_t magnus_cluster;
+extern bool magnus_upstream_enabled;
+
+/* Resolves cluster endpoint `index` (`magnus_cluster`'s own indexing)
+ * to a connectable IPv4 address, or false if `index` is out of range or
+ * the endpoint is a not-yet-resolved hostname (roadmap 1c) with no
+ * address available yet. */
+bool magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out);
+
+/* The one epoll instance every fd in this process is registered
+ * against -- an HTTP/3 proxy dispatch's own upstream connection fd
+ * (roadmap 4d) included, despite the QUIC connection that owns it
+ * having no fd of its own. Set once, early in main(), well before any
+ * QUIC traffic can arrive. */
+extern int magnus_global_epoll_fd;
 
 #endif

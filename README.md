@@ -234,10 +234,19 @@ independently by IORESPONSE.
   none can drift into different numbers for the same process;
   `/metrics` is withdrawn once `--admin-socket`/`admin_socket` is
   configured -- same isolation boundary the main TCP listener already
-  applies -- while `/healthz` stays public. Proxy dispatch and
-  compression over HTTP/3 remain a later increment -- see
-  `src/magnus_quic.h`
-- Container image: 10,347,248 bytes (~9.87 MiB), non-root, read-only rootfs
+  applies -- while `/healthz` stays public
+- HTTP/3 `"/proxy"` dispatch (roadmap Phase 4d): a real HTTP/1.1
+  upstream relay over HTTP/3, reusing the same cluster
+  selection/passive-health tracking (`src/magnus_policy.h`) and
+  response-header sanitization (`src/magnus_proxy.h`) HTTP/1.1 and
+  HTTP/2 already share, so a killed backend produces the same clean
+  502 and the same `magnus_upstream_healthy` degradation regardless of
+  which protocol the client used. The `route` table's own
+  host/path-prefix/header/cookie/query/source-CIDR matching, retry-on-
+  connect-failure, upstream connection pooling, session affinity,
+  response caching, and compression over HTTP/3 remain later
+  increments -- see `src/magnus_quic.h`
+- Container image: 10,350,250 bytes (~9.87 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

@@ -478,8 +478,10 @@ static magnus_connection_t *magnus_connections[MAGNUS_MAX_FDS];
  * functions below it directly. */
 int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
-static magnus_cluster_t magnus_cluster;
-static bool magnus_upstream_enabled;
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c (HTTP/3 proxy dispatch, roadmap Phase 4d) needs both. */
+magnus_cluster_t magnus_cluster;
+bool magnus_upstream_enabled;
 /* gRPC upstream cluster (roadmap 2c-1): a separate pool from magnus_cluster
  * above, targeted only by a route with action=grpc -- reuses
  * magnus_cluster_t's own weighted-RR/health/circuit-breaker logic
@@ -734,7 +736,12 @@ static struct magnus_h2_stream *magnus_h2_upstream_owner[MAGNUS_MAX_FDS];
  * upstream fd but have no epoll_fd parameter of their own to work with --
  * every other function in this file still takes epoll_fd as a normal
  * parameter and should keep doing so. */
-static int magnus_global_epoll_fd = -1;
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c (HTTP/3 proxy dispatch, roadmap Phase 4d) needs this:
+ * an upstream connection's own fd, registered here so its events reach
+ * the *main* epoll loop despite belonging to a QUIC stream, which (with
+ * no fd of its own -- see src/magnus_quic.h) has no other way onto it. */
+int magnus_global_epoll_fd = -1;
 
 /* gRPC upstream connection pool + multiplexing (roadmap 2c-5): a pooled,
  * shared upstream h2 connection, kept alive across many RPCs rather than
@@ -1454,7 +1461,9 @@ magnus_rate_check(struct in_addr address, time_t now)
     return magnus_rate_allow(&magnus_rate_table[index].limiter, now_ms);
 }
 
-static bool
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c (HTTP/3 proxy dispatch, roadmap Phase 4d) needs this. */
+bool
 magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
 {
     if (index >= magnus_cluster.count) return false;
@@ -10676,6 +10685,16 @@ main(int argc, char **argv)
                 magnus_quic_listener_service(magnus_quic_listener);
                 continue;
             }
+            /* HTTP/3 proxy dispatch's own upstream connection (roadmap
+             * 4d): an ordinary TCP fd, unlike every QUIC-side fd
+             * dispatched above -- see magnus_quic_handle_upstream_event()'s
+             * own comment in src/magnus_quic.h for why this needs its
+             * own check here at all, on the *main* epoll loop, rather
+             * than the QUIC listener dispatch above. Returns false (does
+             * nothing) for any fd it does not itself own. */
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_quic_handle_upstream_event(fd, flags))
+                continue;
             if (fd < 0 || fd >= MAGNUS_MAX_FDS
                 || (connection = magnus_connections[fd]) == NULL) {
                 continue;
