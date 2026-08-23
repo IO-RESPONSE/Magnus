@@ -65,6 +65,10 @@ static bool g_request_submitted;
  * notice and validate the new path; see magnus_quic_path_validation()'s
  * own comment in src/magnus_quic.c). */
 static bool g_migrate;
+/* Real IP (roadmap 2b, extended to HTTP/3): send X-Forwarded-For: <this>
+ * -- the same "final positional arg, '-' sentinel means absent" shape
+ * every other optional request header this tool sends already uses. */
+static const char *g_request_xff;
 static char g_response_status[8];
 static char g_response_content_encoding[32]; /* roadmap 4e */
 static char g_response_vary[32]; /* roadmap 4e */
@@ -337,7 +341,7 @@ static int
 submit_request(void)
 {
     int64_t request_stream_id;
-    nghttp3_nv headers[6];
+    nghttp3_nv headers[7];
     size_t header_count = 4;
 
     if (ngtcp2_conn_open_bidi_stream(g_conn, &request_stream_id, NULL) != 0) {
@@ -363,6 +367,13 @@ submit_request(void)
         headers[header_count] = (nghttp3_nv) { .name = (const uint8_t *) "cookie",
             .value = (const uint8_t *) g_request_cookie, .namelen = 6,
             .valuelen = strlen(g_request_cookie) };
+        header_count++;
+    }
+    if (g_request_xff != NULL) {
+        headers[header_count] = (nghttp3_nv) {
+            .name = (const uint8_t *) "x-forwarded-for",
+            .value = (const uint8_t *) g_request_xff, .namelen = 15,
+            .valuelen = strlen(g_request_xff) };
         header_count++;
     }
     if (nghttp3_conn_submit_request(g_httpconn, request_stream_id, headers,
@@ -592,10 +603,10 @@ main(int argc, char **argv)
     ngtcp2_tstamp deadline;
     static const unsigned char alpn_h3[] = { 2, 'h', '3' };
 
-    if (argc < 3 || argc > 7) {
+    if (argc < 3 || argc > 8) {
         fprintf(stderr,
-            "usage: %s <host> <port> [request-path] [gzip|-] [cookie] "
-            "[migrate]\n", argv[0]);
+            "usage: %s <host> <port> [request-path] [gzip|-] [cookie|-] "
+            "[migrate|-] [xff]\n", argv[0]);
         return 2;
     }
     host = argv[1];
@@ -604,11 +615,12 @@ main(int argc, char **argv)
     if (argc >= 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
     /* "-" is a no-op sentinel here too (matching argv[4]'s own "gzip|-"
      * convention) -- needed so a caller that wants the trailing
-     * "migrate" flag (roadmap 4l) but no cookie does not have to send
-     * a literal, meaningless "Cookie: -" header just to keep the
+     * "migrate"/xff args (roadmap 4l/2b) but no cookie does not have to
+     * send a literal, meaningless "Cookie: -" header just to keep the
      * cookie slot's position. */
     if (argc >= 6 && strcmp(argv[5], "-") != 0) g_request_cookie = argv[5];
-    if (argc == 7) g_migrate = strcmp(argv[6], "migrate") == 0;
+    if (argc >= 7) g_migrate = strcmp(argv[6], "migrate") == 0;
+    if (argc == 8 && strcmp(argv[7], "-") != 0) g_request_xff = argv[7];
 
     g_response_body = malloc(QUIC_HANDSHAKE_CHECK_MAX_BODY);
     if (!g_response_body) {

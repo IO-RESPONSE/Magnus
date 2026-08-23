@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.40.0
+
+### Added
+
+- **Real IP for HTTP/3 (roadmap 2b, extended here): `source_cidr` route
+  matching and client-IP-based cluster selection (4h's own fallback
+  when no sticky affinity cookie applies) now resolve a trusted-proxy-
+  forwarded Forwarded/X-Forwarded-For address over QUIC exactly like
+  HTTP/1.1 and HTTP/2 already do.** Turned out to need no new QUIC-
+  specific mechanism at all: `magnus_realip_resolve_headers()` operates
+  purely on already-parsed HTTP header fields, and HTTP/3's own headers
+  are just as parseable as HTTP/1.1's -- the only genuinely QUIC-
+  incompatible piece is PROXY protocol v1/v2 (no raw preamble concept
+  once ngtcp2/nghttp3 have already framed a stream's headers), which
+  stays correctly out of scope and is now the *only* remaining item in
+  `src/magnus_quic.h`'s own "deliberately still not here" list under
+  this heading.
+
+  `magnus_quic_stream_t` gained `effective_client_address`, the h3
+  analogue of `struct magnus_h2_stream`'s own identically-named field:
+  a *per-stream* value (never `connection->remote_addr` itself, which
+  a concurrently dispatching sibling stream on the same QUIC connection
+  could be reading at the same instant -- the same multiplexing
+  concern h2 already had and HTTP/1.1 never does), resolved once in
+  `magnus_quic_http_dispatch()` and read from there by both
+  `source_cidr` route matching and `magnus_quic_proxy_start()`'s own
+  client-IP-based endpoint selection, rather than each recomputing the
+  raw QUIC peer address independently and risking an inconsistent
+  answer between the two. Trust is always decided against the
+  connection's actual raw peer address, never against an already-
+  resolved value, matching `magnus_h2_dispatch()`'s own identical
+  anti-forgery reasoning.
+
+  `magnus_trusted_proxies[]`/`magnus_trusted_proxy_count` (magnus.c)
+  are no longer `static`, exposed via `src/magnus_static.h` the same
+  way `magnus_routes[]`/`magnus_route_count` already are -- config
+  state magnus.c owns and populates once at startup, read (never
+  written) by magnus_quic.c's dispatch. `magnus_realip_is_trusted()`/
+  `magnus_realip_resolve_headers()` themselves needed no changes at
+  all: magnus_quic.c now simply `#include`s `magnus_realip.h` directly
+  and calls them, the same way h1/h2 already do.
+
+  `tests/quic-handshake-check.c` gained X-Forwarded-For support (a new
+  trailing positional argument, matching the tool's own existing
+  "`-` sentinel means absent" convention already established for
+  cookie/migrate), needed to actually exercise this over QUIC at all
+  -- no prior mechanism in the tool could set an arbitrary request
+  header.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; a new `tests/test-core.sh` block (config-file mode, matching
+  the HTTP/1.1 Real IP block's own precedent of proving the config key
+  itself, not just a CLI-flag equivalent) confirms a trusted peer's
+  `X-Forwarded-For` making a `source_cidr`-denied address reachable/
+  unreachable over QUIC, and that no header at all falls back to
+  routing against the raw QUIC peer address correctly. Docker image
+  rebuilt and a live container tested directly -- the same deny/allow
+  behavior confirmed against the running container, not just the host
+  binary.
+
 ## 1.39.0
 
 ### Added

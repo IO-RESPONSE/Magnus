@@ -3,6 +3,7 @@
 #include "magnus_cache.h"
 #include "magnus_compression.h"
 #include "magnus_proxy.h"
+#include "magnus_realip.h"
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -152,6 +153,27 @@ typedef struct {
      * over. See magnus_quic_http_recv_header()'s own comment for the
      * capture side. */
     magnus_http_request_t parsed;
+    /* Real IP (roadmap 2b, extended to HTTP/3 here): this stream's own
+     * resolved client address, the h3 analogue of struct
+     * magnus_h2_stream's own identically-named field (see that
+     * struct's own comment for why a *per-stream* field, not an
+     * in-place overwrite of the connection's own raw peer address the
+     * way HTTP/1.1 safely can -- a QUIC connection multiplexes many
+     * concurrent streams exactly like h2 does, so a shared field could
+     * race between two sibling streams' own dispatch). Defaults to the
+     * connection's own raw QUIC peer address (magnus_quic_client_ip());
+     * magnus_quic_http_dispatch() overwrites it with a Forwarded/
+     * X-Forwarded-For-resolved value only when that raw peer address
+     * itself is in trusted_proxies -- never resolved from (or trusted
+     * because of) anything already-resolved, so a forged header from an
+     * untrusted hop can never borrow a trusted hop's own standing.
+     * PROXY protocol v1/v2 has no QUIC analogue (no raw preamble
+     * concept once ngtcp2/nghttp3 have already framed a stream's
+     * headers) and stays out of scope here -- Forwarded/X-Forwarded-For
+     * are ordinary HTTP header fields, parsed identically regardless of
+     * which protocol carried them, so this needed no new QUIC-specific
+     * mechanism at all, only wiring the existing one in. */
+    struct in_addr effective_client_address;
     bool head_only;
     /* The whole file, mmap()ed once at dispatch and handed to nghttp3
      * as a single vec (magnus_quic_http_read_file()) rather than
@@ -2140,7 +2162,15 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
         client_affinity[0] != '\0' ? client_affinity : NULL, &preferred_index);
     stream->issue_affinity_cookie = !sticky;
 
-    client_ip = magnus_quic_client_ip(connection);
+    /* Real IP (roadmap 2b, extended to HTTP/3 here): magnus_quic_http_
+     * dispatch() -- this function's own, only caller -- already resolved
+     * stream->effective_client_address before ever reaching this point,
+     * so client-IP-based cluster selection (this fallback, when no
+     * sticky affinity cookie applies) sees the same trusted-proxy-
+     * resolved address session affinity's own source_cidr route
+     * matching already does, rather than recomputing the raw QUIC peer
+     * address a second time here and getting an inconsistent answer. */
+    client_ip = stream->effective_client_address;
     stream->attempt = 0;
     for (;;) {
         int endpoint = sticky
@@ -2401,6 +2431,26 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
     if (forward_path[0] == '\0') forward_path = "/";
 
     client_ip = magnus_quic_client_ip(connection);
+    stream->effective_client_address = client_ip;
+    /* Real IP (roadmap 2b, extended to HTTP/3 here): resolved once, into
+     * this stream's own effective_client_address -- see that field's
+     * own comment on why per-stream, not connection->remote_addr
+     * itself. Trust is always decided against the connection's raw
+     * QUIC peer address (client_ip, just captured above), never
+     * against an already-resolved value, for the identical anti-
+     * forgery reason magnus_h2_dispatch()'s own identical block
+     * already documents. */
+    if (magnus_trusted_proxy_count > 0
+        && magnus_realip_is_trusted(magnus_trusted_proxies,
+                                    magnus_trusted_proxy_count, client_ip)) {
+        struct in_addr resolved;
+        if (magnus_realip_resolve_headers(&stream->parsed,
+                magnus_trusted_proxies, magnus_trusted_proxy_count,
+                &resolved)) {
+            stream->effective_client_address = resolved;
+            client_ip = resolved;
+        }
+    }
 
     /* Roadmap 4f: host/path-prefix/method/header/header_prefix/cookie/
      * query/source-CIDR route matching, reusing magnus_route_matches()
@@ -2413,11 +2463,11 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
      * magnus_proxy_pick_and_start()'s documented h1/h2 precedent), even
      * when both apply to the same request -- and, once matched, its own
      * `cache_enabled` (roadmap 4i) travels along with it into
-     * magnus_quic_proxy_start(). Deliberately NOT consulted here: Real
-     * IP resolution (source_cidr below matches against the raw QUIC
-     * peer address, not a trusted-proxy-resolved one -- QUIC has no
-     * established PROXY-protocol-over-UDP precedent in this codebase to
-     * resolve from in the first place). */
+     * magnus_quic_proxy_start(). `client_ip` here is already whatever
+     * the Real-IP block just above resolved it to (or the raw QUIC peer
+     * address unchanged, if resolution did not apply) -- source_cidr
+     * below matches against the same effective address the h1/h2 route
+     * tables already would for an equivalent trusted-proxy setup. */
     for (size_t r = 0; r < magnus_route_count; r++) {
         if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
                                   client_ip))

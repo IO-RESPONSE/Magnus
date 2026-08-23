@@ -10,9 +10,11 @@
  * response caching for proxy dispatch, 4j upstream connection pooling
  * for proxy dispatch, 2a-4 proxy dispatch response compression -- the
  * last of h1/h2/h3 to get it, closing out roadmap 2a's own cross-
- * protocol compression story) -- a UDP listener wired into Magnus's own
- * epoll reactor that completes a real ngtcp2 handshake using the
- * ngtcp2 + libngtcp2_crypto_ossl + nghttp3 stack chosen in
+ * protocol compression story; Real IP (roadmap 2b) extended to HTTP/3's
+ * own source_cidr route matching and client-IP-based cluster selection)
+ * -- a UDP listener wired into Magnus's own epoll reactor that
+ * completes a real ngtcp2 handshake using the ngtcp2 +
+ * libngtcp2_crypto_ossl + nghttp3 stack chosen in
  * docs/phase4-http3-quic-dependency-evaluation.md and verified working
  * against this host's OpenSSL in docs/phase4-spike-results.md, then
  * serves real HTTP/3 traffic over it -- src/magnus_quic.c's own section
@@ -26,12 +28,13 @@
  *     2a's own 8 MiB bound -- cross-cutting, not protocol-specific,
  *     applies equally to h1/h2/h3 now that all three share the same
  *     buffer-then-compress shape and the same bound
- *   - Real-IP-aware (trusted-proxy-resolved) source_cidr route
- *     matching (4f) or client-IP-based cluster selection (4h's own
- *     fallback when no sticky cookie applies) -- both match against
- *     the raw QUIC peer address only, since QUIC has no established
- *     PROXY-protocol-over-UDP precedent in this codebase to resolve a
- *     trusted client address from in the first place)
+ *   - PROXY protocol v1/v2 for QUIC: genuinely has no analogue here
+ *     (no raw preamble concept once ngtcp2/nghttp3 have already framed
+ *     a stream's headers, unlike a plain TCP byte stream) -- Forwarded/
+ *     X-Forwarded-For (roadmap 2b, now wired in above) cover the same
+ *     "trusted intermediary forwards the real client address" need
+ *     without requiring one, since those are ordinary HTTP header
+ *     fields parsed identically regardless of protocol
  * See docs/phase4-spike-results.md for 4a's own standalone
  * verification, and CHANGELOG.md for each shipped sub-phase's detail.
  */
@@ -49,7 +52,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.39.0"
+#define MAGNUS_VERSION "1.40.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

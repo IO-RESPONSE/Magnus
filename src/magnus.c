@@ -771,8 +771,11 @@ static uint64_t magnus_stream_bytes_u2c_total;
  * translation unit boundary. */
 magnus_route_t magnus_routes[MAGNUS_CONFIG_MAX_ROUTES];
 size_t magnus_route_count;
-static magnus_cidr_t magnus_trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
-static size_t magnus_trusted_proxy_count;
+/* Not `static` -- see src/magnus_static.h's own comment on why
+ * magnus_quic.c's HTTP/3 dispatch (roadmap 2b, extended here) needs
+ * this same trust list across a real translation unit boundary. */
+magnus_cidr_t magnus_trusted_proxies[MAGNUS_CONFIG_MAX_TRUSTED_PROXIES];
+size_t magnus_trusted_proxy_count;
 static magnus_connection_t *magnus_upstream_owner[MAGNUS_MAX_FDS];
 /* Parallel to magnus_upstream_owner[] above, for an upstream fd opened on
  * behalf of one HTTP/2 stream's proxy dispatch (1e-2) rather than a whole

@@ -15,6 +15,7 @@
  * rather than each maintaining its own copy, but magnus_quic.c calls
  * them across a real translation unit boundary rather than inline. */
 
+#include "magnus_config.h"
 #include "magnus_policy.h"
 #include "magnus_route.h"
 
@@ -80,6 +81,20 @@ extern bool magnus_upstream_enabled;
  * needs to do since it only ever indexes up to magnus_route_count). */
 extern magnus_route_t magnus_routes[];
 extern size_t magnus_route_count;
+
+/* Real IP (roadmap 2b), exposed here for the identical reason
+ * magnus_routes[]/magnus_route_count just above are: config state
+ * magnus.c owns and populates once at startup (magnus_apply_config()),
+ * read (never written) by magnus_quic.c's own HTTP/3 dispatch --
+ * magnus_realip_is_trusted()/magnus_realip_resolve_headers() themselves
+ * already have real prototypes in src/magnus_realip.h, which
+ * magnus_quic.c includes directly; only the trust-list data itself,
+ * with no natural header of its own, needs exposing here.
+ * `magnus_trusted_proxy_count` entries are valid in
+ * `magnus_trusted_proxies[]`, sized (MAGNUS_CONFIG_MAX_TRUSTED_PROXIES,
+ * src/magnus_config.h) only where it is actually defined, magnus.c. */
+extern magnus_cidr_t magnus_trusted_proxies[];
+extern size_t magnus_trusted_proxy_count;
 
 /* Resolves cluster endpoint `index` (`magnus_cluster`'s own indexing)
  * to a connectable IPv4 address, or false if `index` is out of range or

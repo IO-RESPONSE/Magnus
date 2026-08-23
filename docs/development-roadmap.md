@@ -496,7 +496,13 @@ connection-pool and common-request-model decisions).
     only the connection's true direct TCP peer. Was pulled ahead of the
     rest of Phase 2 exactly for the reason flagged above: ACL/rate-limit
     correctness downstream depends on knowing the real client address
-    first.
+    first. **Extended to HTTP/3 in 1.40.0** -- turned out to need no new
+    QUIC-specific mechanism, since Forwarded/X-Forwarded-For resolution
+    operates purely on already-parsed HTTP headers, identically
+    regardless of protocol; only PROXY protocol v1/v2 genuinely has no
+    QUIC analogue (no raw preamble concept once ngtcp2/nghttp3 have
+    already framed a stream's headers) and stays out of scope. See
+    `CHANGELOG.md` 1.40.0 for the full detail.
   - **gRPC 2c — sub-scoped the same way 1e was, given the same "expected
     to be the largest single piece of work" sizing:**
     - **2c-1 — h2-to-h2 upstream dispatch, unary RPCs only. Shipped in

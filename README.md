@@ -303,7 +303,14 @@ independently by IORESPONSE.
   except the body is buffered from a live upstream fetch first rather
   than read from an mmap'd file. Pooling, caching, and session affinity
   all keep working unmodified alongside it on every protocol
-- Container image: 10,356,903 bytes (~9.88 MiB), non-root, read-only rootfs
+- Real IP for HTTP/3 (roadmap 2b, extended): `source_cidr` route
+  matching and client-IP-based cluster selection now resolve a
+  trusted-proxy-forwarded Forwarded/X-Forwarded-For address over QUIC,
+  identically to HTTP/1.1 and HTTP/2 -- needed no new QUIC-specific
+  mechanism, since Forwarded/X-Forwarded-For are ordinary HTTP header
+  fields parsed the same way regardless of protocol. PROXY protocol
+  v1/v2 has no QUIC analogue and remains out of scope
+- Container image: 10,356,890 bytes (~9.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

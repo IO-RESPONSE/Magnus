@@ -4889,4 +4889,53 @@ backend_pid=
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation, proxy dispatch response compression ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l/2a-4, see src/magnus_quic.h)"
+
+# Real IP, HTTP/3 (roadmap 2b, extended here): Forwarded/X-Forwarded-For
+# resolution reaching source_cidr route matching over QUIC -- the exact
+# same config-file-mode proof (a resolved address makes a denied
+# source_cidr reachable/unreachable) the HTTP/1.1 realip block above
+# already gives, now for HTTP/3. PROXY protocol v1/v2 has no QUIC
+# analogue and stays untested here for that same reason (see
+# magnus_quic_stream_t's own effective_client_address comment).
+port_quic_realip=$((port + 133))
+port_quic_realip_udp=$((port + 134))
+quic_realip_root="$web_root/quic-realip"
+mkdir -p "$quic_realip_root"
+printf '%s\n' 'quic realip ok' >"$quic_realip_root/hello.txt"
+quic_realip_config="$web_root/quic-realip.conf"
+cat > "$quic_realip_config" <<EOF
+port = $port_quic_realip
+root = $quic_realip_root
+tls_cert = $web_root/quic-server.crt
+tls_key = $web_root/quic-server.key
+quic_listen = $port_quic_realip_udp
+trusted_proxies = 127.0.0.1/32
+route = source_cidr=9.9.9.0/24; action=deny
+EOF
+"$binary" --config "$quic_realip_config" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$port_quic_realip/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+
+# X-Forwarded-For from a trusted peer resolves and reaches routing: a
+# denied source_cidr becomes reachable through the header, proving this
+# is real request-time resolution over QUIC, not just an access-log
+# cosmetic.
+test "$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_realip_udp" /hello.txt - - - 9.9.9.9 | head -1)" \
+  = "status: 403"
+test "$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_realip_udp" /hello.txt - - - 1.2.3.4 | tail -1)" \
+  = "quic realip ok"
+# No X-Forwarded-For at all: routes against the raw QUIC peer address
+# (127.0.0.1 here), which the deny CIDR does not match either.
+test "$("$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_realip_udp" /hello.txt | tail -1)" = "quic realip ok"
+
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation, proxy dispatch response compression, Real-IP-aware source_cidr matching ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l/2a-4/2b, see src/magnus_quic.h)"
