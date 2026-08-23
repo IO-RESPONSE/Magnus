@@ -53,7 +53,10 @@ static ngtcp2_conn *g_conn;
 static nghttp3_conn *g_httpconn;
 static bool g_handshake_confirmed;
 static const char *g_request_path; /* NULL: handshake-only mode */
-static bool g_request_accept_gzip; /* roadmap 4e: send Accept-Encoding: gzip */
+/* roadmap 4e (gzip)/2a-5 (zstd): send Accept-Encoding: <this> when
+ * non-NULL -- the literal token itself, not just a bool, so this tool
+ * can exercise either negotiated encoding. */
+static const char *g_request_accept_encoding;
 static const char *g_request_cookie; /* roadmap 4h: send Cookie: <this> */
 static bool g_request_submitted;
 /* roadmap 4l: after the first request completes, rebind to a fresh
@@ -357,10 +360,11 @@ submit_request(void)
     headers[3] = (nghttp3_nv) { .name = (const uint8_t *) ":path",
         .value = (const uint8_t *) g_request_path, .namelen = 5,
         .valuelen = strlen(g_request_path) };
-    if (g_request_accept_gzip) {
+    if (g_request_accept_encoding != NULL) {
         headers[header_count] = (nghttp3_nv) {
             .name = (const uint8_t *) "accept-encoding",
-            .value = (const uint8_t *) "gzip", .namelen = 15, .valuelen = 4 };
+            .value = (const uint8_t *) g_request_accept_encoding, .namelen = 15,
+            .valuelen = strlen(g_request_accept_encoding) };
         header_count++;
     }
     if (g_request_cookie != NULL) {
@@ -605,14 +609,16 @@ main(int argc, char **argv)
 
     if (argc < 3 || argc > 8) {
         fprintf(stderr,
-            "usage: %s <host> <port> [request-path] [gzip|-] [cookie|-] "
-            "[migrate|-] [xff]\n", argv[0]);
+            "usage: %s <host> <port> [request-path] [gzip|zstd|-] "
+            "[cookie|-] [migrate|-] [xff]\n", argv[0]);
         return 2;
     }
     host = argv[1];
     port = strtoul(argv[2], NULL, 10);
     if (argc >= 4) g_request_path = argv[3];
-    if (argc >= 5) g_request_accept_gzip = strcmp(argv[4], "gzip") == 0;
+    if (argc >= 5 && (strcmp(argv[4], "gzip") == 0
+                       || strcmp(argv[4], "zstd") == 0))
+        g_request_accept_encoding = argv[4];
     /* "-" is a no-op sentinel here too (matching argv[4]'s own "gzip|-"
      * convention) -- needed so a caller that wants the trailing
      * "migrate"/xff args (roadmap 4l/2b) but no cookie does not have to

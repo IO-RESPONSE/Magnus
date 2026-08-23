@@ -5,7 +5,7 @@ ARG BASE_IMAGE=ioresponse/glibc71-base:poc
 FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates \
-        libssl-dev libnghttp2-dev zlib1g-dev \
+        libssl-dev libnghttp2-dev zlib1g-dev libzstd-dev \
         git autoconf automake libtool \
     && rm -rf /var/lib/apt/lists/*
 

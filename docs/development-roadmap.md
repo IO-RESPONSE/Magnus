@@ -489,6 +489,29 @@ connection-pool and common-request-model decisions).
       the outset, so the exact scenario that exposed 2a-3's own gap
       passed on the first attempt here. See `CHANGELOG.md` 1.39.0 for
       the full detail.
+    - **2a-5 — zstd as a second negotiable encoding. Shipped in 1.41.0.**
+      Joins gzip, preferred whenever a client's `Accept-Encoding` offers
+      both, across *both* static-file and proxy-dispatch compression, on
+      all three protocols at once -- the first compression increment to
+      be genuinely cross-cutting from the start rather than shipped
+      protocol-by-protocol the way 2a-2/2a-3/2a-4 were. Chosen over
+      Brotli for this increment on two concrete grounds: `libzstd.so.1`
+      was already being copied into the runtime image as a transitive
+      OpenSSL 3.5+ dependency (Brotli would need two new `.so` files),
+      and zstd's fast default level (`ZSTD_CLEVEL_DEFAULT`) suits this
+      codebase's compress-fresh-on-every-request design, unlike
+      Brotli's asset-tuned default quality 11. The old boolean
+      `magnus_accepts_gzip()` became `magnus_negotiate_encoding()`,
+      returning a `magnus_encoding_t` (`NONE`/`GZIP`/`ZSTD`); q-value
+      exclusion stays deliberately unhonored, matching the old
+      function's own already-established behavior (an existing unit
+      test already asserted `magnus_accepts_gzip("GZip;q=0")` true).
+      `magnus_proxy_sanitize_response_headers()` gained a
+      `compressed_content_encoding` parameter alongside its existing
+      `compressed_content_length` override, so the one shared h1/h2/h3
+      header rewriter emits whichever encoding was actually negotiated
+      instead of a hardcoded `"gzip"`. See `CHANGELOG.md` 1.41.0 for the
+      full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

@@ -14,7 +14,13 @@ LDFLAGS ?= -Wl,-z,relro,-z,now
 # magnus_quic.c) -- 4a linked nothing from it (confirmed via the
 # shipped binary's own dynamic dependency list), per Section 5's own
 # "record a dependency when it's actually adopted, not before" rule.
-LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lngtcp2 \
+# -lzstd joined in 2a-5 (Zstandard response compression,
+# src/magnus_compression.c) -- its runtime library was already bundled
+# into the Docker image (Dockerfile's own libzstd.so.1 copy predates
+# this: a transitive OpenSSL 3.5+ dependency, unused by Magnus's own
+# code until now), so this is a build-time-only addition for the image,
+# not a new runtime footprint.
+LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lzstd -lngtcp2 \
           -lngtcp2_crypto_ossl -lnghttp3
 
 SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
@@ -179,13 +185,13 @@ build/test-compression: tests/test-compression.c src/magnus_compression.c \
 		src/magnus_compression.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-compression.c \
-		src/magnus_compression.c -lz -o $@
+		src/magnus_compression.c -lz -lzstd -o $@
 
 build/fuzz-compression: tests/fuzz-compression.c src/magnus_compression.c \
 		src/magnus_compression.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-compression.c \
-		src/magnus_compression.c -lz -o $@
+		src/magnus_compression.c -lz -lzstd -o $@
 
 build/test-realip: tests/test-realip.c src/magnus_realip.c src/magnus_realip.h \
 		src/magnus_route.c src/magnus_http.c src/magnus_config.h

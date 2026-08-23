@@ -432,10 +432,9 @@ typedef struct {
     char *cache_serve_body;
     size_t cache_serve_body_length;
     size_t cache_serve_body_sent;
-    /* Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2) --
-     * the same "narrow the first cut" shape every Phase 2/4 feature in
-     * this codebase has already used once: HTTP/1.1 only for now, h2/h3
-     * a later increment (see CHANGELOG.md's own 2a-2 entry). Unlike
+    /* Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2; h2
+     * and h3 followed in 2a-3/2a-4; a second candidate encoding, zstd,
+     * joined gzip in 2a-5). Unlike
      * cache_capture (a pure side observation that never affects the
      * normal client-facing relay -- see that field's own comment),
      * compression genuinely changes what gets relayed: the *entire*
@@ -443,14 +442,22 @@ typedef struct {
      * about this response reaches the client at all, so
      * proxy_compress_pending gates the ordinary relay logic in
      * magnus_handle_upstream()/magnus_proxy_flush() directly rather
-     * than running alongside it. proxy_accept_gzip is decided once, at
-     * dispatch time (magnus_proxy_pick_and_start()), from the client's
-     * own original Accept-Encoding -- like cache_host/cache_target, the
-     * client's parsed request does not survive the asynchronous
-     * upstream fetch. proxy_compress_raw_headers/_length preserve the
-     * *raw*, pre-sanitize upstream header block (magnus_proxy_receive_
-     * headers()'s own header_copy, still pristine at that point -- see
-     * that function's own comment on why) so
+     * than running alongside it. proxy_accept_encoding is decided once,
+     * at dispatch time (magnus_proxy_pick_and_start()), from the
+     * client's own original Accept-Encoding (magnus_negotiate_encoding(),
+     * roadmap 2a-5 -- zstd preferred over gzip when the client offers
+     * both) -- like cache_host/cache_target, the client's parsed
+     * request does not survive the asynchronous upstream fetch.
+     * proxy_compress_encoding is a *copy* of that decision, taken at
+     * eligibility time (once content-type/status/length are also
+     * known) rather than proxy_accept_encoding being read again
+     * directly at finalize time, purely so magnus_proxy_finish_
+     * compression() never has to re-derive "which encoding did I
+     * commit to" from two separate fields whose eligibility gates
+     * could in principle diverge. proxy_compress_raw_headers/_length
+     * preserve the *raw*, pre-sanitize upstream header block
+     * (magnus_proxy_receive_headers()'s own header_copy, still pristine
+     * at that point -- see that function's own comment on why) so
      * magnus_proxy_finish_compression() can call magnus_proxy_sanitize_
      * response_headers() a *second* time, once the real compressed
      * length is known, without having kept the upstream socket's raw
@@ -468,11 +475,12 @@ typedef struct {
      * body/_length/_sent are the *final*, client-facing bytes
      * (magnus_proxy_flush()'s own second write loop sends from here
      * instead of proxy_buffer whenever non-NULL) -- either the actual
-     * gzip output, or (magnus_gzip_compress() failing on nothing but an
-     * allocation, the only way it ever fails) the captured raw bytes
-     * relayed uncompressed as a graceful fallback rather than losing
-     * the response outright. */
-    bool proxy_accept_gzip;
+     * compressed output, or (the chosen encoding's own compress
+     * function failing on nothing but an allocation, the only way
+     * either ever fails) the captured raw bytes relayed uncompressed as
+     * a graceful fallback rather than losing the response outright. */
+    magnus_encoding_t proxy_accept_encoding;
+    magnus_encoding_t proxy_compress_encoding;
     bool proxy_compress_pending;
     char *proxy_compress_capture;
     size_t proxy_compress_capture_length;
@@ -1993,8 +2001,10 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
      * only: HEAD carries a declared Content-Length with no body bytes
      * ever following it, which "buffer exactly content_length body
      * bytes, then compress" has no sensible answer for. */
-    connection->proxy_accept_gzip = strcmp(request->method, "GET") == 0
-        && magnus_accepts_gzip(magnus_http_header_find(parsed, "accept-encoding"));
+    connection->proxy_accept_encoding = strcmp(request->method, "GET") == 0
+        ? magnus_negotiate_encoding(
+              magnus_http_header_find(parsed, "accept-encoding"))
+        : MAGNUS_ENCODING_NONE;
     if (cache_route_enabled && strcmp(request->method, "GET") == 0) {
         strncpy(connection->cache_host, parsed->host,
                sizeof(connection->cache_host) - 1);
@@ -2267,32 +2277,41 @@ magnus_proxy_connect_failed(int epoll_fd, magnus_connection_t *connection,
 /* Roadmap 2a-2: called from magnus_proxy_flush() the moment a
  * compress-pending response's body is fully captured (or the upstream
  * closed early -- see that call site's own comment). Compresses
- * connection->proxy_compress_capture via magnus_gzip_compress(), then
- * calls magnus_proxy_sanitize_response_headers() a *second* time on
- * proxy_compress_raw_headers (the pristine raw upstream header block
- * magnus_proxy_receive_headers() stashed for exactly this), this time
- * with the real compressed length so it emits Content-Length/Content-
- * Encoding/Vary for the compressed body instead of relaying the
- * upstream's own uncompressed Content-Length line. Populates
- * proxy_header_out and proxy_compressed_body for magnus_proxy_flush()'s
- * own write loops to actually send. magnus_gzip_compress() only ever
- * fails on an allocation failure (never on well-formed input), so that
- * one case falls back to relaying the captured bytes uncompressed
- * (ownership of proxy_compress_capture transfers straight into
- * proxy_compressed_body, no extra copy) rather than losing the response
- * outright. Returns 0 on success, -1 only if even the *second* sanitize
- * call or its own header_out allocation fails -- a genuinely
- * unrecoverable case at this point (nothing has reached the client yet
- * either way), handled by the caller exactly like any other proxy abort. */
+ * connection->proxy_compress_capture via magnus_gzip_compress() or
+ * magnus_zstd_compress() (roadmap 2a-5; whichever connection->
+ * proxy_compress_encoding was negotiated back in magnus_proxy_receive_
+ * headers()'s own eligibility check), then calls magnus_proxy_sanitize_
+ * response_headers() a *second* time on proxy_compress_raw_headers (the
+ * pristine raw upstream header block magnus_proxy_receive_headers()
+ * stashed for exactly this), this time with the real compressed length
+ * and encoding name so it emits Content-Length/Content-Encoding/Vary for
+ * the compressed body instead of relaying the upstream's own
+ * uncompressed Content-Length line. Populates proxy_header_out and
+ * proxy_compressed_body for magnus_proxy_flush()'s own write loops to
+ * actually send. Neither compress function ever fails except on an
+ * allocation failure (never on well-formed input), so that one case
+ * falls back to relaying the captured bytes uncompressed (ownership of
+ * proxy_compress_capture transfers straight into proxy_compressed_body,
+ * no extra copy) rather than losing the response outright. Returns 0 on
+ * success, -1 only if even the *second* sanitize call or its own
+ * header_out allocation fails -- a genuinely unrecoverable case at this
+ * point (nothing has reached the client yet either way), handled by the
+ * caller exactly like any other proxy abort. */
 static int
 magnus_proxy_finish_compression(magnus_connection_t *connection)
 {
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
-    bool compressed_ok = magnus_gzip_compress(
-        (unsigned char *) connection->proxy_compress_capture,
-        connection->proxy_compress_capture_length,
-        &compressed, &compressed_length) == 0;
+    bool compressed_ok = connection->proxy_compress_encoding
+            == MAGNUS_ENCODING_ZSTD
+        ? magnus_zstd_compress(
+              (unsigned char *) connection->proxy_compress_capture,
+              connection->proxy_compress_capture_length,
+              &compressed, &compressed_length) == 0
+        : magnus_gzip_compress(
+              (unsigned char *) connection->proxy_compress_capture,
+              connection->proxy_compress_capture_length,
+              &compressed, &compressed_length) == 0;
     char sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
@@ -2306,7 +2325,11 @@ magnus_proxy_finish_compression(magnus_connection_t *connection)
         connection->proxy_issue_affinity_cookie
             ? connection->proxy_affinity_key : NULL,
         connection->proxy_client_wants_close,
-        compressed_ok ? compressed_length : (size_t) -1, &info, NULL);
+        compressed_ok ? compressed_length : (size_t) -1,
+        compressed_ok
+            ? magnus_encoding_name(connection->proxy_compress_encoding)
+            : NULL,
+        &info, NULL);
     if (sanitized_length < 0) {
         free(compressed);
         return -1;
@@ -2605,7 +2628,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
                      * ever learns the *uncompressed* framing/content-
                      * type -- see magnus_proxy_finish_compression()'s
                      * own second call for the compressed one */,
-        &info, &cacheable_prefix_length);
+        NULL, &info, &cacheable_prefix_length);
     if (sanitized_length < 0)
         return magnus_proxy_connect_failed(epoll_fd, connection, 502,
                                            "Bad Gateway");
@@ -2745,7 +2768,8 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
      * bound). A response with no unambiguous Content-Length is also
      * never eligible: "buffer exactly this many bytes, then compress"
      * has no sensible answer for a chunked/close-delimited body. */
-    bool try_compress = connection->proxy_accept_gzip && info.status == 200
+    bool try_compress = connection->proxy_accept_encoding != MAGNUS_ENCODING_NONE
+        && info.status == 200
         && !info.has_content_encoding && info.has_content_length
         && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
         && info.content_length <= MAGNUS_COMPRESSION_MAX_SIZE
@@ -2761,6 +2785,7 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
          * header_copy intact) so magnus_proxy_finish_compression() can
          * sanitize it a second time, with the real compressed
          * Content-Length, once compression completes. */
+        connection->proxy_compress_encoding = connection->proxy_accept_encoding;
         memcpy(connection->proxy_compress_raw_headers, header_copy,
               header_length + 1);
         connection->proxy_compress_raw_headers_length = header_length;
@@ -3212,8 +3237,13 @@ magnus_content_type(const char *path)
 
 /* The first compression increment buffers bounded static files completely so
  * both protocols can send an exact compressed Content-Length. Files outside
- * the 256-byte..8-MiB window retain their existing streaming path. */
-static int
+ * the 256-byte..8-MiB window retain their existing streaming path. Roadmap
+ * 2a-5: returns the negotiated magnus_encoding_t (MAGNUS_ENCODING_NONE if
+ * this file is not being compressed at all, for any reason -- ineligible
+ * size/content-type, the client offered neither gzip nor zstd, or an
+ * allocation failure) instead of the old plain 0/1, so callers know which
+ * encoding name to put in their own Content-Encoding header. */
+static magnus_encoding_t
 magnus_compress_static(int fd, const struct stat *metadata,
                        const magnus_http_request_t *request,
                        const char *content_type, unsigned char **output,
@@ -3222,29 +3252,35 @@ magnus_compress_static(int fd, const struct stat *metadata,
     unsigned char *input;
     size_t length;
     size_t offset = 0;
+    magnus_encoding_t encoding;
     if (metadata->st_size < MAGNUS_COMPRESSION_MIN_SIZE
         || metadata->st_size > MAGNUS_COMPRESSION_MAX_SIZE
-        || !magnus_content_type_compressible(content_type)
-        || !magnus_accepts_gzip(
-            magnus_http_header_find(request, "accept-encoding"))) return 0;
+        || !magnus_content_type_compressible(content_type))
+        return MAGNUS_ENCODING_NONE;
+    encoding = magnus_negotiate_encoding(
+        magnus_http_header_find(request, "accept-encoding"));
+    if (encoding == MAGNUS_ENCODING_NONE) return MAGNUS_ENCODING_NONE;
     length = (size_t) metadata->st_size;
     input = malloc(length);
-    if (input == NULL) return 0;
+    if (input == NULL) return MAGNUS_ENCODING_NONE;
     while (offset < length) {
         ssize_t got = pread(fd, input + offset, length - offset, (off_t) offset);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) {
             free(input);
-            return 0;
+            return MAGNUS_ENCODING_NONE;
         }
         offset += (size_t) got;
     }
-    if (magnus_gzip_compress(input, length, output, output_length) != 0) {
+    if ((encoding == MAGNUS_ENCODING_ZSTD
+             ? magnus_zstd_compress(input, length, output, output_length)
+             : magnus_gzip_compress(input, length, output, output_length))
+        != 0) {
         free(input);
-        return 0;
+        return MAGNUS_ENCODING_NONE;
     }
     free(input);
-    return 1;
+    return encoding;
 }
 
 int
@@ -3299,20 +3335,27 @@ magnus_prepare_file_response(magnus_connection_t *connection, int file_fd,
     const char *content_type = magnus_content_type(request->path);
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
-    bool use_gzip = magnus_compress_static(file_fd, metadata, parsed,
-                                           content_type, &compressed,
-                                           &compressed_length) == 1;
+    magnus_encoding_t encoding = magnus_compress_static(file_fd, metadata,
+                                                         parsed, content_type,
+                                                         &compressed,
+                                                         &compressed_length);
+    bool use_gzip = encoding != MAGNUS_ENCODING_NONE;
+    char content_encoding_header[32] = "";
     long long response_length = use_gzip
         ? (long long) compressed_length : (long long) metadata->st_size;
     request->status = 200;
     magnus_requests_total++;
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_RESPONSE, request);
+    if (use_gzip) {
+        snprintf(content_encoding_header, sizeof(content_encoding_header),
+                 "Content-Encoding: %s\r\n", magnus_encoding_name(encoding));
+    }
     written = snprintf(connection->output, sizeof(connection->output),
         "HTTP/1.1 200 OK\r\nServer: Magnus/%s\r\nContent-Type: %s\r\n"
         "Content-Length: %lld\r\n%s%sConnection: %s\r\nAccept-Ranges: bytes\r\n"
         "X-Magnus-Engine: native-c17/0.1\r\nX-Magnus-Request-Id: %s\r\n\r\n",
         MAGNUS_VERSION, content_type, response_length,
-        use_gzip ? "Content-Encoding: gzip\r\n" : "",
+        content_encoding_header,
         use_gzip ? "Vary: Accept-Encoding\r\n" : "",
         close_connection ? "close" : "keep-alive",
         request->request_id);
@@ -3508,6 +3551,13 @@ struct magnus_h2_stream {
      * file h2 compression path (magnus_h2_dispatch_static()) -- roadmap
      * 2a's own first increment -- already does. */
     bool compress_pending;
+    /* Roadmap 2a-5: which encoding (gzip or zstd) was negotiated for
+     * this stream, decided once in magnus_h2_proxy_receive_headers()'s
+     * own eligibility block and read back later by magnus_h2_proxy_
+     * finish_compression() -- the h2 analogue of magnus_connection_t's
+     * own proxy_compress_encoding field. Only meaningful when
+     * compress_pending is true. */
+    magnus_encoding_t compress_encoding;
     char *compress_capture;
     size_t compress_capture_length;
     size_t compress_capture_capacity;
@@ -3872,6 +3922,7 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     const char *content_type;
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
+    magnus_encoding_t encoding;
     bool use_gzip;
 
     fd = magnus_open_static(stream->parsed.target, &metadata);
@@ -3881,9 +3932,10 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     }
     stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
     content_type = magnus_content_type(stream->parsed.target);
-    use_gzip = magnus_compress_static(fd, &metadata, &stream->parsed,
+    encoding = magnus_compress_static(fd, &metadata, &stream->parsed,
                                       content_type, &compressed,
-                                      &compressed_length) == 1;
+                                      &compressed_length);
+    use_gzip = encoding != MAGNUS_ENCODING_NONE;
     stream->file_offset = 0;
     stream->file_length = use_gzip ? (off_t) compressed_length : metadata.st_size;
     snprintf(content_length, sizeof(content_length), "%lld",
@@ -3893,7 +3945,7 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     headers[2] = magnus_h2_nv("content-type", content_type);
     headers[3] = magnus_h2_nv("content-length", content_length);
     if (use_gzip) {
-        headers[4] = magnus_h2_nv("content-encoding", "gzip");
+        headers[4] = magnus_h2_nv("content-encoding", magnus_encoding_name(encoding));
         headers[5] = magnus_h2_nv("vary", "Accept-Encoding");
         header_count = 6;
     }
@@ -5263,10 +5315,15 @@ magnus_h2_proxy_finish_compression(struct magnus_h2_stream *stream)
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
     bool compressed_ok;
-    compressed_ok = magnus_gzip_compress(
-        (unsigned char *) stream->compress_capture,
-        stream->compress_capture_length, &compressed, &compressed_length)
-        == 0;
+    compressed_ok = stream->compress_encoding == MAGNUS_ENCODING_ZSTD
+        ? magnus_zstd_compress(
+              (unsigned char *) stream->compress_capture,
+              stream->compress_capture_length, &compressed,
+              &compressed_length) == 0
+        : magnus_gzip_compress(
+              (unsigned char *) stream->compress_capture,
+              stream->compress_capture_length, &compressed,
+              &compressed_length) == 0;
     char sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
@@ -5279,7 +5336,9 @@ magnus_h2_proxy_finish_compression(struct magnus_h2_stream *stream)
         stream->issue_affinity_cookie ? stream->affinity_key : NULL,
         true /* client_wants_close: N/A for h2, same reasoning as the
               * first sanitize call already had */,
-        compressed_ok ? compressed_length : (size_t) -1, &info, NULL);
+        compressed_ok ? compressed_length : (size_t) -1,
+        compressed_ok ? magnus_encoding_name(stream->compress_encoding) : NULL,
+        &info, NULL);
     if (sanitized_length < 0) {
         free(compressed);
         return -1;
@@ -5457,7 +5516,7 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
                      * ever learns the *uncompressed* framing/content-
                      * type -- see magnus_h2_proxy_finish_compression()'s
                      * own second call for the compressed one (roadmap
-                     * 2a-3) */, &info,
+                     * 2a-3) */, NULL, &info,
         &cacheable_prefix_length);
     if (sanitized_length < 0) {
         magnus_h2_proxy_connect_failed(connection, stream, "502");
@@ -5548,12 +5607,14 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
      * identical HTTP/1.1 comment for the exact bounds/rationale.
      * stream->parsed (this struct's own persistent copy of the client's
      * request, unlike HTTP/1.1's stack-local one) is read directly
-     * here instead of needing a separate proxy_accept_gzip field
+     * here instead of needing a separate proxy_accept_encoding field
      * captured at dispatch time. */
     {
-        bool try_compress = strcmp(stream->parsed.method, "GET") == 0
-            && magnus_accepts_gzip(
-                   magnus_http_header_find(&stream->parsed, "accept-encoding"))
+        magnus_encoding_t encoding = strcmp(stream->parsed.method, "GET") == 0
+            ? magnus_negotiate_encoding(
+                  magnus_http_header_find(&stream->parsed, "accept-encoding"))
+            : MAGNUS_ENCODING_NONE;
+        bool try_compress = encoding != MAGNUS_ENCODING_NONE
             && info.status == 200 && !info.has_content_encoding
             && info.has_content_length
             && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
@@ -5571,6 +5632,7 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
              * completes. Captured, not relayed, for the identical
              * reason: nothing about this response is client-visible
              * yet. */
+            stream->compress_encoding = encoding;
             memcpy(stream->compress_raw_headers, header_copy,
                   header_length + 1);
             stream->compress_raw_headers_length = header_length;

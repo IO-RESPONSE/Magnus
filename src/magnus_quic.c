@@ -146,8 +146,8 @@ typedef struct {
      * stream->parsed (magnus.c), reused verbatim here (not a QUIC-local
      * near-copy) specifically so magnus_route_matches() (roadmap 4f:
      * host/path-prefix/method/header/header_prefix/cookie/query/
-     * source-CIDR route matching) and magnus_accepts_gzip() (roadmap
-     * 4e, via magnus_http_header_find(&stream->parsed,
+     * source-CIDR route matching) and magnus_negotiate_encoding()
+     * (roadmap 4e/2a-5, via magnus_http_header_find(&stream->parsed,
      * "accept-encoding") -- no longer a separate ad hoc field) both
      * work identically regardless of which protocol a request arrived
      * over. See magnus_quic_http_recv_header()'s own comment for the
@@ -284,6 +284,11 @@ typedef struct {
      * body_chunk allocation, going through that exact same existing
      * lifecycle unchanged. */
     bool compress_pending;
+    /* Roadmap 2a-5: which encoding (gzip or zstd) was negotiated for
+     * this stream -- the h3 analogue of struct magnus_h2_stream's own
+     * identically-purposed compress_encoding field; see that struct's
+     * own comment. Only meaningful when compress_pending is true. */
+    magnus_encoding_t compress_encoding;
     char *compress_capture;
     size_t compress_capture_length;
     size_t compress_capture_capacity;
@@ -1337,10 +1342,15 @@ magnus_quic_proxy_finish_compression(magnus_quic_connection_t *connection,
     magnus_proxy_response_info_t info;
     int sanitized_length;
 
-    compressed_ok = magnus_gzip_compress(
-        (unsigned char *) stream->compress_capture,
-        stream->compress_capture_length, &compressed, &compressed_length)
-        == 0;
+    compressed_ok = stream->compress_encoding == MAGNUS_ENCODING_ZSTD
+        ? magnus_zstd_compress(
+              (unsigned char *) stream->compress_capture,
+              stream->compress_capture_length, &compressed,
+              &compressed_length) == 0
+        : magnus_gzip_compress(
+              (unsigned char *) stream->compress_capture,
+              stream->compress_capture_length, &compressed,
+              &compressed_length) == 0;
 
     memcpy(sanitize_scratch, stream->compress_raw_headers,
           stream->compress_raw_headers_length + 1);
@@ -1349,7 +1359,9 @@ magnus_quic_proxy_finish_compression(magnus_quic_connection_t *connection,
         stream->issue_affinity_cookie ? stream->affinity_key : NULL,
         true /* client_wants_close: N/A for h3, same reasoning as the
               * first sanitize call already had */,
-        compressed_ok ? compressed_length : (size_t) -1, &info, NULL);
+        compressed_ok ? compressed_length : (size_t) -1,
+        compressed_ok ? magnus_encoding_name(stream->compress_encoding) : NULL,
+        &info, NULL);
     if (sanitized_length < 0) {
         free(compressed);
         return -1;
@@ -1532,7 +1544,7 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
                          * content-type -- see magnus_quic_proxy_finish_
                          * compression()'s own second call for the
                          * compressed one (roadmap 2a-4) */,
-            &info,
+            NULL, &info,
             &cacheable_prefix_length /* roadmap 4i: bytes of `sanitized`
                                        * that are safe for
                                        * magnus_cache_store() -- see
@@ -1630,11 +1642,13 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
      * stream->parsed (this struct's own persistent copy of the
      * client's request, the same shape magnus_h2_stream's own has) is
      * read directly here instead of needing a separate
-     * proxy_accept_gzip field captured at dispatch time. */
+     * proxy_accept_encoding field captured at dispatch time. */
     {
-        bool try_compress = strcmp(stream->parsed.method, "GET") == 0
-            && magnus_accepts_gzip(
-                   magnus_http_header_find(&stream->parsed, "accept-encoding"))
+        magnus_encoding_t encoding = strcmp(stream->parsed.method, "GET") == 0
+            ? magnus_negotiate_encoding(
+                  magnus_http_header_find(&stream->parsed, "accept-encoding"))
+            : MAGNUS_ENCODING_NONE;
+        bool try_compress = encoding != MAGNUS_ENCODING_NONE
             && info.status == 200 && !info.has_content_encoding
             && info.has_content_length
             && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
@@ -1652,6 +1666,7 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
              * once compression completes. Captured, not relayed, for
              * the identical reason: nothing about this response is
              * client-visible yet. */
+            stream->compress_encoding = encoding;
             memcpy(stream->compress_raw_headers, header_copy,
                   header_length + 1);
             stream->compress_raw_headers_length = header_length;
@@ -2211,24 +2226,24 @@ magnus_quic_proxy_start(magnus_quic_connection_t *connection,
     }
 }
 
-/* gzip-compresses fd's whole contents into a fresh malloc()ed buffer,
- * the h3 analogue of magnus_compress_static() -- duplicated rather
- * than reused directly because that function takes a
- * `magnus_http_request_t *` purely to reach
- * magnus_http_header_find(request, "accept-encoding"), and pulling in
- * magnus_http.h just for that would coupled this module to a request
- * shape it does not otherwise use anywhere (magnus_quic_stream_t
- * already carries its own flat accept_encoding field, captured
- * straight off the QPACK static-table token -- see that field's own
- * comment). Same eligibility rule (256 bytes..8 MiB, compressible MIME
- * type, client advertises gzip) and the same "buffer the whole file,
- * compress once, exact Content-Length" shape 2a already established
- * for HTTP/1.1 and HTTP/2. Returns true and fills `*output`/
- * `*output_length` on success (caller owns the buffer); false leaves
- * both untouched and the caller falls back to the uncompressed path,
- * exactly like magnus_compress_static()'s own every-failure-mode
- * contract. */
-static bool
+/* Compresses fd's whole contents into a fresh malloc()ed buffer, the h3
+ * analogue of magnus_compress_static() -- duplicated rather than reused
+ * directly because that function takes a `magnus_http_request_t *`
+ * purely to reach magnus_http_header_find(request, "accept-encoding"),
+ * and pulling in magnus_http.h just for that would coupled this module
+ * to a request shape it does not otherwise use anywhere
+ * (magnus_quic_stream_t already carries its own flat accept_encoding
+ * field, captured straight off the QPACK static-table token -- see
+ * that field's own comment). Same eligibility rule (256 bytes..8 MiB,
+ * compressible MIME type, client advertises gzip and/or zstd -- roadmap
+ * 2a-5) and the same "buffer the whole file, compress once, exact
+ * Content-Length" shape 2a already established for HTTP/1.1 and
+ * HTTP/2. Returns the negotiated encoding and fills `*output`/
+ * `*output_length` on success (caller owns the buffer);
+ * MAGNUS_ENCODING_NONE leaves both untouched and the caller falls back
+ * to the uncompressed path, exactly like magnus_compress_static()'s own
+ * every-failure-mode contract. */
+static magnus_encoding_t
 magnus_quic_compress_static(int fd, const struct stat *metadata,
                             const char *content_type,
                             const char *accept_encoding,
@@ -2237,29 +2252,35 @@ magnus_quic_compress_static(int fd, const struct stat *metadata,
     unsigned char *input;
     size_t length;
     size_t offset = 0;
+    magnus_encoding_t encoding;
     if (metadata->st_size < MAGNUS_COMPRESSION_MIN_SIZE
         || metadata->st_size > MAGNUS_COMPRESSION_MAX_SIZE
-        || !magnus_content_type_compressible(content_type)
-        || !magnus_accepts_gzip(accept_encoding)) return false;
+        || !magnus_content_type_compressible(content_type))
+        return MAGNUS_ENCODING_NONE;
+    encoding = magnus_negotiate_encoding(accept_encoding);
+    if (encoding == MAGNUS_ENCODING_NONE) return MAGNUS_ENCODING_NONE;
     length = (size_t) metadata->st_size;
     input = malloc(length);
-    if (input == NULL) return false;
+    if (input == NULL) return MAGNUS_ENCODING_NONE;
     while (offset < length) {
         ssize_t got = pread(fd, input + offset, length - offset,
                             (off_t) offset);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) {
             free(input);
-            return false;
+            return MAGNUS_ENCODING_NONE;
         }
         offset += (size_t) got;
     }
-    if (magnus_gzip_compress(input, length, output, output_length) != 0) {
+    if ((encoding == MAGNUS_ENCODING_ZSTD
+             ? magnus_zstd_compress(input, length, output, output_length)
+             : magnus_gzip_compress(input, length, output, output_length))
+        != 0) {
         free(input);
-        return false;
+        return MAGNUS_ENCODING_NONE;
     }
     free(input);
-    return true;
+    return encoding;
 }
 
 /* Serves stream->parsed.target as a static file -- the fallback once
@@ -2279,6 +2300,7 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     int fd;
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
+    magnus_encoding_t encoding;
     bool use_gzip;
 
     fd = magnus_open_static(stream->parsed.target, &metadata);
@@ -2291,11 +2313,12 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
      * a HEAD response still needs the *compressed* Content-Length to
      * be accurate (what a subsequent GET would actually transfer),
      * exactly like magnus_h2_dispatch_static()'s own ordering. */
-    use_gzip = magnus_quic_compress_static(fd, &metadata, content_type,
+    encoding = magnus_quic_compress_static(fd, &metadata, content_type,
                                            magnus_http_header_find(
                                                &stream->parsed,
                                                "accept-encoding"),
                                            &compressed, &compressed_length);
+    use_gzip = encoding != MAGNUS_ENCODING_NONE;
     snprintf(content_length, sizeof(content_length), "%lld",
             use_gzip ? (long long) compressed_length
                      : (long long) metadata.st_size);
@@ -2304,7 +2327,7 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     headers[2] = magnus_quic_nv("content-type", content_type);
     headers[3] = magnus_quic_nv("content-length", content_length);
     if (use_gzip) {
-        headers[4] = magnus_quic_nv("content-encoding", "gzip");
+        headers[4] = magnus_quic_nv("content-encoding", magnus_encoding_name(encoding));
         headers[5] = magnus_quic_nv("vary", "Accept-Encoding");
         header_count = 6;
     }

@@ -6,9 +6,15 @@
 #include <string.h>
 #include <strings.h>
 #include <zlib.h>
+#include <zstd.h>
 
-bool
-magnus_accepts_gzip(const char *accept_encoding)
+/* Shared token-scan core magnus_negotiate_encoding() below calls once
+ * per candidate encoding -- the exact same comma-separated-list walk
+ * (trim whitespace, strip a trailing `;q=...` parameter, ignore its
+ * value) magnus_accepts_gzip() used to do inline before roadmap 2a-5
+ * added a second candidate encoding worth checking for. */
+static bool
+has_token(const char *accept_encoding, const char *token, size_t token_len)
 {
     const char *cursor = accept_encoding;
     if (cursor == NULL) return false;
@@ -25,12 +31,31 @@ magnus_accepts_gzip(const char *accept_encoding)
             while (token_end > cursor && isspace((unsigned char) token_end[-1]))
                 token_end--;
         }
-        if ((size_t) (token_end - cursor) == 4
-            && strncasecmp(cursor, "gzip", 4) == 0) return true;
+        if ((size_t) (token_end - cursor) == token_len
+            && strncasecmp(cursor, token, token_len) == 0) return true;
         if (end == NULL) break;
         cursor = end + 1;
     }
     return false;
+}
+
+magnus_encoding_t
+magnus_negotiate_encoding(const char *accept_encoding)
+{
+    if (has_token(accept_encoding, "zstd", 4)) return MAGNUS_ENCODING_ZSTD;
+    if (has_token(accept_encoding, "gzip", 4)) return MAGNUS_ENCODING_GZIP;
+    return MAGNUS_ENCODING_NONE;
+}
+
+const char *
+magnus_encoding_name(magnus_encoding_t encoding)
+{
+    switch (encoding) {
+    case MAGNUS_ENCODING_ZSTD: return "zstd";
+    case MAGNUS_ENCODING_GZIP: return "gzip";
+    case MAGNUS_ENCODING_NONE: break;
+    }
+    return "";
 }
 
 bool
@@ -79,5 +104,31 @@ magnus_gzip_compress(const unsigned char *input, size_t input_length,
     *output_length = (size_t) stream.total_out;
     *output = compressed;
     deflateEnd(&stream);
+    return 0;
+}
+
+int
+magnus_zstd_compress(const unsigned char *input, size_t input_length,
+                     unsigned char **output, size_t *output_length)
+{
+    unsigned char *compressed;
+    size_t bound;
+    size_t written;
+    if (output == NULL || output_length == NULL
+        || (input == NULL && input_length != 0))
+        return -1;
+    *output = NULL;
+    *output_length = 0;
+    bound = ZSTD_compressBound(input_length);
+    compressed = malloc(bound == 0 ? 1 : bound);
+    if (compressed == NULL) return -1;
+    written = ZSTD_compress(compressed, bound, input, input_length,
+                            ZSTD_CLEVEL_DEFAULT);
+    if (ZSTD_isError(written)) {
+        free(compressed);
+        return -1;
+    }
+    *output_length = written;
+    *output = compressed;
     return 0;
 }

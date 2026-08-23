@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.41.0
+
+### Added
+
+- **zstd as a second negotiable compression encoding (roadmap 2a-5),
+  joining gzip -- across both static-file and proxy-dispatch
+  compression, on all three protocols at once.** Unlike 2a-2/2a-3/2a-4
+  (each shipped one protocol at a time), this increment is genuinely
+  cross-cutting from the start: every place that used to call the old
+  gzip-only API now negotiates between gzip and zstd identically,
+  whether serving an mmap'd static file or a live upstream proxy
+  response, over HTTP/1.1, HTTP/2, or HTTP/3.
+
+  zstd was chosen over Brotli for this increment on two concrete,
+  evidence-based grounds, not an arbitrary preference: (a)
+  `libzstd.so.1` was *already* being copied into the runtime image
+  (`Dockerfile`'s own pre-existing `cp -L .../libzstd.so.1` line), a
+  transitive dependency of OpenSSL 3.5+ that no Magnus code had ever
+  actually called -- so zstd support adds zero new runtime library
+  footprint, whereas Brotli would need two new `.so` files
+  (`libbrotlienc`, `libbrotlicommon`) bundled in; (b) zstd's default
+  compression level (`ZSTD_CLEVEL_DEFAULT` = 3) is fast, well-suited to
+  this codebase's "compress fresh on every qualifying request, never
+  cached compressed" design, unlike Brotli's default quality 11 (tuned
+  for precomputed static assets, too slow for on-the-fly per-request
+  compression of bodies up to 8 MiB). Brotli remains a separate, later,
+  well-documented increment -- the same "narrow the first cut, extend
+  later" pattern this codebase has used for every prior sub-phase.
+
+  The old boolean `magnus_accepts_gzip()` (`src/magnus_compression.h`)
+  became `magnus_negotiate_encoding()`, returning a new
+  `magnus_encoding_t` (`MAGNUS_ENCODING_NONE`/`_GZIP`/`_ZSTD`, `NONE`
+  always `0` so `!= MAGNUS_ENCODING_NONE` reads as the exact same
+  eligibility check every caller already had) -- zstd is preferred
+  whenever a client's `Accept-Encoding` offers both, in either order.
+  RFC 9110 q-value exclusion (e.g. `gzip;q=0`) stays deliberately
+  unhonored, matching the old function's own already-established
+  behavior -- confirmed via a pre-existing unit test asserting
+  `magnus_accepts_gzip("GZip;q=0")` was true -- rather than a new,
+  silent correctness gap; RFC 9110 12.5.3 permits any server policy
+  that excludes q=0, and this remains a documented simplification. A
+  new `magnus_zstd_compress()` (`ZSTD_compress()`/`ZSTD_compressBound()`,
+  the same one-shot shape `magnus_gzip_compress()` already has) sits
+  alongside the existing `magnus_gzip_compress()`.
+
+  `magnus_proxy_sanitize_response_headers()` (the shared h1/h2/h3
+  response header rewriter) gained a `compressed_content_encoding`
+  parameter immediately after its existing `compressed_content_length`
+  override -- unused when that length is `(size_t) -1` (no
+  compression), required otherwise -- so the one shared `Content-
+  Encoding: %s` emission site can name whichever encoding was actually
+  negotiated instead of a hardcoded `"gzip"`. Each protocol's own
+  proxy-dispatch eligibility/finish-compression pair (h1's
+  `connection->proxy_accept_encoding`/`proxy_compress_encoding`, h2's
+  and h3's own per-stream `compress_encoding`) was migrated the same
+  way; `magnus_compress_static()` (h1/h2 shared) and h3's own
+  `magnus_quic_compress_static()` now return the negotiated
+  `magnus_encoding_t` instead of a plain bool, for the same reason.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; `tests/test-compression.c` gained `zstd_round_trip()` (the
+  zstd analogue of the existing `gzip_round_trip()`) plus negotiation
+  assertions covering zstd alone, zstd-preferred-over-gzip in both
+  offer orders, and the unchanged q-value/absent-header/no-match cases;
+  `tests/fuzz-compression.c`'s seed corpus gained zstd-shaped entries.
+  `tests/test-proxy.c`'s `compressed_content_encoding` coverage now
+  includes a `"zstd"` case alongside the existing `"gzip"` one. New
+  `tests/test-core.sh` blocks (static-file and proxy-dispatch, all
+  three protocols) confirm `Accept-Encoding: zstd` gets back a
+  byte-exact `zstd`-decodable body with `Content-Encoding: zstd`/
+  `Vary: Accept-Encoding`, and that offering `gzip, zstd` together
+  always prefers zstd -- `tests/quic-handshake-check.c`'s own
+  `[gzip|zstd|-]` argument (previously gzip-only) drives the HTTP/3
+  cases. Docker image rebuilt (`libzstd-dev` added to the builder
+  stage; the runtime stage needed no change, `libzstd.so.1` was already
+  copied) and a live container tested directly across all three
+  protocols, static and proxied alike.
+
 ## 1.40.0
 
 ### Added

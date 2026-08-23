@@ -1855,6 +1855,24 @@ for protocol in --http1.1 --http2; do
     --dump-header "$gzip_headers" --output /dev/null \
     "https://127.0.0.1:$port_compression/image.png"
   ! grep -qi '^content-encoding: gzip' "$gzip_headers"
+
+  # Roadmap 2a-5: zstd is a second negotiable encoding, preferred over
+  # gzip whenever a client offers both -- curl's own libcurl here has no
+  # built-in zstd decoder (unlike gzip/brotli via --compressed), so the
+  # request/response is driven explicitly and decoded with the zstd CLI
+  # instead, the same shape the final byte-exact gzip check below uses.
+  zstd_headers="$web_root/zstd-${protocol#--}.headers"
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: zstd' \
+    --dump-header "$zstd_headers" --output "$web_root/zstd-${protocol#--}.out" \
+    "https://127.0.0.1:$port_compression/page.html"
+  grep -qi '^content-encoding: zstd' "$zstd_headers"
+  grep -qi '^vary: Accept-Encoding' "$zstd_headers"
+  zstd -dc "$web_root/zstd-${protocol#--}.out" | cmp "$compression_root/page.html" -
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip, zstd' \
+    --dump-header "$zstd_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compression/page.html"
+  grep -qi '^content-encoding: zstd' "$zstd_headers"
 done
 
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
@@ -1938,6 +1956,25 @@ for protocol in --http1.1 --http2; do
     --dump-header "$gzip_headers" --output /dev/null \
     "https://127.0.0.1:$port_compress_proxy/proxy/tiny.html"
   ! grep -qi '^content-encoding: gzip' "$gzip_headers"
+
+  # Roadmap 2a-5: zstd through the proxy dispatch path -- the same
+  # buffer-then-compress machinery as gzip above, just a different
+  # encoder/Content-Encoding, and (again) preferred over gzip when a
+  # client offers both.
+  zstd_headers="$web_root/compress-proxy-zstd-${protocol#--}.headers"
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: zstd' \
+    --dump-header "$zstd_headers" \
+    --output "$web_root/compress-proxy-zstd-${protocol#--}.out" \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  grep -qi '^content-encoding: zstd' "$zstd_headers"
+  grep -qi '^vary: Accept-Encoding' "$zstd_headers"
+  zstd -dc "$web_root/compress-proxy-zstd-${protocol#--}.out" \
+    | cmp "$compress_proxy_root/page.html" -
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip, zstd' \
+    --dump-header "$zstd_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  grep -qi '^content-encoding: zstd' "$zstd_headers"
 done
 
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
@@ -4120,6 +4157,15 @@ tail -n +3 "$web_root/quic-compress-plain-out" \
   /quic-compress.png gzip > "$web_root/quic-compress-png-out"
 grep -qE '^status: 200$' "$web_root/quic-compress-png-out"
 ! grep -q '^content-encoding:' "$web_root/quic-compress-png-out"
+# Roadmap 2a-5: zstd, negotiated identically to gzip above -- same
+# eligibility window/gate, just a different encoder/Content-Encoding.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-compress.html zstd > "$web_root/quic-compress-zstd-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-zstd-out"
+grep -qE '^content-encoding: zstd$' "$web_root/quic-compress-zstd-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-zstd-out"
+tail -n +5 "$web_root/quic-compress-zstd-out" | zstd -dc \
+  | diff - "$web_root/quic-compress.html"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
@@ -4882,6 +4928,18 @@ grep -qE '^status: 200$' "$web_root/quic-compress-proxy-png-out"
   > "$web_root/quic-compress-proxy-tiny-out"
 grep -qE '^status: 200$' "$web_root/quic-compress-proxy-tiny-out"
 ! grep -q '^content-encoding:' "$web_root/quic-compress-proxy-tiny-out"
+
+# Roadmap 2a-5: zstd through the HTTP/3 proxy dispatch path -- same
+# deferred-submission-until-compressed shape as gzip above, just a
+# different encoder/Content-Encoding.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/page.html zstd \
+  > "$web_root/quic-compress-proxy-zstd-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-zstd-out"
+grep -qE '^content-encoding: zstd$' "$web_root/quic-compress-proxy-zstd-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-zstd-out"
+tail -n +6 "$web_root/quic-compress-proxy-zstd-out" | zstd -dc \
+  | diff - "$compress_proxy_root/page.html"
 
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true

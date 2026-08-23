@@ -11,7 +11,9 @@
  * for proxy dispatch, 2a-4 proxy dispatch response compression -- the
  * last of h1/h2/h3 to get it, closing out roadmap 2a's own cross-
  * protocol compression story; Real IP (roadmap 2b) extended to HTTP/3's
- * own source_cidr route matching and client-IP-based cluster selection)
+ * own source_cidr route matching and client-IP-based cluster selection;
+ * 2a-5 zstd joining gzip as a second negotiable encoding, across static-
+ * file and proxy-dispatch compression alike, on all three protocols)
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -24,10 +26,16 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - Brotli/zstd; streaming/chunked compression for responses above
- *     2a's own 8 MiB bound -- cross-cutting, not protocol-specific,
- *     applies equally to h1/h2/h3 now that all three share the same
- *     buffer-then-compress shape and the same bound
+ *   - Brotli, as a third negotiable encoding alongside gzip/zstd (2a-5):
+ *     deferred on its own merits, not bundled into 2a-5 -- its default
+ *     quality (11) is tuned for precomputed static assets, too slow for
+ *     this codebase's on-the-fly per-request compression, and its
+ *     runtime libraries are not already present in the image the way
+ *     zstd's was (see CHANGELOG.md's own 2a-5 entry)
+ *   - streaming/chunked compression for responses above 2a's own 8 MiB
+ *     bound -- cross-cutting, not protocol-specific, applies equally to
+ *     h1/h2/h3 now that all three share the same buffer-then-compress
+ *     shape and the same bound
  *   - PROXY protocol v1/v2 for QUIC: genuinely has no analogue here
  *     (no raw preamble concept once ngtcp2/nghttp3 have already framed
  *     a stream's headers, unlike a plain TCP byte stream) -- Forwarded/
@@ -52,7 +60,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.40.0"
+#define MAGNUS_VERSION "1.41.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

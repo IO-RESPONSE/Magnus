@@ -11,8 +11,9 @@ independently by IORESPONSE.
   server runtime
 - Strict HTTP/1.0/1.1 parser, keep-alive, 8KiB request cap
 - Safe document root, MIME/HEAD, zero-copy `sendfile` static delivery
-- Negotiated gzip compression for 256-byte through 8 MiB compressible static
-  files over HTTP/1.1 and HTTP/2; other responses retain their streaming path
+- Negotiated gzip/zstd compression for 256-byte through 8 MiB compressible
+  static files over HTTP/1.1 and HTTP/2 (zstd preferred over gzip when a
+  client offers both); other responses retain their streaming path
 - Structured access log keyed by request ID
 - Native phase API: ingress → route → response → log
 - Per-request 128-bit trace ID, health endpoint, explicit error responses
@@ -245,8 +246,8 @@ independently by IORESPONSE.
 - HTTP/3 static-file gzip compression (roadmap Phase 4e): the same
   scope compression 2a shipped for HTTP/1.1 and HTTP/2, extended to
   the third protocol -- same eligibility window, same
-  `Vary: Accept-Encoding`. Proxied-response compression, Brotli/zstd,
-  and streaming compression above the 8 MiB bound remain deferred on
+  `Vary: Accept-Encoding`. Proxied-response compression, Brotli, and
+  streaming compression above the 8 MiB bound remain deferred on
   every protocol, not a QUIC-specific gap
 - HTTP/3 `route` table dispatch (roadmap Phase 4f): host/path-prefix/
   method/header/header_prefix/cookie/query/source-CIDR matching, the
@@ -310,7 +311,15 @@ independently by IORESPONSE.
   mechanism, since Forwarded/X-Forwarded-For are ordinary HTTP header
   fields parsed the same way regardless of protocol. PROXY protocol
   v1/v2 has no QUIC analogue and remains out of scope
-- Container image: 10,356,890 bytes (~9.88 MiB), non-root, read-only rootfs
+- zstd as a second negotiable encoding (roadmap 2a-5), alongside gzip,
+  for both static-file and proxy dispatch compression, on all three
+  protocols: preferred over gzip whenever a client's `Accept-Encoding`
+  offers both. `libzstd.so.1` was already present in the runtime image
+  as a transitive OpenSSL dependency, so this adds no new runtime
+  library footprint; zstd's fast default level also suits this
+  codebase's compress-fresh-per-request design better than Brotli's
+  asset-tuned default, which remains deferred on its own merits
+- Container image: 10,357,545 bytes (~9.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

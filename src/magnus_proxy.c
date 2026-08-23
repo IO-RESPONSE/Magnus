@@ -52,6 +52,7 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
                                        const char *affinity_cookie_value,
                                        bool client_wants_close,
                                        size_t compressed_content_length,
+                                       const char *compressed_content_encoding,
                                        magnus_proxy_response_info_t *info,
                                        size_t *out_cacheable_prefix_length)
 {
@@ -194,8 +195,9 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
      * tidy; narrowed for a later increment, not a correctness gap. */
     if (compressing) {
         written = snprintf(out + total, out_capacity - total,
-                           "Content-Length: %zu\r\nContent-Encoding: gzip\r\n"
-                           "Vary: Accept-Encoding\r\n", compressed_content_length);
+                           "Content-Length: %zu\r\nContent-Encoding: %s\r\n"
+                           "Vary: Accept-Encoding\r\n", compressed_content_length,
+                           compressed_content_encoding);
         if (written < 0 || (size_t) written >= out_capacity - total) return -1;
         total += (size_t) written;
     }
