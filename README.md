@@ -351,7 +351,24 @@ independently by IORESPONSE.
   TLS 1.3 client the moment a response is framed purely by the
   connection closing, exactly what this increment's own responses are
   the first to do
-- Container image: 10,722,631 bytes (~10.23 MiB), non-root, read-only rootfs
+- Streaming compression for HTTP/2 static files past the 8 MiB bound
+  (roadmap 2a-8): the second slice, confirming 2a-7's own prediction --
+  HTTP/2 needs none of HTTP/1.1's close-delimited-framing workaround,
+  since no protocol requires a Content-Length ahead of a DATA-frame
+  response, so the connection stays alive and multiplexed after a
+  streamed response exactly like any other. HTTP/3 static files and
+  proxy dispatch on every protocol remain later increments. Found and
+  fixed one real, previously-latent, more serious bug along the way:
+  `magnus_h2_drain_send()` retried a failed/partial `SSL_write()`
+  against a *different* buffer address than the original attempt saw,
+  violating OpenSSL's own same-address retry contract -- silently
+  truncated *any* HTTP/2-over-TLS response (static files, proxy
+  dispatch, gRPC, `/healthz`/`/metrics`, all of it, not just this
+  increment's own new code) large enough to hit a partial write
+  mid-transfer, invisible until something exercised a response that
+  large, which nothing in this codebase's own test suite did before
+  this increment's own well-past-8-MiB fixture
+- Container image: 10,723,178 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

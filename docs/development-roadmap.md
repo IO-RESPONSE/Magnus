@@ -563,12 +563,9 @@ connection-pool and common-request-model decisions).
       write/EAGAIN handling every other loop in `magnus_handle_write()`
       already has) instead of building this codebase's first
       `Transfer-Encoding: chunked` writer. A real chunked writer
-      (recovering keep-alive for these responses), HTTP/2 and HTTP/3
-      static files (neither actually needs the close-delimited-framing
-      workaround at all -- no protocol requires a Content-Length ahead
-      of a DATA-frame response, so these are plausibly *easier* than
-      this slice, not harder), and proxy dispatch on every protocol all
-      remain later increments.
+      (recovering keep-alive for these responses), HTTP/3 static files,
+      and proxy dispatch on every protocol all remain later increments
+      (HTTP/2's own slice followed immediately after, as 2a-8 below).
 
       `src/magnus_compression.h/.c` gained a small opaque streaming API
       (`magnus_stream_compressor_t`, `_begin()`/`_step()`/`_end()`)
@@ -595,6 +592,52 @@ connection-pool and common-request-model decisions).
       before `close(fd)`, the standard OpenSSL usage for a server not
       waiting on the peer's own close_notify back. See `CHANGELOG.md`
       1.43.0 for the full detail.
+    - **2a-8 — streaming compression, HTTP/2 static files past the 8
+      MiB bound. Shipped in 1.44.0.** The second slice, confirming
+      2a-7's own prediction: no close-delimited-framing workaround
+      needed at all, since HTTP/2 never requires a Content-Length ahead
+      of a DATA-frame response -- a new pull-based
+      `nghttp2_data_provider2` callback (`magnus_h2_read_stream_
+      compressed()`) reports `NGHTTP2_DATA_FLAG_EOF` once the streaming
+      compressor (2a-7's own API) reports done, and the connection
+      stays alive and multiplexed afterward exactly like any other
+      (verified directly: a second, ordinary request sent right after a
+      streamed one on the same connection). No separate output staging
+      buffer was needed the way HTTP/1.1's own write loop requires one
+      either -- nghttp2 already hands the callback a buffer to fill
+      directly on every pull. `struct magnus_h2_stream` gained a
+      dedicated input-staging buffer but safely reuses the stream's
+      existing `file_fd`/`file_offset`/`file_length` fields for the raw
+      source file, unlike the HTTP/1.1 connection struct: exactly one
+      `nghttp2_data_provider2` callback is ever registered per stream,
+      so there is no risk of two consumers racing over the same fields.
+
+      Found and fixed a second, more serious previously-latent bug
+      along the way, discovered because this was the first thing in
+      this codebase's history to test HTTP/2 static-file serving past a
+      few MB: `magnus_h2_drain_send()` retried a failed/partial
+      `SSL_write()` against a *different* buffer address than the
+      original attempt saw (copying nghttp2's own transient output
+      buffer into `connection->h2_output` only *after* a short/failed
+      first attempt, rather than before every attempt), violating
+      OpenSSL's own contract that a retried write must reuse the exact
+      same address, not merely equal content, when
+      `SSL_MODE_ENABLE_PARTIAL_WRITE` isn't set. Silently truncated any
+      HTTP/2-over-TLS response large enough to hit a partial write
+      mid-transfer -- not just static files: `magnus_h2_drain_send()` is
+      the shared send path under every HTTP/2 response this codebase
+      produces (proxy dispatch, gRPC, `/healthz`/`/metrics`, all of it).
+      Reproduced reliably (~25-40% of attempts) against the *existing*,
+      unmodified plain relay once actually tested at this size; a plain
+      h2c connection with the identical fixture never showed it, since
+      TLS's own retry contract is the only thing being violated. Fixed
+      by copying nghttp2's chunk into `h2_output` unconditionally,
+      before any write is attempted, so every write (first attempt or
+      retry) goes through `magnus_h2_flush_output()`'s own already-
+      correct fixed-address loop. Verified: 15 consecutive live
+      requests for a 12 MB file over HTTP/2+TLS, byte-exact every time
+      (previously ~25-40% truncated). See `CHANGELOG.md` 1.44.0 for the
+      full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

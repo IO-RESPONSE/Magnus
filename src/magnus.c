@@ -3714,6 +3714,30 @@ struct magnus_h2_stream {
     size_t compress_capture_capacity;
     char compress_raw_headers[MAGNUS_PROXY_HEADER_LIMIT + 1];
     size_t compress_raw_headers_length;
+    /* Streaming compression, HTTP/2 static files past
+     * MAGNUS_COMPRESSION_MAX_SIZE (roadmap 2a-8) -- the h2 analogue of
+     * magnus_connection_t's own 2a-7 fields, distinct from proxy
+     * dispatch compression's compress_pending/compress_encoding/
+     * compress_capture above (different feature, different lifecycle;
+     * kept separate rather than shared, same reasoning file_fd/
+     * file_offset/file_length below stay theirs). No dedicated output
+     * staging buffer is needed the way HTTP/1.1's own write loop
+     * requires one: nghttp2's own read_callback (magnus_h2_read_
+     * stream_compressed()) already hands the compressor a buffer to
+     * fill directly on every pull, since h2's DATA frames are pull-
+     * driven rather than a push loop this code owns outright. file_fd/
+     * file_offset/file_length below are reused for the raw source file
+     * (safe: exactly one read_callback is ever registered per stream,
+     * so there is no risk of two different consumers racing over the
+     * same fields the way magnus_connection_t's own unconditional
+     * per-tick sendfile/pread loops made a dedicated field set
+     * necessary there) -- only the *compressed* output side needs
+     * anything new. */
+    magnus_stream_compressor_t *stream_compress;
+    unsigned char *stream_compress_inbuf;
+    size_t stream_compress_inbuf_length;
+    size_t stream_compress_inbuf_sent;
+    bool stream_compress_input_eof;
     /* Built once at proxy start: "METHOD target HTTP/1.0\r\nHost: ...
      * \r\n...\r\n\r\n", sent to the upstream ahead of any request body. */
     char proxy_request[512];
@@ -3995,6 +4019,12 @@ magnus_h2_stream_free(struct magnus_h2_stream *stream)
     else connection->h2_streams = stream->next;
     if (stream->next != NULL) stream->next->prev = stream->prev;
     if (stream->file_fd >= 0) close(stream->file_fd);
+    /* Roadmap 2a-8: a stream can close mid-stream at any point (client
+     * disconnect, GOAWAY, ...) -- magnus_stream_compress_end() itself
+     * tolerates that, same as freeing the not-necessarily-fully-drained
+     * buffers this whole function already handles. */
+    magnus_stream_compress_end(stream->stream_compress);
+    free(stream->stream_compress_inbuf);
     magnus_h2_stream_teardown_upstream(stream);
     free(stream->body);
     free(stream->io_buffer);
@@ -4054,6 +4084,121 @@ magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
     return got;
 }
 
+/* Roadmap 2a-8: the h2 analogue of magnus_h2_read_file() above, for a
+ * stream compressing its static file on the fly (magnus_h2_dispatch_
+ * static_streaming()'s own doc comment has the full design). Unlike
+ * HTTP/1.1's own write loop (magnus_handle_write(), roadmap 2a-7),
+ * this compresses directly into `buf` -- nghttp2 already hands this
+ * callback a buffer to fill on every pull, so no separate output
+ * staging buffer is needed the way owning the socket write outright
+ * requires. stream->file_fd/file_offset/file_length (reused from the
+ * plain relay above -- see struct magnus_h2_stream's own comment on
+ * why that reuse is safe here, unlike the HTTP/1.1 connection struct)
+ * track the *raw* source file being read into stream->stream_compress_
+ * inbuf as needed; the compressor itself is fed from there. */
+static nghttp2_ssize
+magnus_h2_read_stream_compressed(nghttp2_session *session, int32_t stream_id,
+                                 uint8_t *buf, size_t length,
+                                 uint32_t *data_flags,
+                                 nghttp2_data_source *source, void *user_data)
+{
+    struct magnus_h2_stream *stream = source->ptr;
+    size_t consumed = 0;
+    size_t produced = 0;
+    bool done = false;
+    bool ok;
+    (void) session;
+    (void) stream_id;
+    (void) user_data;
+    if (stream->stream_compress_inbuf_sent == stream->stream_compress_inbuf_length
+        && !stream->stream_compress_input_eof) {
+        ssize_t got = pread(stream->file_fd, stream->stream_compress_inbuf,
+                            MAGNUS_STREAM_COMPRESS_CHUNK, stream->file_offset);
+        if (got < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (got == 0) {
+            stream->stream_compress_input_eof = true;
+        } else {
+            stream->stream_compress_inbuf_length = (size_t) got;
+            stream->stream_compress_inbuf_sent = 0;
+            stream->file_offset += got;
+        }
+    }
+    ok = magnus_stream_compress_step(stream->stream_compress,
+        stream->stream_compress_inbuf + stream->stream_compress_inbuf_sent,
+        stream->stream_compress_inbuf_length - stream->stream_compress_inbuf_sent,
+        stream->stream_compress_input_eof, &consumed, buf, length, &produced,
+        &done);
+    if (!ok) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    stream->stream_compress_inbuf_sent += consumed;
+    if (done) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return (nghttp2_ssize) produced;
+}
+
+/* Roadmap 2a-8: the streaming-compression analogue of magnus_prepare_
+ * streaming_compressed_file_response() (magnus.c's own 2a-7 HTTP/1.1
+ * function) -- see that function's own doc comment for the shared
+ * design rationale (magnus_compress_static()'s buffer-then-compress
+ * shape refuses anything past MAGNUS_COMPRESSION_MAX_SIZE by design;
+ * no Content-Length is knowable ahead of a streamed body). Unlike
+ * HTTP/1.1, no close-delimited-framing workaround is needed here at
+ * all -- HTTP/2 never requires a Content-Length ahead of a DATA-frame
+ * response; the stream simply ends on the frame carrying END_STREAM,
+ * decided by magnus_h2_read_stream_compressed() itself reporting
+ * NGHTTP2_DATA_FLAG_EOF -- so this response stays on the same
+ * multiplexed connection afterward exactly like any other, the
+ * "plausibly easier, not harder" follow-up 2a-7's own doc comment
+ * already predicted. Returns true if it took the streaming path (the
+ * caller must not fall through to its own one-shot/uncompressed
+ * handling in that case, and must not close `fd` itself -- ownership
+ * transfers to `stream->file_fd`); false leaves `stream` untouched and
+ * lets the caller's existing path handle `fd` instead, the same
+ * graceful-fallback contract magnus_compress_static() itself already
+ * has on its own allocation-failure path. */
+static bool
+magnus_h2_dispatch_static_streaming(magnus_connection_t *connection,
+                                    struct magnus_h2_stream *stream, int fd,
+                                    const struct stat *metadata,
+                                    const char *content_type)
+{
+    nghttp2_session *session = connection->h2_session;
+    magnus_encoding_t encoding;
+    nghttp2_nv headers[5];
+    if (stream->head_only || metadata->st_size <= MAGNUS_COMPRESSION_MAX_SIZE
+        || !magnus_content_type_compressible(content_type))
+        return false;
+    encoding = magnus_negotiate_encoding(
+        magnus_http_header_find(&stream->parsed, "accept-encoding"));
+    if (encoding == MAGNUS_ENCODING_NONE) return false;
+    stream->stream_compress = magnus_stream_compress_begin(encoding);
+    if (stream->stream_compress == NULL) return false;
+    stream->stream_compress_inbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+    if (stream->stream_compress_inbuf == NULL) {
+        magnus_stream_compress_end(stream->stream_compress);
+        stream->stream_compress = NULL;
+        return false;
+    }
+    stream->file_fd = fd;
+    stream->file_offset = 0;
+    stream->file_length = metadata->st_size;
+    stream->stream_compress_inbuf_length = 0;
+    stream->stream_compress_inbuf_sent = 0;
+    stream->stream_compress_input_eof = false;
+    headers[0] = magnus_h2_nv(":status", "200");
+    headers[1] = magnus_h2_nv("server", "Magnus/" MAGNUS_VERSION);
+    headers[2] = magnus_h2_nv("content-type", content_type);
+    headers[3] = magnus_h2_nv("content-encoding", magnus_encoding_name(encoding));
+    headers[4] = magnus_h2_nv("vary", "Accept-Encoding");
+    {
+        nghttp2_data_provider2 data_provider = {
+            .source = { .ptr = stream },
+            .read_callback = magnus_h2_read_stream_compressed,
+        };
+        (void) nghttp2_submit_response2(session, stream->stream_id, headers,
+                                        5, &data_provider);
+    }
+    return true;
+}
+
 /* Serves stream->parsed.target as a static file, exactly like the
  * HTTP/1.1 GET path (magnus_open_static() + magnus_content_type(), same
  * helpers) -- reused rather than reimplemented so both protocols agree
@@ -4083,6 +4228,9 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     }
     stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
     content_type = magnus_content_type(stream->parsed.target);
+    if (magnus_h2_dispatch_static_streaming(connection, stream, fd, &metadata,
+            content_type))
+        return;
     encoding = magnus_compress_static(fd, &metadata, &stream->parsed,
                                       content_type, &compressed,
                                       &compressed_length);
@@ -4651,10 +4799,36 @@ magnus_h2_flush_output(magnus_connection_t *connection)
  * frames nghttp2 generates on its own, like automatic PING/WINDOW_UPDATE
  * acks) and writes it out. nghttp2_session_mem_send2() only guarantees
  * the pointer it returns stays valid until the *next* mem_send2 or
- * mem_recv2 call, so a partial (would-block) write's remainder is copied
- * into connection->h2_output here rather than retried against the same
- * pointer later -- once that happens this function must not be called
- * again until magnus_h2_flush_output() has fully drained it. */
+ * mem_recv2 call, so each chunk is copied into connection->h2_output
+ * unconditionally, *before* any write is attempted against it (not just
+ * once a write partially fails), and every actual write -- first
+ * attempt or a later retry -- goes through magnus_h2_flush_output()'s
+ * own already-correct fixed-address loop.
+ *
+ * This isn't just defensive: attempting the *first* write directly
+ * against nghttp2's own transient buffer, only falling back to a copy
+ * once that write failed or came up short, was a real, previously-
+ * latent bug (found chasing an intermittent truncated-transfer report
+ * on large HTTP/2-over-TLS responses -- static files past a few MB
+ * reliably reproduced it, plain h2c never did). OpenSSL's own SSL_write()
+ * contract requires every retry of an interrupted write to pass the
+ * *exact same* buffer address as the original attempt, not merely
+ * equal content, whenever SSL_MODE_ENABLE_PARTIAL_WRITE isn't set --
+ * this codebase's default. The old code's retry (via connection->
+ * h2_output, a fresh copy made only after the fact) hands OpenSSL a
+ * *different* address than whatever attempt already touched nghttp2's
+ * own buffer, which is undefined behavior per OpenSSL's own
+ * documentation, not merely untested territory: harmless for a small
+ * response that always writes fully on the first attempt (no retry
+ * ever happens), but silently truncated the response body once a large
+ * enough transfer actually hit a partial write, entirely dependent on
+ * how fast the peer was draining its own receive buffer at that
+ * moment -- exactly the shape of bug that stays invisible until
+ * something exercises a large enough response, which nothing in this
+ * codebase's own test suite did before roadmap 2a-8's own streaming-
+ * compression fixtures (needing something well past 8 MiB) started
+ * reusing the same fixture against the *existing*, unmodified static-
+ * file relay too. */
 static int
 magnus_h2_drain_send(magnus_connection_t *connection)
 {
@@ -4662,23 +4836,20 @@ magnus_h2_drain_send(magnus_connection_t *connection)
     for (;;) {
         const uint8_t *data = NULL;
         nghttp2_ssize length = nghttp2_session_mem_send2(session, &data);
-        ssize_t sent;
         if (length < 0) return -1;
         if (length == 0) return 0;
-        sent = magnus_socket_write(connection, data, (size_t) length);
-        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) sent = 0;
-        else if (sent < 0) return -1;
-        if ((size_t) sent == (size_t) length) {
-            connection->last_active = time(NULL);
-            continue;
-        }
-        connection->h2_output = malloc((size_t) length - (size_t) sent);
+        connection->h2_output = malloc((size_t) length);
         if (connection->h2_output == NULL) return -1;
-        memcpy(connection->h2_output, data + sent,
-              (size_t) length - (size_t) sent);
-        connection->h2_output_length = (size_t) length - (size_t) sent;
+        memcpy(connection->h2_output, data, (size_t) length);
+        connection->h2_output_length = (size_t) length;
         connection->h2_output_sent = 0;
-        return 0;
+        if (magnus_h2_flush_output(connection) < 0) return -1;
+        /* Still non-NULL means magnus_h2_flush_output() hit EAGAIN
+         * partway through (or wrote nothing at all) -- stop here and
+         * let the next writable event resume it; only loop back for
+         * more of nghttp2's own queued output once this chunk is fully
+         * on the wire. */
+        if (connection->h2_output != NULL) return 0;
     }
 }
 

@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.44.0
+
+### Fixed
+
+- **A real, previously-latent data-corruption bug: `magnus_h2_drain_send()`
+  could silently truncate any HTTP/2-over-TLS response large enough to
+  hit a partial write mid-transfer.** Found while building this
+  release's own 2a-8 streaming-compression feature (below), which was
+  the first thing in this codebase's history to test HTTP/2 static-file
+  serving against a fixture well past a few MB -- reproduced reliably
+  (roughly 25-40% of attempts) against the *existing*, unmodified
+  `magnus_h2_read_file()` plain relay once tested at that size, and
+  never against a plain h2c connection with the same fixture.
+
+  Root cause: when a write of nghttp2's own serialized output hit
+  `SSL_ERROR_WANT_WRITE` partway through, the old code copied the
+  *unsent remainder* into `connection->h2_output` for a later retry --
+  but the *first* attempt had been made directly against nghttp2's own
+  transient buffer (`nghttp2_session_mem_send2()`'s own pointer, valid
+  only until the next `mem_send2`/`mem_recv2` call), never copied at
+  all unless that first attempt already came up short. OpenSSL's own
+  `SSL_write()` contract requires every retry of an interrupted write
+  to use the *exact same buffer address* as the original attempt, not
+  merely equal content, whenever `SSL_MODE_ENABLE_PARTIAL_WRITE` isn't
+  set (this codebase's default, and OpenSSL's own). The retry via
+  `h2_output` handed OpenSSL a *different* address than whatever the
+  first attempt saw -- undefined behavior per OpenSSL's own
+  documentation, not merely untested territory. Harmless for any
+  response small enough to always write fully on the first attempt (no
+  retry ever happens, which is why nothing before now ever caught it);
+  silently truncated once a large enough transfer actually hit a
+  partial write, with the exact cutoff point entirely dependent on how
+  fast the peer happened to be draining its own receive buffer at that
+  moment -- exactly the shape of bug that stays invisible until
+  something exercises a response that large.
+
+  Fixed by copying nghttp2's chunk into `connection->h2_output`
+  unconditionally, *before* any write is ever attempted against it --
+  every actual write, first attempt or later retry, now goes through
+  `magnus_h2_flush_output()`'s own already-correct fixed-address retry
+  loop, the same one every other multi-attempt write in this codebase
+  already relies on. This is not static-file-specific: `magnus_h2_drain_send()`
+  is the shared send path under *every* HTTP/2 response this codebase
+  produces (static files, proxy dispatch, gRPC, `/healthz`/`/metrics`,
+  all of it), so any of them could have silently truncated a large
+  enough response over TLS before this fix, not just static files.
+
+  Verified: 15 consecutive live requests for a 12 MB file over
+  HTTP/2+TLS, byte-exact every time (previously ~25-40% truncated);
+  `make test` (twice) and direct ASan/UBSan testing of the live server
+  (5 runs, zero findings) both clean.
+
+### Added
+
+- **Streaming compression for HTTP/2 static files past the 8 MiB bound
+  (roadmap 2a-8) -- the second slice of "streaming/chunked compression
+  above 8 MiB", following 2a-7's own HTTP/1.1 slice.** Confirms that
+  increment's own prediction: HTTP/2 needed none of HTTP/1.1's close-
+  delimited-framing workaround, since no protocol requires a
+  Content-Length ahead of a DATA-frame response -- the stream simply
+  ends on the frame carrying `END_STREAM`, decided by a new pull-based
+  `nghttp2_data_provider2` callback (`magnus_h2_read_stream_compressed()`)
+  reporting `NGHTTP2_DATA_FLAG_EOF` once the streaming compressor
+  (`src/magnus_compression.h`'s own 2a-7 API) reports done. Unlike
+  HTTP/1.1's own write loop, no separate output staging buffer was
+  needed either: nghttp2 already hands the callback a buffer to fill
+  directly on every pull. A streamed response therefore keeps the
+  connection alive and multiplexed afterward exactly like any other --
+  verified directly via a second, ordinary request sent right after a
+  streamed one on the same connection.
+
+  `struct magnus_h2_stream` gained a dedicated input-staging buffer for
+  this path (mirroring `magnus_connection_t`'s own 2a-7 fields), but
+  safely reuses the stream's existing `file_fd`/`file_offset`/
+  `file_length` fields for the raw source file -- unlike HTTP/1.1's
+  connection struct, exactly one `nghttp2_data_provider2` callback is
+  ever registered per stream, so there is no risk of two different
+  consumers racing over the same fields the way the connection
+  struct's own unconditional per-tick sendfile/pread loops made a
+  dedicated field set necessary there.
+
+  Verified: `make test` (twice) and direct ASan/UBSan testing of the
+  live server (multiple runs, all three encodings, zero findings) both
+  clean; a real 12 MB fixture streamed and decoded byte-exact over
+  HTTP/2 under gzip, zstd, and Brotli. New `tests/test-core.sh` blocks
+  confirm byte-exact decode with no `Content-Length` for all three
+  encodings, that plain and `HEAD` requests on the same oversized file
+  stay on the unmodified relay, and that the connection survives a
+  streamed response to serve a second, ordinary request right after.
+  Docker image rebuilt and a live container tested directly.
+
 ## 1.43.0
 
 ### Added

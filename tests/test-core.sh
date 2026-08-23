@@ -1969,6 +1969,69 @@ curl --http1.1 --insecure --fail --silent --head -H 'Accept-Encoding: gzip' \
 ! grep -qi '^content-encoding:' "$stream_head_headers"
 grep -qi "^content-length: $stream_size" "$stream_head_headers"
 
+# Roadmap 2a-8: the same streaming compression, over HTTP/2 --
+# magnus_h2_dispatch_static_streaming()'s own doc comment explains why
+# no Connection: close/no-keep-alive workaround is needed here at all
+# (no protocol requires a Content-Length ahead of a DATA-frame
+# response), confirmed below by reusing the same connection for a
+# second, ordinary request right after the streamed one via curl's own
+# --next. Reuses streaming.html from the HTTP/1.1 block above --
+# same fixture, same server instance, still running.
+h2_stream_headers="$web_root/h2-stream.headers"
+curl --http2 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  --dump-header "$h2_stream_headers" --output "$web_root/h2-stream.out.gz" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: gzip' "$h2_stream_headers"
+grep -qi '^vary: Accept-Encoding' "$h2_stream_headers"
+! grep -qi '^content-length:' "$h2_stream_headers"
+gzip -dc "$web_root/h2-stream.out.gz" | cmp "$compression_root/streaming.html" -
+
+h2_stream_headers2="$web_root/h2-stream2.headers"
+curl --http2 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
+  --dump-header "$h2_stream_headers2" --output "$web_root/h2-stream.out.zst" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: zstd' "$h2_stream_headers2"
+! grep -qi '^content-length:' "$h2_stream_headers2"
+zstd -dc "$web_root/h2-stream.out.zst" | cmp "$compression_root/streaming.html" -
+
+h2_stream_headers3="$web_root/h2-stream3.headers"
+curl --http2 --insecure --fail --silent -H 'Accept-Encoding: br' \
+  --dump-header "$h2_stream_headers3" --output "$web_root/h2-stream.out.br" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: br' "$h2_stream_headers3"
+! grep -qi '^content-length:' "$h2_stream_headers3"
+brotli -dc "$web_root/h2-stream.out.br" | cmp "$compression_root/streaming.html" -
+
+# Plain (no Accept-Encoding) and HEAD over h2 stay on the unmodified,
+# unaffected relay -- same shape as the HTTP/1.1 checks above.
+h2_stream_plain_headers="$web_root/h2-stream-plain.headers"
+curl --http2 --insecure --fail --silent --dump-header "$h2_stream_plain_headers" \
+  --output "$web_root/h2-stream.out.plain" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+! grep -qi '^content-encoding:' "$h2_stream_plain_headers"
+grep -qi "^content-length: $stream_size" "$h2_stream_plain_headers"
+cmp "$compression_root/streaming.html" "$web_root/h2-stream.out.plain"
+
+h2_stream_head_headers="$web_root/h2-stream-head.headers"
+curl --http2 --insecure --fail --silent --head -H 'Accept-Encoding: gzip' \
+  --dump-header "$h2_stream_head_headers" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+! grep -qi '^content-encoding:' "$h2_stream_head_headers"
+grep -qi "^content-length: $stream_size" "$h2_stream_head_headers"
+
+# The connection survives a streamed response and serves a second,
+# ordinary request right after -- proving h2 needed no close-after-
+# write workaround the way HTTP/1.1 does.
+h2_reuse_headers="$web_root/h2-reuse.headers"
+curl --http2 --insecure --fail --silent \
+  -H 'Accept-Encoding: gzip' -o "$web_root/h2-reuse1.gz" \
+  "https://127.0.0.1:$port_compression/streaming.html" \
+  --next --http2 --insecure --fail --silent \
+  --dump-header "$h2_reuse_headers" -o /dev/null \
+  "https://127.0.0.1:$port_compression/page.html"
+grep -qE '^HTTP/2 200' "$h2_reuse_headers"
+gzip -dc "$web_root/h2-reuse1.gz" | cmp "$compression_root/streaming.html" -
+
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
