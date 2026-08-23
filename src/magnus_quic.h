@@ -8,9 +8,11 @@
  * dispatch, 4g retry-on-connect-failure for proxy dispatch, 4h
  * cookie-based session affinity for proxy dispatch, 4i reverse-proxy
  * response caching for proxy dispatch, 4j upstream connection pooling
- * for proxy dispatch) -- a UDP listener wired into Magnus's own epoll
- * reactor that completes a real ngtcp2 handshake using the ngtcp2 +
- * libngtcp2_crypto_ossl + nghttp3 stack chosen in
+ * for proxy dispatch, 2a-4 proxy dispatch response compression -- the
+ * last of h1/h2/h3 to get it, closing out roadmap 2a's own cross-
+ * protocol compression story) -- a UDP listener wired into Magnus's own
+ * epoll reactor that completes a real ngtcp2 handshake using the
+ * ngtcp2 + libngtcp2_crypto_ossl + nghttp3 stack chosen in
  * docs/phase4-http3-quic-dependency-evaluation.md and verified working
  * against this host's OpenSSL in docs/phase4-spike-results.md, then
  * serves real HTTP/3 traffic over it -- src/magnus_quic.c's own section
@@ -20,14 +22,10 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - proxied-response compression over HTTP/3 (4e is static files
- *     only; roadmap 2a-2/2a-3 shipped this for proxy dispatch on
- *     HTTP/1.1 and HTTP/2 -- HTTP/3 remains its own later increment,
- *     not a QUIC-specific gap; a *cached* response reuses whatever the
- *     origin itself sent, uncompressed here too, matching 2a-2's own
- *     explicit choice not to compress a cache HIT on any protocol);
- *     Brotli/zstd; streaming/chunked compression for responses above
- *     2a's own 8 MiB bound
+ *   - Brotli/zstd; streaming/chunked compression for responses above
+ *     2a's own 8 MiB bound -- cross-cutting, not protocol-specific,
+ *     applies equally to h1/h2/h3 now that all three share the same
+ *     buffer-then-compress shape and the same bound
  *   - Real-IP-aware (trusted-proxy-resolved) source_cidr route
  *     matching (4f) or client-IP-based cluster selection (4h's own
  *     fallback when no sticky cookie applies) -- both match against
@@ -51,7 +49,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.38.0"
+#define MAGNUS_VERSION "1.39.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

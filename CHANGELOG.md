@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.39.0
+
+### Added
+
+- **Proxy dispatch response compression, HTTP/3 (roadmap 2a-4): the
+  third and final protocol, closing out roadmap 2a's own cross-protocol
+  compression story -- every one of h1/h2/h3's own `"/proxy"` dispatch
+  now negotiates gzip identically.** Same deferred-submission-until-
+  compressed shape as HTTP/1.1 (2a-2) and HTTP/2 (2a-3), adapted to
+  nghttp3's own frame-based, pull-driven response model:
+  `nghttp3_conn_submit_response()` (previously unconditional, the
+  moment upstream headers arrived) is now deferred behind a new
+  `stream->compress_pending`, exactly like HTTP/2's `submit_response2()`
+  already is.
+
+  Unlike HTTP/2's `stream->io_buffer` (a generically reassignable heap
+  pointer reused directly for the compressed body), HTTP/3's own
+  `stream->body_chunk` could not be reused the same way: it is a
+  single, ACK-gated, one-shot-per-network-chunk allocation by design
+  (roadmap 4b's own hard-won lesson -- reusing one buffer there once
+  corrupted a real streamed response under genuine QUIC flow-control
+  backpressure, reproduced with a 220 KB response through a small
+  stream window). A new dedicated `stream->compress_capture` growable
+  buffer (mirroring `magnus_h2_proxy_compress_capture()`/
+  `magnus_proxy_compress_capture()`) accumulates the body instead; only
+  once compression completes does the result become a single fresh
+  `body_chunk` allocation, entering that field's own existing
+  ACK-gated-free lifecycle completely unchanged.
+
+  Applying the exact bug 1.38.0's own HTTP/2 increment found and fixed
+  as a lesson learned rather than repeating it: `magnus_quic_proxy_
+  compress_capture()` was wired into *both* call sites from the start
+  -- the header-arrival leftover chunk in `magnus_quic_proxy_receive_
+  headers()`, and every subsequent chunk `magnus_quic_proxy_stream_
+  response()` reads from the upstream socket -- so this increment's own
+  manual verification (a response whose headers and body arrived
+  separately, the exact scenario that exposed 1.38.0's own gap) passed
+  correctly on the first attempt.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; a new `tests/test-core.sh` block (reusing the h1/h2 block's
+  own `compress_proxy_root` fixture files rather than recreating them)
+  fetches `page.html` through `"/proxy"` over QUIC with and without
+  `gzip`, confirming the decompressed body matches the original
+  byte-for-byte and the plain body relays unchanged, plus confirms
+  `image.png` (non-compressible content-type) and `tiny.html` (under
+  the 256-byte floor) both stay uncompressed even when gzip is
+  requested. Docker image rebuilt and a live container tested directly
+  -- an HTTP/3 proxy request decompresses byte-for-byte identical to
+  the original, and a plain HTTP/3 proxy request relays the
+  uncompressed body unchanged.
+
+  With this, `src/magnus_quic.h`'s own "deliberately still not here"
+  list drops proxied-response compression entirely -- the remaining
+  compression-related gaps (Brotli/zstd, streaming/chunked compression
+  above the 8 MiB bound) are now genuinely cross-cutting across all
+  three protocols, not QUIC-specific.
+
 ## 1.38.0
 
 ### Added

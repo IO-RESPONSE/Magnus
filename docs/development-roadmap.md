@@ -469,6 +469,26 @@ connection-pool and common-request-model decisions).
       separate reads (routine) silently compressed zero bytes into an
       empty-but-valid gzip stream. See `CHANGELOG.md` 1.38.0 for the
       full detail.
+    - **2a-4 — proxy dispatch response compression, HTTP/3. Shipped in
+      1.39.0.** The third and final protocol, closing out 2a's own
+      cross-protocol compression story. Same deferred-submission-until-
+      compressed shape, adapted to nghttp3's own frame-based, pull-
+      driven model (`nghttp3_conn_submit_response()` now deferred behind
+      `stream->compress_pending`). Unlike h2's `io_buffer`, h3's own
+      `body_chunk` could not be reused directly -- it is a single,
+      ACK-gated, one-shot-per-network-chunk allocation by design (4b's
+      own hard-won lesson: reusing one buffer there once corrupted a
+      real streamed response under genuine QUIC flow-control
+      backpressure). A new dedicated `stream->compress_capture` growable
+      buffer accumulates the body instead; only once compression
+      completes does the result become a single fresh `body_chunk`
+      allocation, entering that field's own existing lifecycle
+      unchanged. Applied 2a-3's own lesson from the start this time --
+      `magnus_quic_proxy_compress_capture()` was wired into both the
+      header-arrival leftover *and* every subsequent upstream read from
+      the outset, so the exact scenario that exposed 2a-3's own gap
+      passed on the first attempt here. See `CHANGELOG.md` 1.39.0 for
+      the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

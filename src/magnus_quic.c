@@ -245,6 +245,28 @@ typedef struct {
     size_t cache_capture_length;
     size_t cache_capture_capacity;
     bool cache_capture_overflowed;
+    /* Proxy dispatch response compression, HTTP/3 (roadmap 2a-4) -- the
+     * h3 analogue of struct magnus_h2_stream's own identically-purposed
+     * fields (see that struct's own comment for the full rationale of
+     * why compression needs its own deferred-submission gate, unlike
+     * cache_capture's pure side observation). No proxy_accept_gzip
+     * field needed here either, for the identical h2 reason: this
+     * stream's own persistent stream->parsed survives for the whole
+     * stream's lifetime. Unlike h2's stream->io_buffer, though, this
+     * *does* need its own dedicated capture buffer rather than reusing
+     * body_chunk directly -- body_chunk is a single, ACK-gated,
+     * one-shot-per-network-chunk allocation (see its own comment just
+     * below), not a growable append target the way accumulating a
+     * whole response body before compression needs; only once
+     * compression completes does the result become a single fresh
+     * body_chunk allocation, going through that exact same existing
+     * lifecycle unchanged. */
+    bool compress_pending;
+    char *compress_capture;
+    size_t compress_capture_length;
+    size_t compress_capture_capacity;
+    char compress_raw_headers[MAGNUS_QUIC_PROXY_HEADER_LIMIT + 1];
+    size_t compress_raw_headers_length;
     time_t connect_started;
     time_t last_activity;
     char *proxy_request;
@@ -516,6 +538,7 @@ magnus_quic_http_stream_free(magnus_quic_stream_t *stream)
     free(stream->body_chunk);
     free(stream->proxy_request);
     free(stream->cache_capture); /* roadmap 4i */
+    free(stream->compress_capture); /* roadmap 2a-4 */
     free(stream);
 }
 
@@ -963,6 +986,43 @@ magnus_quic_proxy_cache_capture(magnus_quic_stream_t *stream,
     stream->cache_capture_length += len;
 }
 
+/* Appends `data`/`len` to stream->compress_capture (growable, doubling)
+ * -- the h3 analogue of magnus_h2_proxy_compress_capture()/
+ * magnus_proxy_compress_capture(), same shape exactly. Unlike
+ * cache_capture just above, this one's failure is NOT silently
+ * tolerable -- see either of those functions' own identical comment
+ * for the full rationale (this response has no uncompressed client-
+ * facing state to fall back to, since compression is exactly why
+ * nothing was ever submitted yet). No bound check against a max size
+ * either, for the same reason those two also do not need one: a
+ * response is only ever marked compress_pending once its own declared
+ * Content-Length has already been confirmed <=
+ * MAGNUS_COMPRESSION_MAX_SIZE, and every caller of this function
+ * already clamps what it passes to at most that many total bytes.
+ * Returns false only on allocation failure. */
+static bool
+magnus_quic_proxy_compress_capture(magnus_quic_stream_t *stream,
+                                   const char *data, size_t len)
+{
+    if (len == 0) return true;
+    if (stream->compress_capture_length + len
+        > stream->compress_capture_capacity) {
+        size_t new_capacity = stream->compress_capture_capacity == 0
+            ? MAGNUS_QUIC_PROXY_BUFFER : stream->compress_capture_capacity * 2;
+        char *grown;
+        while (new_capacity < stream->compress_capture_length + len)
+            new_capacity *= 2;
+        grown = realloc(stream->compress_capture, new_capacity);
+        if (grown == NULL) return false;
+        stream->compress_capture = grown;
+        stream->compress_capture_capacity = new_capacity;
+    }
+    memcpy(stream->compress_capture + stream->compress_capture_length, data,
+          len);
+    stream->compress_capture_length += len;
+    return true;
+}
+
 static void
 magnus_quic_proxy_teardown_upstream(magnus_quic_stream_t *stream)
 {
@@ -1229,6 +1289,75 @@ magnus_quic_proxy_submit_response(magnus_quic_connection_t *connection,
                                         &reader);
 }
 
+/* The h3 analogue of magnus_h2_proxy_finish_compression()/
+ * magnus_proxy_finish_compression() -- see either's own comment for the
+ * full rationale. Called from magnus_quic_proxy_maybe_complete() the
+ * moment a compress-pending stream's body is fully captured (or the
+ * upstream closed early), *before* magnus_quic_proxy_submit_response()
+ * has ever been called for this stream. Unlike stream->body_chunk's own
+ * usual per-network-chunk allocation, the result here becomes exactly
+ * one such allocation -- going through that field's own existing
+ * ACK-gated free lifecycle completely unchanged once assigned. Returns
+ * 0 on success, -1 only if even the *second* sanitize call fails (a
+ * genuinely unrecoverable case at this point --
+ * response_headers_submitted is still false, so
+ * magnus_quic_proxy_fail()'s own precondition still holds; the caller
+ * handles it exactly that way). */
+static int
+magnus_quic_proxy_finish_compression(magnus_quic_connection_t *connection,
+                                     magnus_quic_stream_t *stream)
+{
+    unsigned char *compressed = NULL;
+    size_t compressed_length = 0;
+    bool compressed_ok;
+    char sanitize_scratch[MAGNUS_QUIC_PROXY_HEADER_LIMIT + 1];
+    char sanitized[MAGNUS_QUIC_PROXY_SANITIZED_LIMIT];
+    magnus_proxy_response_info_t info;
+    int sanitized_length;
+
+    compressed_ok = magnus_gzip_compress(
+        (unsigned char *) stream->compress_capture,
+        stream->compress_capture_length, &compressed, &compressed_length)
+        == 0;
+
+    memcpy(sanitize_scratch, stream->compress_raw_headers,
+          stream->compress_raw_headers_length + 1);
+    sanitized_length = magnus_proxy_sanitize_response_headers(sanitize_scratch,
+        stream->compress_raw_headers_length, sanitized, sizeof(sanitized),
+        stream->issue_affinity_cookie ? stream->affinity_key : NULL,
+        true /* client_wants_close: N/A for h3, same reasoning as the
+              * first sanitize call already had */,
+        compressed_ok ? compressed_length : (size_t) -1, &info, NULL);
+    if (sanitized_length < 0) {
+        free(compressed);
+        return -1;
+    }
+
+    if (compressed_ok) {
+        stream->body_chunk = compressed;
+        stream->body_chunk_length = compressed_length;
+    } else {
+        /* gzip's own allocation failed -- fall back to relaying the
+         * already-captured raw bytes uncompressed rather than losing
+         * the response; ownership transfers straight over, no extra
+         * copy. */
+        stream->body_chunk = (uint8_t *) stream->compress_capture;
+        stream->body_chunk_length = stream->compress_capture_length;
+        stream->compress_capture = NULL;
+        stream->compress_capture_capacity = 0;
+    }
+    free(stream->compress_capture); /* no-op in the compressed case
+                                      * (already NULLed in the fallback
+                                      * case just above) */
+    stream->compress_capture = NULL;
+    stream->compress_capture_length = 0;
+    stream->compress_capture_capacity = 0;
+
+    magnus_quic_proxy_submit_response(connection, stream, info.status,
+                                      sanitized);
+    return 0;
+}
+
 /* Once the response is known fully received (Content-Length reached, or
  * the upstream closed), tears the upstream leg down -- no pool to check
  * into in this increment, see this section's own top comment -- and
@@ -1241,6 +1370,24 @@ magnus_quic_proxy_maybe_complete(magnus_quic_connection_t *connection,
     bool complete_by_length = stream->has_response_length
         && stream->response_received >= stream->response_length;
     if (!stream->upstream_eof && !complete_by_length) return;
+
+    /* Roadmap 2a-4: response_headers_submitted is still false here for
+     * a compress-pending stream (magnus_quic_proxy_receive_headers()
+     * only ever buffered so far, exactly like the h1/h2 paths' own
+     * compress_pending gate) -- finalizing calls magnus_quic_proxy_
+     * submit_response() for the first time, right here, whether or not
+     * the body's own declared length was ever fully reached (a
+     * truncated upstream still finalizes with whatever was captured,
+     * same tolerance the pre-existing, non-compressing behavior just
+     * below this block already has for that identical scenario). */
+    if (stream->compress_pending) {
+        stream->compress_pending = false;
+        if (magnus_quic_proxy_finish_compression(connection, stream) != 0) {
+            magnus_quic_proxy_fail(connection, stream, "502");
+            return;
+        }
+    }
+
     stream->response_complete = true;
     /* Reverse-proxy cache (roadmap 4i): commits the captured body now
      * that the whole response is known complete -- before
@@ -1358,9 +1505,11 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
                   * -- see magnus_quic_proxy_submit_response()'s own
                   * comment on why the Connection header this produces
                   * is dropped either way */,
-            (size_t) -1 /* compressed_content_length: roadmap 2a-2 is
-                         * HTTP/1.1 proxy dispatch only in this first
-                         * increment -- see CHANGELOG.md's own entry */,
+            (size_t) -1 /* compressed_content_length: this first call
+                         * only ever learns the *uncompressed* framing/
+                         * content-type -- see magnus_quic_proxy_finish_
+                         * compression()'s own second call for the
+                         * compressed one (roadmap 2a-4) */,
             &info,
             &cacheable_prefix_length /* roadmap 4i: bytes of `sanitized`
                                        * that are safe for
@@ -1451,18 +1600,60 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
         leftover = info.content_length;
     if (stream->cache_this_response_cacheable)
         magnus_quic_proxy_cache_capture(stream, body_start, leftover);
-    if (leftover > 0) {
-        /* stream->body_chunk is necessarily NULL here (this is the
-         * very first body data this stream has ever seen) -- see
-         * magnus_quic_stream_t's own comment on why a fresh allocation
-         * per chunk, not a reused buffer. */
-        stream->body_chunk = malloc(leftover);
-        if (stream->body_chunk == NULL) {
-            magnus_quic_proxy_fail(connection, stream, "502");
-            return true;
+
+    /* Roadmap 2a-4: decided once, right here, the moment headers
+     * (status/content-type/content-length/an existing Content-Encoding,
+     * if any) are known -- see magnus_proxy_receive_headers()'s own
+     * identical HTTP/1.1 comment for the exact bounds/rationale.
+     * stream->parsed (this struct's own persistent copy of the
+     * client's request, the same shape magnus_h2_stream's own has) is
+     * read directly here instead of needing a separate
+     * proxy_accept_gzip field captured at dispatch time. */
+    {
+        bool try_compress = strcmp(stream->parsed.method, "GET") == 0
+            && magnus_accepts_gzip(
+                   magnus_http_header_find(&stream->parsed, "accept-encoding"))
+            && info.status == 200 && !info.has_content_encoding
+            && info.has_content_length
+            && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
+            && info.content_length <= MAGNUS_COMPRESSION_MAX_SIZE
+            && magnus_content_type_compressible(info.content_type);
+        stream->compress_pending = try_compress;
+        if (try_compress) {
+            /* Defer submit_response() until the whole body is captured
+             * and compressed (see magnus_quic_proxy_maybe_complete()'s
+             * own finalize block) -- stash the RAW upstream header
+             * block (header_copy is still pristine: sanitize
+             * tokenized its own separate scratch copy) so
+             * magnus_quic_proxy_finish_compression() can sanitize it a
+             * second time, with the real compressed Content-Length,
+             * once compression completes. Captured, not relayed, for
+             * the identical reason: nothing about this response is
+             * client-visible yet. */
+            memcpy(stream->compress_raw_headers, header_copy,
+                  header_length + 1);
+            stream->compress_raw_headers_length = header_length;
+            stream->compress_capture = NULL;
+            stream->compress_capture_length = 0;
+            stream->compress_capture_capacity = 0;
+            if (!magnus_quic_proxy_compress_capture(stream, body_start,
+                    leftover)) {
+                magnus_quic_proxy_fail(connection, stream, "502");
+                return true;
+            }
+        } else if (leftover > 0) {
+            /* stream->body_chunk is necessarily NULL here (this is the
+             * very first body data this stream has ever seen) -- see
+             * magnus_quic_stream_t's own comment on why a fresh
+             * allocation per chunk, not a reused buffer. */
+            stream->body_chunk = malloc(leftover);
+            if (stream->body_chunk == NULL) {
+                magnus_quic_proxy_fail(connection, stream, "502");
+                return true;
+            }
+            memcpy(stream->body_chunk, body_start, leftover);
+            stream->body_chunk_length = leftover;
         }
-        memcpy(stream->body_chunk, body_start, leftover);
-        stream->body_chunk_length = leftover;
     }
     stream->headers_received = true;
     stream->upstream_poolable = info.upstream_poolable;
@@ -1470,8 +1661,9 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
     stream->response_length = info.content_length;
     stream->response_received = leftover;
 
-    magnus_quic_proxy_submit_response(connection, stream, info.status,
-                                      sanitized);
+    if (!stream->compress_pending)
+        magnus_quic_proxy_submit_response(connection, stream, info.status,
+                                          sanitized);
     magnus_quic_proxy_maybe_complete(connection, stream);
     return true;
 }
@@ -1505,6 +1697,32 @@ magnus_quic_proxy_stream_response(magnus_quic_connection_t *connection,
     }
     received = recv(stream->upstream_fd, buffer, want, 0);
     if (received > 0) {
+        stream->response_received += (size_t) received;
+        stream->last_activity = time(NULL);
+        if (stream->cache_this_response_cacheable)
+            magnus_quic_proxy_cache_capture(stream, (const char *) buffer,
+                                            (size_t) received);
+        /* Roadmap 2a-4: redirected into the capture buffer instead of
+         * becoming a real body_chunk nghttp3 could pull from -- see
+         * magnus_quic_proxy_receive_headers()'s own comment on why
+         * nothing client-visible is populated for a compress-pending
+         * stream until the whole body is known. body_chunk stays NULL
+         * throughout, so this function's own backpressure gate keeps
+         * allowing more reads exactly as it would for any other still-
+         * incomplete response. An allocation failure here is
+         * unrecoverable (no uncompressed client-facing state exists to
+         * fall back to either) -- magnus_quic_proxy_abort(), the same
+         * outcome any other genuine mid-relay failure in this function
+         * already has. */
+        if (stream->compress_pending) {
+            if (!magnus_quic_proxy_compress_capture(stream,
+                    (const char *) buffer, (size_t) received)) {
+                magnus_quic_proxy_abort(connection, stream);
+                return;
+            }
+            magnus_quic_proxy_maybe_complete(connection, stream);
+            return;
+        }
         stream->body_chunk = malloc((size_t) received);
         if (stream->body_chunk == NULL) {
             magnus_quic_proxy_abort(connection, stream);
@@ -1512,11 +1730,6 @@ magnus_quic_proxy_stream_response(magnus_quic_connection_t *connection,
         }
         memcpy(stream->body_chunk, buffer, (size_t) received);
         stream->body_chunk_length = (size_t) received;
-        stream->response_received += (size_t) received;
-        stream->last_activity = time(NULL);
-        if (stream->cache_this_response_cacheable)
-            magnus_quic_proxy_cache_capture(stream, (const char *) buffer,
-                                            (size_t) received);
         if (stream->nghttp3_wants_resume) {
             stream->nghttp3_wants_resume = false;
             (void) nghttp3_conn_resume_stream(connection->http3_conn,

@@ -4822,4 +4822,71 @@ test "$migration_after" -gt "$migration_before"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
-echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l, see src/magnus_quic.h)"
+
+# Proxy dispatch response compression, HTTP/3 (roadmap 2a-4): the third
+# and final protocol -- same deferred-submission-until-compressed shape
+# as h1 (2a-2)/h2 (2a-3), adapted to nghttp3's own frame-based,
+# pull-driven response model (nghttp3_conn_submit_response(), deferred
+# via stream->compress_pending exactly like h2's own submit_response2()
+# is). Reuses compress_proxy_root's own fixture files (page.html/
+# image.png/tiny.html) from the h1/h2 block above rather than
+# recreating them.
+port_quic_compress_proxy_upstream=$((port + 130))
+port_quic_compress_proxy=$((port + 131))
+port_quic_compress_proxy_udp=$((port + 132))
+python3 -m http.server "$port_quic_compress_proxy_upstream" --bind 127.0.0.1 \
+  --directory "$compress_proxy_root" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_quic_compress_proxy_upstream/page.html" \
+    >/dev/null && break
+  sleep 1
+done
+"$binary" --port "$port_quic_compress_proxy" --root "$web_root" \
+  --tls-cert "$web_root/quic-server.crt" --tls-key "$web_root/quic-server.key" \
+  --quic-port "$port_quic_compress_proxy_udp" \
+  --upstream "127.0.0.1:$port_quic_compress_proxy_upstream" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent \
+    "https://127.0.0.1:$port_quic_compress_proxy/healthz" >/dev/null && break
+  sleep 1
+done
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/page.html gzip \
+  > "$web_root/quic-compress-proxy-gzip-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-gzip-out"
+grep -qE '^content-encoding: gzip$' "$web_root/quic-compress-proxy-gzip-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-gzip-out"
+tail -n +6 "$web_root/quic-compress-proxy-gzip-out" | gunzip \
+  | diff - "$compress_proxy_root/page.html"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/page.html - \
+  > "$web_root/quic-compress-proxy-plain-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-plain-out"
+! grep -q '^content-encoding:' "$web_root/quic-compress-proxy-plain-out"
+tail -n +4 "$web_root/quic-compress-proxy-plain-out" \
+  | diff - "$compress_proxy_root/page.html"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/image.png gzip \
+  > "$web_root/quic-compress-proxy-png-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-png-out"
+! grep -q '^content-encoding:' "$web_root/quic-compress-proxy-png-out"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/tiny.html gzip \
+  > "$web_root/quic-compress-proxy-tiny-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-tiny-out"
+! grep -q '^content-encoding:' "$web_root/quic-compress-proxy-tiny-out"
+
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation, proxy dispatch response compression ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l/2a-4, see src/magnus_quic.h)"
