@@ -14,7 +14,10 @@
  * own source_cidr route matching and client-IP-based cluster selection;
  * 2a-5 zstd joining gzip as a second negotiable encoding, 2a-6 Brotli
  * joining as a third, both across static-file and proxy-dispatch
- * compression alike, on all three protocols)
+ * compression alike, on all three protocols; 2a-7 streaming compression
+ * for HTTP/1.1 static files past 2a's own 8 MiB bound, the first slice
+ * of the item this list itself used to carry -- see that item's own
+ * narrowed scope below)
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -27,10 +30,24 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - streaming/chunked compression for responses above 2a's own 8 MiB
- *     bound -- cross-cutting, not protocol-specific, applies equally to
- *     h1/h2/h3 now that all three share the same buffer-then-compress
- *     shape and the same bound
+ *   - streaming compression for HTTP/2 and HTTP/3 static files, and for
+ *     proxy-dispatch responses on all three protocols, past 2a's own 8
+ *     MiB bound -- 2a-7 narrowed this from "streaming/chunked
+ *     compression above 8 MiB, cross-cutting across h1/h2/h3" to just
+ *     its first slice (HTTP/1.1 static files); h2/h3 don't need this
+ *     increment's own close-delimited-framing workaround at all (no
+ *     Content-Length is ever required for a DATA-frame response, unlike
+ *     HTTP/1.1 without chunked encoding), so they are plausibly an
+ *     *easier* follow-up, not a harder one, once someone picks this
+ *     back up
+ *   - a real HTTP/1.1 `Transfer-Encoding: chunked` response writer,
+ *     which would let 2a-7's own streaming-compressed responses keep
+ *     the connection alive afterward instead of always closing -- 2a-7
+ *     deliberately chose the narrower of the two ways to frame a
+ *     response with no Content-Length known ahead of time (RFC 9112
+ *     6.3 permits either), reusing every existing byte-writing
+ *     primitive unchanged rather than building this codebase's first
+ *     chunked writer just to ship the first slice
  *   - PROXY protocol v1/v2 for QUIC: genuinely has no analogue here
  *     (no raw preamble concept once ngtcp2/nghttp3 have already framed
  *     a stream's headers, unlike a plain TCP byte stream) -- Forwarded/
@@ -55,7 +72,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.42.0"
+#define MAGNUS_VERSION "1.43.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

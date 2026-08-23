@@ -541,6 +541,60 @@ connection-pool and common-request-model decisions).
       dedicated Brotli blocks that use `--compressed` deliberately, as
       live confirmation a real client actually gets Brotli back. See
       `CHANGELOG.md` 1.42.0 for the full detail.
+    - **2a-7 — streaming compression, HTTP/1.1 static files past the 8
+      MiB bound. Shipped in 1.43.0.** The first slice of "streaming/
+      chunked compression above 8 MiB", the item 2a through 2a-6 each
+      deferred in turn. `magnus_compress_static()`'s own buffer-then-
+      compress shape refuses anything past `MAGNUS_COMPRESSION_MAX_SIZE`
+      by design (holding the whole body, compressed and uncompressed,
+      in memory at once stops being reasonable well before 8 MiB scales
+      to a real static file server's needs) -- an eligible GET above
+      that bound now streams instead, compressing 64 KiB chunks via
+      each encoder's own incremental API (`deflate()`/`Z_NO_FLUSH`,
+      `ZSTD_compressStream2()`, `BrotliEncoderCompressStream()`) as the
+      file is read, writing each produced chunk to the client as it
+      becomes available. No `Content-Length` is knowable ahead of time
+      for a streamed body -- the real reason this needed its own
+      response-framing decision, not just a different body-writing
+      loop -- so the response is close-delimited (`Connection: close`,
+      RFC 9112 6.3 permits this) rather than chunked-encoded: the
+      narrower of the two real options, reusing every existing byte-
+      writing primitive (`magnus_socket_write()`, the same partial-
+      write/EAGAIN handling every other loop in `magnus_handle_write()`
+      already has) instead of building this codebase's first
+      `Transfer-Encoding: chunked` writer. A real chunked writer
+      (recovering keep-alive for these responses), HTTP/2 and HTTP/3
+      static files (neither actually needs the close-delimited-framing
+      workaround at all -- no protocol requires a Content-Length ahead
+      of a DATA-frame response, so these are plausibly *easier* than
+      this slice, not harder), and proxy dispatch on every protocol all
+      remain later increments.
+
+      `src/magnus_compression.h/.c` gained a small opaque streaming API
+      (`magnus_stream_compressor_t`, `_begin()`/`_step()`/`_end()`)
+      alongside the existing one-shot `magnus_compress()` -- verified
+      against a standalone sanity harness (18 combinations: all three
+      encodings, input sizes 0 to 10 MiB, and deliberately tiny 37-byte
+      output buffers forcing many partial-drain iterations) before ever
+      being wired into `magnus.c`, under ASan/UBSan.
+      `struct magnus_connection_t` gained a dedicated fd/buffer set for
+      this path rather than reusing `file_fd`/`file_buffer`, so the
+      existing sendfile/pread relay loops never needed their own guard
+      conditions touched.
+
+      One real, previously-latent bug found and fixed along the way:
+      `magnus_close_connection()` never called `SSL_shutdown()` before
+      closing a TLS connection. Harmless for every existing
+      `close_after_write`-over-TLS response before this one (each
+      always had a `Content-Length`, or was HTTP/1.0, so a client never
+      needed to detect "body complete" purely by watching the
+      connection close) -- this increment's own responses are the first
+      that do, and a strict TLS 1.3 client reported `SSL_ERROR_SYSCALL`/
+      "errno 0" on the abrupt close despite every byte already read
+      being correct. Fixed with one best-effort `SSL_shutdown()` call
+      before `close(fd)`, the standard OpenSSL usage for a server not
+      waiting on the peer's own close_notify back. See `CHANGELOG.md`
+      1.43.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

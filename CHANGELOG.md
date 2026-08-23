@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.43.0
+
+### Added
+
+- **Streaming compression for HTTP/1.1 static files past
+  `MAGNUS_COMPRESSION_MAX_SIZE` (roadmap 2a-7) -- the first slice of
+  the "streaming/chunked compression above 8 MiB" item every prior
+  compression increment (2a through 2a-6) has deferred.** Until now, a
+  static file larger than 8 MiB always relayed uncompressed regardless
+  of what the client's `Accept-Encoding` offered -- `magnus_compress_
+  static()`'s own buffer-then-compress shape (hold the whole body,
+  compressed *and* uncompressed, in memory at once) simply refuses
+  anything past that bound, by design, to keep memory use predictable.
+  A GET for an eligible file above the bound now streams instead:
+  compresses the file in 64 KiB chunks as it reads them, using each
+  encoder's own incremental/streaming API rather than the one-shot
+  functions every other compression path here uses (`deflate()` with
+  `Z_NO_FLUSH`/`Z_FINISH` per chunk for gzip, `ZSTD_compressStream2()`
+  for zstd, `BrotliEncoderCompressStream()` for Brotli), and writes
+  each produced chunk to the client as it becomes available.
+
+  No `Content-Length` can ever be known ahead of time here -- the
+  actual reason this needed its own response-framing decision, not
+  just a different body-writing loop, unlike every other compression
+  path in this codebase. RFC 9112 6.3 permits a response with neither
+  `Content-Length` nor `Transfer-Encoding: chunked` as long as the
+  connection closes once the body ends; that's the framing this
+  increment chose (`Connection: close` plus the existing
+  `close_after_write` mechanism), deliberately narrower than building
+  this codebase's first `Transfer-Encoding: chunked` response writer --
+  the same "narrow the first cut" pattern established throughout
+  roadmap 2a, this time trading keep-alive for these specific
+  responses away rather than a new framing mechanism. A real chunked
+  writer (recovering keep-alive) remains a later increment, along with
+  HTTP/2 and HTTP/3 (neither actually needs the close-delimited-framing
+  workaround at all -- no protocol requires a Content-Length ahead of
+  a DATA-frame response) and proxy dispatch on all three protocols.
+
+  `src/magnus_compression.h/.c` gained a small opaque streaming API
+  (`magnus_stream_compressor_t`, `magnus_stream_compress_begin()`/
+  `_step()`/`_end()`) sitting alongside the existing one-shot
+  `magnus_compress()` -- verified against a standalone sanity harness
+  first (18 combinations: all three encodings, input sizes from 0 to 10
+  MiB, and deliberately tiny 37-byte output buffers forcing many
+  partial-drain iterations, the exact shape the real event-loop caller
+  needs to handle) before ever being wired into magnus.c, under
+  ASan/UBSan. `struct magnus_connection_t` gained its own dedicated
+  fd/buffer set for this path (`stream_compress_fd` et al.) rather than
+  reusing `file_fd`/`file_buffer`, so the existing, already-verified
+  sendfile/pread relay loops never needed their own guard conditions
+  touched.
+
+  One real, previously-latent bug found and fixed along the way, not
+  new to this increment: `magnus_close_connection()` never called
+  `SSL_shutdown()` before closing a TLS connection's raw fd. Every
+  existing `close_after_write`-over-TLS response before this one always
+  had a `Content-Length` (or was HTTP/1.0, which stops reading at
+  `Content-Length` without ever attempting the read that would expose
+  the gap), so a client never needed to detect "body complete" purely
+  by watching for the TLS connection to close -- this increment's own
+  responses are the first ones that do, and a strict TLS 1.3 client
+  (confirmed against this host's own curl/OpenSSL) reported
+  `SSL_ERROR_SYSCALL`/"errno 0" on the abrupt close, even though every
+  byte it had already read was byte-for-byte correct: an unexpected-EOF
+  false alarm, not a real transport error. Fixed with one best-effort,
+  non-blocking `SSL_shutdown()` call before `close(fd)` -- OpenSSL's
+  own manual documents exactly this "call once, don't wait for the
+  peer's own close_notify back" usage as legitimate for a server that
+  is simply done with a connection, matching every other
+  `close_after_write` path's own now-correct behavior, not just this
+  new one's.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; a real 12 MB fixture streamed and decoded byte-exact under
+  gzip, zstd, and Brotli, over both plain and TLS HTTP/1.1, manually
+  before writing the automated coverage. New `tests/test-core.sh`
+  blocks confirm: byte-exact decode for all three encodings with no
+  `Content-Length` and `Connection: close`; a plain request (no
+  `Accept-Encoding`) and a `HEAD` on the same oversized file both still
+  get the unmodified, unaffected uncompressed relay with a real
+  `Content-Length` and `keep-alive`, proving this increment changed
+  nothing about either of those existing paths. Docker image rebuilt
+  and a live container tested directly.
+
 ## 1.42.0
 
 ### Added

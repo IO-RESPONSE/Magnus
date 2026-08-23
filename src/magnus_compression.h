@@ -76,4 +76,63 @@ int magnus_compress(magnus_encoding_t encoding, const unsigned char *input,
                     size_t input_length, unsigned char **output,
                     size_t *output_length);
 
+/* Roadmap 2a-7: streaming compression for responses too large for the
+ * buffer-then-compress shape every other compress function above uses
+ * (magnus_compress()'s own callers cap out at MAGNUS_COMPRESSION_MAX_SIZE
+ * for exactly this reason -- holding the whole body, compressed *and*
+ * uncompressed, in memory at once stops being reasonable well before 8
+ * MiB scales to what a static file server actually needs to handle).
+ * Opaque: the concrete encoder state (z_stream / ZSTD_CStream pointer /
+ * BrotliEncoderState pointer, one of the three depending on which encoding was
+ * negotiated) is magnus_compression.c's own business, not exposed here
+ * -- callers only ever see a pointer to feed back into the functions
+ * below, the same "opaque handle" shape struct magnus_h2_stream's own
+ * callers already use for a persistent object elsewhere in this
+ * codebase. */
+typedef struct magnus_stream_compressor magnus_stream_compressor_t;
+
+/* Allocates a fresh streaming compressor for `encoding` -- never called
+ * with MAGNUS_ENCODING_NONE, same precondition as magnus_compress().
+ * Returns NULL on allocation failure (caller falls back to relaying the
+ * response uncompressed, the same graceful-degradation every other
+ * compress function in this file already provides on its own failure
+ * path). */
+magnus_stream_compressor_t *magnus_stream_compress_begin(
+    magnus_encoding_t encoding);
+
+/* One incremental step: feeds up to `input_length` bytes of `input`
+ * into the compressor and writes as many compressed bytes as fit into
+ * `output` (capacity `output_capacity`). `*input_consumed` and
+ * `*output_length` report how much of each buffer was actually used --
+ * `*input_consumed` can be less than `input_length` when `output` fills
+ * up first, in which case the caller must call again with the
+ * remaining, unconsumed tail of `input` (after draining `output`) to
+ * make further progress, exactly like every other partial-write loop
+ * already in this codebase (see e.g. magnus_handle_write()'s own
+ * sendfile/file_buffer loops in magnus.c). `finish` marks the last
+ * input chunk (the source is fully read) -- the compressor may still
+ * need several more calls, each with `input_length` 0, to fully flush
+ * its own internal buffers; `*done` becomes true only once the whole
+ * stream is complete AND `output` from this same call already holds
+ * everything left to send (the caller must still drain `*output_length`
+ * bytes of `output` before treating the response as finished). Returns
+ * false only on an unrecoverable encoder error (never on well-formed
+ * input, same as every other compress function here) -- the caller has
+ * no good fallback left at that point (unlike a failed one-shot
+ * magnus_compress() call, response headers already went out with no
+ * Content-Length, framed by the connection closing at the end; see
+ * magnus_stream_compress_begin()'s own doc comment for the *earlier*,
+ * still-recoverable failure case), and must abort the connection. */
+bool magnus_stream_compress_step(magnus_stream_compressor_t *compressor,
+                                 const unsigned char *input,
+                                 size_t input_length, bool finish,
+                                 size_t *input_consumed, unsigned char *output,
+                                 size_t output_capacity,
+                                 size_t *output_length, bool *done);
+
+/* Releases a streaming compressor -- safe (a no-op) to call whether or
+ * not the stream ever reached `*done`, since a client can disconnect
+ * mid-stream at any point. */
+void magnus_stream_compress_end(magnus_stream_compressor_t *compressor);
+
 #endif

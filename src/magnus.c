@@ -81,6 +81,13 @@
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_PROXY_MAX_ATTEMPTS 2
+/* Roadmap 2a-7: both the raw-file-chunk read size and the compressed-
+ * output staging buffer size for streaming compression -- 64 KiB is the
+ * same "one syscall/one library call's worth of work per event-loop
+ * turn" sizing every other chunked I/O buffer in this file already
+ * uses (magnus_proxy_compress_capture()'s own growth increment,
+ * MAGNUS_PROXY_BUFFER above), not tuned independently. */
+#define MAGNUS_STREAM_COMPRESS_CHUNK (64 * 1024)
 /* TLS passthrough / SNI routing (roadmap 3b): how long a stream
  * connection may sit in MAGNUS_STREAM_PEEKING before giving up and
  * falling back to the default stream_upstream cluster -- the same
@@ -200,6 +207,29 @@ typedef struct {
     unsigned char *compressed_body;
     size_t compressed_body_length;
     size_t compressed_body_sent;
+    /* Roadmap 2a-7: streaming compression for a static file too large
+     * for the buffer-then-compress shape above (compressed_body et al.)
+     * to use -- see magnus_stream_compress_flush()'s own comment for
+     * the full design. A dedicated fd/buffer set, not a reuse of
+     * file_fd/file_buffer above, so the existing (already-verified)
+     * sendfile/pread relay loops never need their own guard conditions
+     * touched -- mutual exclusion by construction, the same way
+     * cache_serve's own fields stay independent of file_fd's: a
+     * response is prepared as either an ordinary file_fd relay or a
+     * stream_compress_fd one, never both. stream_compress itself is
+     * NULL exactly when this path is inactive -- the one flag every
+     * other field here is gated behind. */
+    int stream_compress_fd;
+    off_t stream_compress_file_offset;
+    magnus_stream_compressor_t *stream_compress;
+    bool stream_compress_done;
+    bool stream_compress_input_eof;
+    unsigned char *stream_compress_inbuf;
+    size_t stream_compress_inbuf_length;
+    size_t stream_compress_inbuf_sent;
+    unsigned char *stream_compress_outbuf;
+    size_t stream_compress_outbuf_length;
+    size_t stream_compress_outbuf_sent;
     int upstream_fd;
     bool proxy_active;
     bool proxy_connected;
@@ -1382,8 +1412,36 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
 {
     int fd = connection->fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    /* Roadmap 2a-7's own stream-compressed responses (no Content-Length,
+     * framed purely by this close) were the first case in this codebase
+     * to actually surface the gap: closing the raw fd without ever
+     * calling SSL_shutdown() first sends no TLS close_notify, which a
+     * strict TLS 1.3 client (confirmed against this host's own curl/
+     * OpenSSL) reports as SSL_ERROR_SYSCALL/"errno 0" even though every
+     * byte it already read was byte-for-byte correct -- an unexpected-
+     * EOF false alarm, not a real transport error. One best-effort,
+     * non-blocking call before close() is the standard fix (and
+     * standard OpenSSL usage -- its own manual explicitly documents
+     * "call it once and ignore the return code" as legitimate for a
+     * server that isn't waiting on the peer's own close_notify back);
+     * must happen before close(fd) below, since SSL_shutdown() writes
+     * through the very fd being closed. Applies to every close_after_
+     * write path over TLS, not just this one -- the other existing
+     * ones happened to always have a Content-Length (or were HTTP/1.0,
+     * which stops reading at Content-Length without ever attempting the
+     * read that would have exposed this), so none had tripped over it
+     * before. */
+    if (connection->tls != NULL) SSL_shutdown(connection->tls);
     close(fd);
     if (connection->file_fd >= 0) close(connection->file_fd);
+    /* Roadmap 2a-7: a client can disconnect mid-stream at any point --
+     * magnus_stream_compress_end() itself tolerates that (see its own
+     * doc comment), same as freeing any of the other not-necessarily-
+     * fully-drained buffers below. */
+    if (connection->stream_compress_fd >= 0) close(connection->stream_compress_fd);
+    magnus_stream_compress_end(connection->stream_compress);
+    free(connection->stream_compress_inbuf);
+    free(connection->stream_compress_outbuf);
     if (connection->tls != NULL) SSL_free(connection->tls);
     free(connection->input);
     free(connection->file_buffer);
@@ -3317,6 +3375,104 @@ magnus_open_static(const char *target, struct stat *metadata)
     return fd;
 }
 
+/* Roadmap 2a-7: the streaming-compression analogue of magnus_prepare_
+ * file_response() above, for a static file past MAGNUS_COMPRESSION_
+ * MAX_SIZE that would otherwise always relay uncompressed (that
+ * function's own use_gzip is unconditionally false past that bound --
+ * magnus_compress_static() itself enforces the ceiling, by design, to
+ * keep the buffer-then-compress shape every other compress path here
+ * uses bounded in memory). Returns true if it took the streaming path
+ * (the caller must not fall through to its own uncompressed relay in
+ * that case); false leaves `connection` untouched and lets the caller's
+ * existing ordinary relay handle this response instead -- the exact
+ * same graceful-fallback contract magnus_compress_static() itself
+ * already has on its own allocation-failure path, extended to this
+ * path's own extra failure modes (compressor allocation, staging
+ * buffer allocation, or the header line simply not fitting).
+ *
+ * No Content-Length is ever known ahead of time here -- the whole
+ * reason this needs its own response-framing decision, not just a
+ * different body-writing loop, unlike every other compression path in
+ * this codebase. RFC 9112 6.3 permits a response with neither Content-
+ * Length nor Transfer-Encoding: chunked as long as the connection
+ * closes once the body ends, which is exactly what `Connection: close`
+ * plus close_after_write below declares and honors -- deliberately
+ * close-delimited framing rather than a first chunked-encoding writer,
+ * the narrower of the two real options and the one that reuses every
+ * byte-writing primitive (magnus_socket_write(), the same partial-
+ * write/EAGAIN handling every other loop in magnus_handle_write()
+ * already has) unchanged. A real Transfer-Encoding: chunked writer
+ * (recovering keep-alive for these responses) is a natural follow-up,
+ * not a silently missing correctness gap -- see CHANGELOG.md's own
+ * 2a-7 entry. HEAD requests are deliberately excluded (falls through
+ * to false): an accurate Content-Length is exactly what compressing
+ * the whole file would be needed to answer, defeating HEAD's own point
+ * of not transferring the body to find that out. */
+static bool
+magnus_prepare_streaming_compressed_file_response(
+    magnus_connection_t *connection, int file_fd, const struct stat *metadata,
+    bool head_only, bool close_connection, magnus_request_t *request,
+    const magnus_http_request_t *parsed)
+{
+    int written;
+    const char *content_type = magnus_content_type(request->path);
+    magnus_encoding_t encoding;
+    (void) close_connection; /* this path always closes -- see doc comment */
+    if (head_only || metadata->st_size <= MAGNUS_COMPRESSION_MAX_SIZE
+        || !magnus_content_type_compressible(content_type))
+        return false;
+    encoding = magnus_negotiate_encoding(
+        magnus_http_header_find(parsed, "accept-encoding"));
+    if (encoding == MAGNUS_ENCODING_NONE) return false;
+    connection->stream_compress = magnus_stream_compress_begin(encoding);
+    if (connection->stream_compress == NULL) return false;
+    connection->stream_compress_inbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+    connection->stream_compress_outbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+    if (connection->stream_compress_inbuf == NULL
+        || connection->stream_compress_outbuf == NULL) {
+        magnus_stream_compress_end(connection->stream_compress);
+        connection->stream_compress = NULL;
+        free(connection->stream_compress_inbuf);
+        connection->stream_compress_inbuf = NULL;
+        free(connection->stream_compress_outbuf);
+        connection->stream_compress_outbuf = NULL;
+        return false;
+    }
+    request->status = 200;
+    magnus_requests_total++;
+    (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_RESPONSE, request);
+    written = snprintf(connection->output, sizeof(connection->output),
+        "HTTP/1.1 200 OK\r\nServer: Magnus/%s\r\nContent-Type: %s\r\n"
+        "Content-Encoding: %s\r\nVary: Accept-Encoding\r\nConnection: close\r\n"
+        "X-Magnus-Engine: native-c17/0.1\r\nX-Magnus-Request-Id: %s\r\n\r\n",
+        MAGNUS_VERSION, content_type, magnus_encoding_name(encoding),
+        request->request_id);
+    if (written < 0 || (size_t) written >= sizeof(connection->output)) {
+        magnus_stream_compress_end(connection->stream_compress);
+        connection->stream_compress = NULL;
+        free(connection->stream_compress_inbuf);
+        connection->stream_compress_inbuf = NULL;
+        free(connection->stream_compress_outbuf);
+        connection->stream_compress_outbuf = NULL;
+        close(file_fd);
+        connection->output_length = 0;
+        connection->close_after_write = true;
+        return true;
+    }
+    connection->output_length = (size_t) written;
+    connection->output_sent = 0;
+    connection->close_after_write = true;
+    connection->stream_compress_fd = file_fd;
+    connection->stream_compress_file_offset = 0;
+    connection->stream_compress_done = false;
+    connection->stream_compress_input_eof = false;
+    connection->stream_compress_inbuf_length = 0;
+    connection->stream_compress_inbuf_sent = 0;
+    connection->stream_compress_outbuf_length = 0;
+    connection->stream_compress_outbuf_sent = 0;
+    return true;
+}
+
 static void
 magnus_prepare_file_response(magnus_connection_t *connection, int file_fd,
                              const struct stat *metadata, bool head_only,
@@ -3327,11 +3483,14 @@ magnus_prepare_file_response(magnus_connection_t *connection, int file_fd,
     const char *content_type = magnus_content_type(request->path);
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
-    magnus_encoding_t encoding = magnus_compress_static(file_fd, metadata,
-                                                         parsed, content_type,
-                                                         &compressed,
-                                                         &compressed_length);
-    bool use_gzip = encoding != MAGNUS_ENCODING_NONE;
+    magnus_encoding_t encoding;
+    bool use_gzip;
+    if (magnus_prepare_streaming_compressed_file_response(connection, file_fd,
+            metadata, head_only, close_connection, request, parsed))
+        return;
+    encoding = magnus_compress_static(file_fd, metadata, parsed, content_type,
+                                      &compressed, &compressed_length);
+    use_gzip = encoding != MAGNUS_ENCODING_NONE;
     char content_encoding_header[32] = "";
     long long response_length = use_gzip
         ? (long long) compressed_length : (long long) metadata->st_size;
@@ -8510,6 +8669,94 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         return -1;
     }
+    /* Roadmap 2a-7: streaming compression for a static file too large
+     * to buffer-then-compress -- see magnus_prepare_streaming_
+     * compressed_file_response()'s own comment for why this needs its
+     * own dedicated fd/buffer set rather than reusing file_fd/
+     * file_buffer above. Four sub-states, checked in this order every
+     * time the loop re-enters (including every resumption after an
+     * EAGAIN below, since none of this is persisted anywhere else):
+     * (1) drain any already-produced compressed output first -- that's
+     * the only sub-state that can hit EAGAIN, so it must be checked
+     * before doing any new compression work on a resumed call; (2) once
+     * fully drained, tear down and finish if the compressor already
+     * reported completion; (3) otherwise pull the next raw chunk from
+     * the file if the input staging buffer is empty and the file isn't
+     * fully read yet; (4) feed whatever input is available (zero bytes,
+     * with finish=true, once the file is fully read) into the
+     * compressor for one more step. */
+    while (connection->stream_compress != NULL) {
+        if (connection->stream_compress_outbuf_sent
+            < connection->stream_compress_outbuf_length) {
+            sent = magnus_socket_write(connection,
+                connection->stream_compress_outbuf
+                    + connection->stream_compress_outbuf_sent,
+                connection->stream_compress_outbuf_length
+                    - connection->stream_compress_outbuf_sent);
+            if (sent > 0) {
+                connection->stream_compress_outbuf_sent += (size_t) sent;
+                magnus_bytes_sent += (uint64_t) sent;
+                connection->last_active = time(NULL);
+                continue;
+            }
+            if (sent < 0 && errno == EINTR) continue;
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            return -1;
+        }
+        if (connection->stream_compress_done) {
+            magnus_stream_compress_end(connection->stream_compress);
+            connection->stream_compress = NULL;
+            close(connection->stream_compress_fd);
+            connection->stream_compress_fd = -1;
+            free(connection->stream_compress_inbuf);
+            connection->stream_compress_inbuf = NULL;
+            free(connection->stream_compress_outbuf);
+            connection->stream_compress_outbuf = NULL;
+            break;
+        }
+        if (connection->stream_compress_inbuf_sent
+                == connection->stream_compress_inbuf_length
+            && !connection->stream_compress_input_eof) {
+            ssize_t got = pread(connection->stream_compress_fd,
+                connection->stream_compress_inbuf,
+                MAGNUS_STREAM_COMPRESS_CHUNK,
+                connection->stream_compress_file_offset);
+            if (got < 0 && errno == EINTR) continue;
+            /* A mid-stream read error has no good recovery -- the
+             * response has already started (headers, and possibly some
+             * compressed body, are already on the wire with no
+             * Content-Length the client could use to detect a short
+             * body any other way) -- same as the existing sendfile/
+             * pread loops above returning -1 on their own read/send
+             * failures. */
+            if (got < 0) return -1;
+            if (got == 0) {
+                connection->stream_compress_input_eof = true;
+            } else {
+                connection->stream_compress_inbuf_length = (size_t) got;
+                connection->stream_compress_inbuf_sent = 0;
+                connection->stream_compress_file_offset += got;
+            }
+        }
+        {
+            size_t consumed = 0;
+            size_t produced = 0;
+            bool done = false;
+            bool ok = magnus_stream_compress_step(connection->stream_compress,
+                connection->stream_compress_inbuf
+                    + connection->stream_compress_inbuf_sent,
+                connection->stream_compress_inbuf_length
+                    - connection->stream_compress_inbuf_sent,
+                connection->stream_compress_input_eof, &consumed,
+                connection->stream_compress_outbuf,
+                MAGNUS_STREAM_COMPRESS_CHUNK, &produced, &done);
+            if (!ok) return -1;
+            connection->stream_compress_inbuf_sent += consumed;
+            connection->stream_compress_outbuf_length = produced;
+            connection->stream_compress_outbuf_sent = 0;
+            connection->stream_compress_done = done;
+        }
+    }
     if (connection->file_fd >= 0) {
         close(connection->file_fd);
         connection->file_fd = -1;
@@ -8605,6 +8852,7 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
         connection->input_capacity = MAGNUS_INITIAL_INPUT;
         connection->fd = client;
         connection->file_fd = -1;
+        connection->stream_compress_fd = -1;
         /* calloc() zero-initializes the rest of the struct, so without
          * this, upstream_fd defaults to 0 (not "no upstream") for every
          * connection that never proxies. magnus_close_connection()'s only

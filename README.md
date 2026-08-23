@@ -330,7 +330,28 @@ independently by IORESPONSE.
   default quality (11) was too slow for on-the-fly per-request
   compression, so it runs at quality 4, the fastest level that still
   clearly beats gzip's ratio
-- Container image: 10,721,033 bytes (~10.22 MiB), non-root, read-only rootfs
+- Streaming compression for HTTP/1.1 static files past the 8 MiB bound
+  (roadmap 2a-7): the first slice of "streaming/chunked compression
+  above 8 MiB", the item every prior compression increment has
+  deferred. A static file too large for the buffer-then-compress shape
+  every other compression path here uses now streams instead --
+  compressed in 64 KiB chunks via each encoder's own incremental API as
+  the file is read, written to the client as each chunk is produced.
+  No `Content-Length` is knowable ahead of time for a streamed body, so
+  the response is close-delimited (`Connection: close`, RFC 9112 6.3)
+  rather than chunked-encoded -- the narrower of the two real options,
+  reusing every existing byte-writing primitive unchanged instead of
+  building this codebase's first `Transfer-Encoding: chunked` writer;
+  a real chunked writer (recovering keep-alive for these responses),
+  HTTP/2 and HTTP/3 static files, and proxy dispatch on every protocol
+  all remain later increments. Found and fixed one real, previously-
+  latent bug along the way: `magnus_close_connection()` never called
+  `SSL_shutdown()` before closing a TLS socket, harmless for every
+  existing `Content-Length`-bearing response but visible to a strict
+  TLS 1.3 client the moment a response is framed purely by the
+  connection closing, exactly what this increment's own responses are
+  the first to do
+- Container image: 10,722,631 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

@@ -1904,6 +1904,71 @@ curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
   "https://127.0.0.1:$port_compression/page.html" \
   | gzip -dc | cmp "$compression_root/page.html" -
 
+# Roadmap 2a-7: streaming compression for a static file past
+# MAGNUS_COMPRESSION_MAX_SIZE (8 MiB) -- magnus_compress_static()'s own
+# buffer-then-compress shape refuses this file outright (same gate the
+# plain/no-Accept-Encoding and HEAD checks below still exercise), so a
+# GET offering a real encoding takes the new streaming path instead.
+# Random content (not html-shaped like page.html above) is fine here --
+# this block is about the framing/plumbing being correct at this size,
+# not about ratio, which the ordinary compression blocks already cover.
+# HTTP/1.1 only -- see magnus_prepare_streaming_compressed_file_
+# response()'s own doc comment for why this first cut stops there.
+head -c 9000000 /dev/urandom | base64 >"$compression_root/streaming.html"
+stream_size=$(wc -c <"$compression_root/streaming.html")
+test "$stream_size" -gt $((8 * 1024 * 1024))
+
+stream_gzip_headers="$web_root/stream-gzip.headers"
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  --dump-header "$stream_gzip_headers" \
+  --output "$web_root/stream.out.gz" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: gzip' "$stream_gzip_headers"
+grep -qi '^vary: Accept-Encoding' "$stream_gzip_headers"
+grep -qi '^connection: close' "$stream_gzip_headers"
+! grep -qi '^content-length:' "$stream_gzip_headers"
+gzip -dc "$web_root/stream.out.gz" | cmp "$compression_root/streaming.html" -
+
+stream_zstd_headers="$web_root/stream-zstd.headers"
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
+  --dump-header "$stream_zstd_headers" \
+  --output "$web_root/stream.out.zst" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: zstd' "$stream_zstd_headers"
+! grep -qi '^content-length:' "$stream_zstd_headers"
+zstd -dc "$web_root/stream.out.zst" | cmp "$compression_root/streaming.html" -
+
+stream_brotli_headers="$web_root/stream-brotli.headers"
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: br' \
+  --dump-header "$stream_brotli_headers" \
+  --output "$web_root/stream.out.br" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^content-encoding: br' "$stream_brotli_headers"
+! grep -qi '^content-length:' "$stream_brotli_headers"
+brotli -dc "$web_root/stream.out.br" | cmp "$compression_root/streaming.html" -
+
+# No Accept-Encoding: the ordinary uncompressed relay handles a file
+# this large exactly like it always has -- a real Content-Length, kept
+# alive, completely unaffected by the streaming path existing now.
+stream_plain_headers="$web_root/stream-plain.headers"
+curl --http1.1 --insecure --fail --silent --dump-header "$stream_plain_headers" \
+  --output "$web_root/stream.out.plain" \
+  "https://127.0.0.1:$port_compression/streaming.html"
+! grep -qi '^content-encoding:' "$stream_plain_headers"
+grep -qi "^content-length: $stream_size" "$stream_plain_headers"
+grep -qi '^connection: keep-alive' "$stream_plain_headers"
+cmp "$compression_root/streaming.html" "$web_root/stream.out.plain"
+
+# HEAD deliberately never takes the streaming path (see that function's
+# own doc comment) -- still answers with the file's real, uncompressed
+# Content-Length, same as any other HEAD on a static file.
+stream_head_headers="$web_root/stream-head.headers"
+curl --http1.1 --insecure --fail --silent --head -H 'Accept-Encoding: gzip' \
+  --dump-header "$stream_head_headers" --output /dev/null \
+  "https://127.0.0.1:$port_compression/streaming.html"
+! grep -qi '^content-encoding:' "$stream_head_headers"
+grep -qi "^content-length: $stream_size" "$stream_head_headers"
+
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
