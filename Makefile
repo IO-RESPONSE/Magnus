@@ -19,9 +19,13 @@ LDFLAGS ?= -Wl,-z,relro,-z,now
 # into the Docker image (Dockerfile's own libzstd.so.1 copy predates
 # this: a transitive OpenSSL 3.5+ dependency, unused by Magnus's own
 # code until now), so this is a build-time-only addition for the image,
-# not a new runtime footprint.
-LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lzstd -lngtcp2 \
-          -lngtcp2_crypto_ossl -lnghttp3
+# not a new runtime footprint. -lbrotlienc/-lbrotlicommon joined in 2a-6
+# (Brotli response compression) -- unlike zstd, this *does* add two new
+# runtime libraries to the image (Dockerfile's own new cp -L lines);
+# only the encoder is linked, never the decoder (libbrotlidec), since
+# Magnus only ever compresses, never decompresses, a response body.
+LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lzstd -lbrotlienc \
+          -lbrotlicommon -lngtcp2 -lngtcp2_crypto_ossl -lnghttp3
 
 SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_compression.c \
@@ -185,13 +189,14 @@ build/test-compression: tests/test-compression.c src/magnus_compression.c \
 		src/magnus_compression.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-compression.c \
-		src/magnus_compression.c -lz -lzstd -o $@
+		src/magnus_compression.c -lz -lzstd -lbrotlienc -lbrotlicommon \
+		-lbrotlidec -o $@
 
 build/fuzz-compression: tests/fuzz-compression.c src/magnus_compression.c \
 		src/magnus_compression.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-compression.c \
-		src/magnus_compression.c -lz -lzstd -o $@
+		src/magnus_compression.c -lz -lzstd -lbrotlienc -lbrotlicommon -o $@
 
 build/test-realip: tests/test-realip.c src/magnus_realip.c src/magnus_realip.h \
 		src/magnus_route.c src/magnus_http.c src/magnus_config.h

@@ -1,6 +1,7 @@
 /* Mutation-based fuzz driver for magnus_negotiate_encoding() (roadmap
- * 2a-5; magnus_accepts_gzip() before it) -- it parses the client-
- * supplied Accept-Encoding request header directly, so it gets the
+ * 2a-6, extending 2a-5; magnus_accepts_gzip() before either) -- it
+ * parses the client-supplied Accept-Encoding request header directly,
+ * so it gets the
  * same fuzzing treatment as every other new parser of untrusted bytes
  * this project has added (see e.g. tests/fuzz-base64.c, roadmap 1e-5).
  * Same approach as every other fuzz-*.c in this codebase: a small seed
@@ -29,8 +30,14 @@ static const char magnus_fuzz_seeds[][48] = {
     "zstd;q=0",
     "zstd, gzip",
     "gzip, zstd",
+    "br",
+    "Br",
+    "br;q=0",
+    "brotli",
+    "gzip, br",
     "br, gzip ; q=0.5, deflate",
     "br, zstd; q=0.5, deflate",
+    "zstd, br, gzip",
     "br, xgzip, xzstd, deflate",
     "identity",
     "*",

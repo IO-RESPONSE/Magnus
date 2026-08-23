@@ -253,5 +253,17 @@ main(void)
     assert(strstr(out, "Content-Encoding: zstd\r\n") != NULL);
     assert(strstr(out, "Vary: Accept-Encoding\r\n") != NULL);
 
+    /* Roadmap 2a-6: same again with "br" (Brotli's own Content-Encoding
+     * token, not "brotli"). */
+    strcpy(raw,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+        "Content-Length: 100\r\n\r\n");
+    written = magnus_proxy_sanitize_response_headers(raw, strlen(raw), out,
+        sizeof(out), NULL, false, 42, "br", &info, NULL);
+    assert(written > 0);
+    assert(strstr(out, "Content-Length: 42\r\n") != NULL);
+    assert(strstr(out, "Content-Encoding: br\r\n") != NULL);
+    assert(strstr(out, "Vary: Accept-Encoding\r\n") != NULL);
+
     return 0;
 }

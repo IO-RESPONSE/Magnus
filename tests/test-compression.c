@@ -5,6 +5,7 @@
 #include <string.h>
 #include <zlib.h>
 #include <zstd.h>
+#include <brotli/decode.h>
 
 static void
 gzip_round_trip(size_t length)
@@ -62,15 +63,40 @@ zstd_round_trip(size_t length)
     free(input);
 }
 
+/* Roadmap 2a-6: the Brotli analogue again -- same shape once more. */
+static void
+brotli_round_trip(size_t length)
+{
+    unsigned char *input = malloc(length == 0 ? 1 : length);
+    unsigned char *compressed = NULL;
+    unsigned char *decoded = malloc(length == 0 ? 1 : length);
+    size_t compressed_length = 0;
+    size_t decoded_size = length == 0 ? 1 : length;
+    assert(input != NULL && decoded != NULL);
+    for (size_t index = 0; index < length; index++)
+        input[index] = (unsigned char) (index % 251);
+    assert(magnus_brotli_compress(input, length, &compressed,
+                                  &compressed_length) == 0);
+    assert(compressed != NULL);
+    assert(BrotliDecoderDecompress(compressed_length, compressed,
+                                   &decoded_size, decoded)
+           == BROTLI_DECODER_RESULT_SUCCESS);
+    assert(decoded_size == length);
+    assert(memcmp(input, decoded, length) == 0);
+    free(decoded);
+    free(compressed);
+    free(input);
+}
+
 int
 main(void)
 {
     assert(magnus_negotiate_encoding("gzip") == MAGNUS_ENCODING_GZIP);
-    assert(magnus_negotiate_encoding("br, gzip ; q=0.5, deflate")
+    assert(magnus_negotiate_encoding("gzip ; q=0.5, deflate")
            == MAGNUS_ENCODING_GZIP);
     assert(magnus_negotiate_encoding("GZip;q=0") == MAGNUS_ENCODING_GZIP);
     assert(magnus_negotiate_encoding(NULL) == MAGNUS_ENCODING_NONE);
-    assert(magnus_negotiate_encoding("br, xgzip, deflate")
+    assert(magnus_negotiate_encoding("xbr, xgzip, deflate")
            == MAGNUS_ENCODING_NONE);
     /* zstd is preferred over gzip whenever a client offers both, in
      * either order -- the whole point of magnus_negotiate_encoding()
@@ -83,10 +109,27 @@ main(void)
     assert(magnus_negotiate_encoding("br, zstd; q=0.1, deflate")
            == MAGNUS_ENCODING_ZSTD);
     assert(magnus_negotiate_encoding("br, xzstd, deflate")
-           == MAGNUS_ENCODING_NONE);
+           == MAGNUS_ENCODING_BROTLI);
+
+    /* Roadmap 2a-6: Brotli ("br", the IANA-registered token -- not
+     * "brotli") sits between zstd and gzip in preference: loses to
+     * zstd, beats gzip, in either offered order either way. */
+    assert(magnus_negotiate_encoding("br") == MAGNUS_ENCODING_BROTLI);
+    assert(magnus_negotiate_encoding("Br") == MAGNUS_ENCODING_BROTLI);
+    assert(magnus_negotiate_encoding("br;q=0") == MAGNUS_ENCODING_BROTLI);
+    assert(magnus_negotiate_encoding("gzip, br") == MAGNUS_ENCODING_BROTLI);
+    assert(magnus_negotiate_encoding("br, gzip") == MAGNUS_ENCODING_BROTLI);
+    assert(magnus_negotiate_encoding("zstd, br") == MAGNUS_ENCODING_ZSTD);
+    assert(magnus_negotiate_encoding("br, zstd") == MAGNUS_ENCODING_ZSTD);
+    assert(magnus_negotiate_encoding("gzip, br, zstd")
+           == MAGNUS_ENCODING_ZSTD);
+    /* "brotli" itself is not a valid Accept-Encoding token (RFC 7932
+     * registers "br"), so it must not match. */
+    assert(magnus_negotiate_encoding("brotli") == MAGNUS_ENCODING_NONE);
 
     assert(strcmp(magnus_encoding_name(MAGNUS_ENCODING_GZIP), "gzip") == 0);
     assert(strcmp(magnus_encoding_name(MAGNUS_ENCODING_ZSTD), "zstd") == 0);
+    assert(strcmp(magnus_encoding_name(MAGNUS_ENCODING_BROTLI), "br") == 0);
 
     assert(magnus_content_type_compressible("text/html; charset=utf-8"));
     assert(magnus_content_type_compressible("application/json"));
@@ -100,6 +143,10 @@ main(void)
     zstd_round_trip(0);
     zstd_round_trip(MAGNUS_COMPRESSION_MIN_SIZE);
     zstd_round_trip(128 * 1024);
+
+    brotli_round_trip(0);
+    brotli_round_trip(MAGNUS_COMPRESSION_MIN_SIZE);
+    brotli_round_trip(128 * 1024);
 
     return 0;
 }

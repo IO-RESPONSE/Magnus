@@ -2277,41 +2277,35 @@ magnus_proxy_connect_failed(int epoll_fd, magnus_connection_t *connection,
 /* Roadmap 2a-2: called from magnus_proxy_flush() the moment a
  * compress-pending response's body is fully captured (or the upstream
  * closed early -- see that call site's own comment). Compresses
- * connection->proxy_compress_capture via magnus_gzip_compress() or
- * magnus_zstd_compress() (roadmap 2a-5; whichever connection->
- * proxy_compress_encoding was negotiated back in magnus_proxy_receive_
- * headers()'s own eligibility check), then calls magnus_proxy_sanitize_
- * response_headers() a *second* time on proxy_compress_raw_headers (the
- * pristine raw upstream header block magnus_proxy_receive_headers()
- * stashed for exactly this), this time with the real compressed length
- * and encoding name so it emits Content-Length/Content-Encoding/Vary for
- * the compressed body instead of relaying the upstream's own
- * uncompressed Content-Length line. Populates proxy_header_out and
- * proxy_compressed_body for magnus_proxy_flush()'s own write loops to
- * actually send. Neither compress function ever fails except on an
- * allocation failure (never on well-formed input), so that one case
- * falls back to relaying the captured bytes uncompressed (ownership of
- * proxy_compress_capture transfers straight into proxy_compressed_body,
- * no extra copy) rather than losing the response outright. Returns 0 on
- * success, -1 only if even the *second* sanitize call or its own
- * header_out allocation fails -- a genuinely unrecoverable case at this
- * point (nothing has reached the client yet either way), handled by the
- * caller exactly like any other proxy abort. */
+ * connection->proxy_compress_capture via magnus_compress() (roadmap
+ * 2a-6; whichever connection->proxy_compress_encoding was negotiated
+ * back in magnus_proxy_receive_headers()'s own eligibility check), then
+ * calls magnus_proxy_sanitize_response_headers() a *second* time on
+ * proxy_compress_raw_headers (the pristine raw upstream header block
+ * magnus_proxy_receive_headers() stashed for exactly this), this time
+ * with the real compressed length and encoding name so it emits
+ * Content-Length/Content-Encoding/Vary for the compressed body instead
+ * of relaying the upstream's own uncompressed Content-Length line.
+ * Populates proxy_header_out and proxy_compressed_body for magnus_
+ * proxy_flush()'s own write loops to actually send. None of the three
+ * encoders ever fail except on an allocation failure (never on
+ * well-formed input), so that one case falls back to relaying the
+ * captured bytes uncompressed (ownership of proxy_compress_capture
+ * transfers straight into proxy_compressed_body, no extra copy) rather
+ * than losing the response outright. Returns 0 on success, -1 only if
+ * even the *second* sanitize call or its own header_out allocation
+ * fails -- a genuinely unrecoverable case at this point (nothing has
+ * reached the client yet either way), handled by the caller exactly
+ * like any other proxy abort. */
 static int
 magnus_proxy_finish_compression(magnus_connection_t *connection)
 {
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
-    bool compressed_ok = connection->proxy_compress_encoding
-            == MAGNUS_ENCODING_ZSTD
-        ? magnus_zstd_compress(
-              (unsigned char *) connection->proxy_compress_capture,
-              connection->proxy_compress_capture_length,
-              &compressed, &compressed_length) == 0
-        : magnus_gzip_compress(
-              (unsigned char *) connection->proxy_compress_capture,
-              connection->proxy_compress_capture_length,
-              &compressed, &compressed_length) == 0;
+    bool compressed_ok = magnus_compress(connection->proxy_compress_encoding,
+        (unsigned char *) connection->proxy_compress_capture,
+        connection->proxy_compress_capture_length, &compressed,
+        &compressed_length) == 0;
     char sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;
@@ -3272,9 +3266,7 @@ magnus_compress_static(int fd, const struct stat *metadata,
         }
         offset += (size_t) got;
     }
-    if ((encoding == MAGNUS_ENCODING_ZSTD
-             ? magnus_zstd_compress(input, length, output, output_length)
-             : magnus_gzip_compress(input, length, output, output_length))
+    if (magnus_compress(encoding, input, length, output, output_length)
         != 0) {
         free(input);
         return MAGNUS_ENCODING_NONE;
@@ -5302,7 +5294,7 @@ magnus_h2_submit_cached_response(magnus_connection_t *connection,
  * independently, on its own schedule, once submit_response2() has told
  * it this stream has a response -- this function's only job is to make
  * that call, for the first time, with the real (compressed, or
- * gracefully-uncompressed-on-gzip-allocation-failure) body and headers
+ * gracefully-uncompressed-on-allocation-failure) body and headers
  * now known. Returns 0 on success, -1 only if even the *second*
  * sanitize call fails (a genuinely unrecoverable case at this point --
  * response_headers_submitted is still false, so
@@ -5314,16 +5306,10 @@ magnus_h2_proxy_finish_compression(struct magnus_h2_stream *stream)
     magnus_connection_t *connection = stream->connection;
     unsigned char *compressed = NULL;
     size_t compressed_length = 0;
-    bool compressed_ok;
-    compressed_ok = stream->compress_encoding == MAGNUS_ENCODING_ZSTD
-        ? magnus_zstd_compress(
-              (unsigned char *) stream->compress_capture,
-              stream->compress_capture_length, &compressed,
-              &compressed_length) == 0
-        : magnus_gzip_compress(
-              (unsigned char *) stream->compress_capture,
-              stream->compress_capture_length, &compressed,
-              &compressed_length) == 0;
+    bool compressed_ok = magnus_compress(stream->compress_encoding,
+        (unsigned char *) stream->compress_capture,
+        stream->compress_capture_length, &compressed, &compressed_length)
+        == 0;
     char sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
     char sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
     magnus_proxy_response_info_t info;

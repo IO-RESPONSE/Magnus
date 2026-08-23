@@ -5,7 +5,7 @@ ARG BASE_IMAGE=ioresponse/glibc71-base:poc
 FROM ${BUILDER_IMAGE} AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential ca-certificates \
-        libssl-dev libnghttp2-dev zlib1g-dev libzstd-dev \
+        libssl-dev libnghttp2-dev zlib1g-dev libzstd-dev libbrotli-dev \
         git autoconf automake libtool \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,6 +58,8 @@ RUN make clean all \
     && cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libz.so.1 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libzstd.so.1 /out/lib64/ \
+    && cp -L /usr/lib/x86_64-linux-gnu/libbrotlienc.so.1 /out/lib64/ \
+    && cp -L /usr/lib/x86_64-linux-gnu/libbrotlicommon.so.1 /out/lib64/ \
     && cp -L /usr/lib/x86_64-linux-gnu/libnghttp2.so.14 /out/lib64/ \
     && cp -L /usr/local/lib/libngtcp2.so.16 /out/lib64/ \
     && cp -L /usr/local/lib/libngtcp2_crypto_ossl.so.0 /out/lib64/ \

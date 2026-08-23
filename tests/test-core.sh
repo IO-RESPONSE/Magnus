@@ -1844,12 +1844,18 @@ for protocol in --http1.1 --http2; do
   ! grep -qi '^content-encoding: gzip' "$plain_headers"
   cmp "$compression_root/page.html" "$decoded_body"
 
-  curl "$protocol" --insecure --fail --silent --compressed \
-    --dump-header "$gzip_headers" --output "$decoded_body" \
+  # Explicit -H rather than --compressed (which would now negotiate
+  # Brotli, not gzip, against this curl build -- see the roadmap 2a-6
+  # block below): decoded manually with the gzip CLI instead of relying
+  # on libcurl's own transparent decompression, the same shape zstd's
+  # own block already needs (its own decoder has no libcurl integration
+  # at all) so all three encodings are verified identically here.
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+    --dump-header "$gzip_headers" --output "$web_root/gzip-${protocol#--}.out" \
     "https://127.0.0.1:$port_compression/page.html"
   grep -qi '^content-encoding: gzip' "$gzip_headers"
   grep -qi '^vary: Accept-Encoding' "$gzip_headers"
-  cmp "$compression_root/page.html" "$decoded_body"
+  gzip -dc "$web_root/gzip-${protocol#--}.out" | cmp "$compression_root/page.html" -
 
   curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
     --dump-header "$gzip_headers" --output /dev/null \
@@ -1858,9 +1864,9 @@ for protocol in --http1.1 --http2; do
 
   # Roadmap 2a-5: zstd is a second negotiable encoding, preferred over
   # gzip whenever a client offers both -- curl's own libcurl here has no
-  # built-in zstd decoder (unlike gzip/brotli via --compressed), so the
-  # request/response is driven explicitly and decoded with the zstd CLI
-  # instead, the same shape the final byte-exact gzip check below uses.
+  # built-in zstd decoder, so the request/response is driven explicitly
+  # and decoded with the zstd CLI instead, the same shape the gzip block
+  # above now uses too.
   zstd_headers="$web_root/zstd-${protocol#--}.headers"
   curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: zstd' \
     --dump-header "$zstd_headers" --output "$web_root/zstd-${protocol#--}.out" \
@@ -1873,6 +1879,25 @@ for protocol in --http1.1 --http2; do
     --dump-header "$zstd_headers" --output /dev/null \
     "https://127.0.0.1:$port_compression/page.html"
   grep -qi '^content-encoding: zstd' "$zstd_headers"
+
+  # Roadmap 2a-6: Brotli ("br"), preferred over gzip but not over zstd,
+  # whenever a client offers it. This curl build negotiates Brotli
+  # transparently via --compressed (libcurl was built with brotli
+  # support -- confirmed via `curl --version`), which doubles as live
+  # confirmation that magnus's own preference-over-gzip behavior matches
+  # what a real, unmodified browser/client would actually get back.
+  brotli_headers="$web_root/brotli-${protocol#--}.headers"
+  curl "$protocol" --insecure --fail --silent --compressed \
+    --dump-header "$brotli_headers" --output "$decoded_body" \
+    "https://127.0.0.1:$port_compression/page.html"
+  grep -qi '^content-encoding: br' "$brotli_headers"
+  grep -qi '^vary: Accept-Encoding' "$brotli_headers"
+  cmp "$compression_root/page.html" "$decoded_body"
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip, zstd, br' \
+    --dump-header "$brotli_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compression/page.html"
+  grep -qi '^content-encoding: zstd' "$brotli_headers"
 done
 
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
@@ -1940,12 +1965,18 @@ for protocol in --http1.1 --http2; do
   ! grep -qi '^content-encoding: gzip' "$plain_headers"
   cmp "$compress_proxy_root/page.html" "$decoded_body"
 
-  curl "$protocol" --insecure --fail --silent --compressed \
-    --dump-header "$gzip_headers" --output "$decoded_body" \
+  # Explicit -H rather than --compressed (which would now negotiate
+  # Brotli against this curl build -- see the roadmap 2a-6 block below),
+  # decoded manually with the gzip CLI, the same reasoning as the
+  # static-file compression block above.
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+    --dump-header "$gzip_headers" \
+    --output "$web_root/compress-proxy-gzip-${protocol#--}.out" \
     "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
   grep -qi '^content-encoding: gzip' "$gzip_headers"
   grep -qi '^vary: Accept-Encoding' "$gzip_headers"
-  cmp "$compress_proxy_root/page.html" "$decoded_body"
+  gzip -dc "$web_root/compress-proxy-gzip-${protocol#--}.out" \
+    | cmp "$compress_proxy_root/page.html" -
 
   curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
     --dump-header "$gzip_headers" --output /dev/null \
@@ -1975,6 +2006,22 @@ for protocol in --http1.1 --http2; do
     --dump-header "$zstd_headers" --output /dev/null \
     "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
   grep -qi '^content-encoding: zstd' "$zstd_headers"
+
+  # Roadmap 2a-6: Brotli through the proxy dispatch path -- --compressed
+  # here doubles as live confirmation that a real client sees the same
+  # preference-over-gzip the static-file block above already proved.
+  brotli_headers="$web_root/compress-proxy-brotli-${protocol#--}.headers"
+  curl "$protocol" --insecure --fail --silent --compressed \
+    --dump-header "$brotli_headers" --output "$decoded_body" \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  grep -qi '^content-encoding: br' "$brotli_headers"
+  grep -qi '^vary: Accept-Encoding' "$brotli_headers"
+  cmp "$compress_proxy_root/page.html" "$decoded_body"
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip, zstd, br' \
+    --dump-header "$brotli_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  grep -qi '^content-encoding: zstd' "$brotli_headers"
 done
 
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
@@ -4166,6 +4213,14 @@ grep -qE '^content-encoding: zstd$' "$web_root/quic-compress-zstd-out"
 grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-zstd-out"
 tail -n +5 "$web_root/quic-compress-zstd-out" | zstd -dc \
   | diff - "$web_root/quic-compress.html"
+# Roadmap 2a-6: Brotli ("br"), same eligibility window/gate again.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-compress.html br > "$web_root/quic-compress-brotli-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-brotli-out"
+grep -qE '^content-encoding: br$' "$web_root/quic-compress-brotli-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-brotli-out"
+tail -n +5 "$web_root/quic-compress-brotli-out" | brotli -dc \
+  | diff - "$web_root/quic-compress.html"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
@@ -4939,6 +4994,17 @@ grep -qE '^status: 200$' "$web_root/quic-compress-proxy-zstd-out"
 grep -qE '^content-encoding: zstd$' "$web_root/quic-compress-proxy-zstd-out"
 grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-zstd-out"
 tail -n +6 "$web_root/quic-compress-proxy-zstd-out" | zstd -dc \
+  | diff - "$compress_proxy_root/page.html"
+
+# Roadmap 2a-6: Brotli through the HTTP/3 proxy dispatch path -- same
+# deferred-submission-until-compressed shape as gzip/zstd above.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/page.html br \
+  > "$web_root/quic-compress-proxy-brotli-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-brotli-out"
+grep -qE '^content-encoding: br$' "$web_root/quic-compress-proxy-brotli-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-brotli-out"
+tail -n +6 "$web_root/quic-compress-proxy-brotli-out" | brotli -dc \
   | diff - "$compress_proxy_root/page.html"
 
 kill -TERM "$backend_pid"

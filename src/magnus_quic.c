@@ -1342,15 +1342,10 @@ magnus_quic_proxy_finish_compression(magnus_quic_connection_t *connection,
     magnus_proxy_response_info_t info;
     int sanitized_length;
 
-    compressed_ok = stream->compress_encoding == MAGNUS_ENCODING_ZSTD
-        ? magnus_zstd_compress(
-              (unsigned char *) stream->compress_capture,
-              stream->compress_capture_length, &compressed,
-              &compressed_length) == 0
-        : magnus_gzip_compress(
-              (unsigned char *) stream->compress_capture,
-              stream->compress_capture_length, &compressed,
-              &compressed_length) == 0;
+    compressed_ok = magnus_compress(stream->compress_encoding,
+        (unsigned char *) stream->compress_capture,
+        stream->compress_capture_length, &compressed, &compressed_length)
+        == 0;
 
     memcpy(sanitize_scratch, stream->compress_raw_headers,
           stream->compress_raw_headers_length + 1);
@@ -2272,9 +2267,7 @@ magnus_quic_compress_static(int fd, const struct stat *metadata,
         }
         offset += (size_t) got;
     }
-    if ((encoding == MAGNUS_ENCODING_ZSTD
-             ? magnus_zstd_compress(input, length, output, output_length)
-             : magnus_gzip_compress(input, length, output, output_length))
+    if (magnus_compress(encoding, input, length, output, output_length)
         != 0) {
         free(input);
         return MAGNUS_ENCODING_NONE;

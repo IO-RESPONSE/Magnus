@@ -11,9 +11,10 @@ independently by IORESPONSE.
   server runtime
 - Strict HTTP/1.0/1.1 parser, keep-alive, 8KiB request cap
 - Safe document root, MIME/HEAD, zero-copy `sendfile` static delivery
-- Negotiated gzip/zstd compression for 256-byte through 8 MiB compressible
-  static files over HTTP/1.1 and HTTP/2 (zstd preferred over gzip when a
-  client offers both); other responses retain their streaming path
+- Negotiated gzip/zstd/Brotli compression for 256-byte through 8 MiB
+  compressible static files over HTTP/1.1 and HTTP/2 (preference order
+  zstd > Brotli > gzip when a client offers more than one); other
+  responses retain their streaming path
 - Structured access log keyed by request ID
 - Native phase API: ingress → route → response → log
 - Per-request 128-bit trace ID, health endpoint, explicit error responses
@@ -246,9 +247,9 @@ independently by IORESPONSE.
 - HTTP/3 static-file gzip compression (roadmap Phase 4e): the same
   scope compression 2a shipped for HTTP/1.1 and HTTP/2, extended to
   the third protocol -- same eligibility window, same
-  `Vary: Accept-Encoding`. Proxied-response compression, Brotli, and
-  streaming compression above the 8 MiB bound remain deferred on
-  every protocol, not a QUIC-specific gap
+  `Vary: Accept-Encoding`. Proxied-response compression and streaming
+  compression above the 8 MiB bound remain deferred on every protocol,
+  not a QUIC-specific gap
 - HTTP/3 `route` table dispatch (roadmap Phase 4f): host/path-prefix/
   method/header/header_prefix/cookie/query/source-CIDR matching, the
   same DSL and matcher (`src/magnus_route.h`) HTTP/1.1 and HTTP/2
@@ -318,8 +319,18 @@ independently by IORESPONSE.
   as a transitive OpenSSL dependency, so this adds no new runtime
   library footprint; zstd's fast default level also suits this
   codebase's compress-fresh-per-request design better than Brotli's
-  asset-tuned default, which remains deferred on its own merits
-- Container image: 10,357,545 bytes (~9.88 MiB), non-root, read-only rootfs
+  asset-tuned default
+- Brotli as a third negotiable encoding (roadmap 2a-6), alongside gzip
+  and zstd, for both static-file and proxy dispatch compression, on all
+  three protocols: preference order zstd > Brotli > gzip, benchmarked
+  rather than assumed (see `CHANGELOG.md`'s 1.42.0 entry for the actual
+  numbers). Unlike zstd, this *does* add two new runtime libraries to
+  the image (`libbrotlienc.so.1`/`libbrotlicommon.so.1` -- the decoder
+  is never bundled, since Magnus only ever compresses); Brotli's own
+  default quality (11) was too slow for on-the-fly per-request
+  compression, so it runs at quality 4, the fastest level that still
+  clearly beats gzip's ratio
+- Container image: 10,721,033 bytes (~10.22 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

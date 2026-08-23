@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.42.0
+
+### Added
+
+- **Brotli as a third negotiable compression encoding (roadmap 2a-6),
+  joining gzip and zstd -- across both static-file and proxy-dispatch
+  compression, on all three protocols, closing out the deferral 2a-5
+  left open.** `magnus_negotiate_encoding()`'s preference order becomes
+  zstd > Brotli > gzip: benchmarked, not assumed. A ~230 KB and a
+  ~4.6 MB HTML-shaped fixture (the same repeated-line shape `tests/
+  test-core.sh`'s own compression blocks use) were compressed at every
+  Brotli quality level from 1 to 11 and compared against gzip -9 and
+  zstd's own default level. Quality 4 held to single-digit-to-low-
+  double-digit milliseconds on both fixtures -- the same ballpark as
+  gzip and zstd -- while beating gzip's ratio by roughly 2x on both;
+  quality 9 and above cost 2-3x the time for a mixed (sometimes worse,
+  on the larger fixture) ratio, and the library's own default quality
+  11 took over 20x longer than quality 4 on the smaller fixture alone.
+  `MAGNUS_BROTLI_QUALITY` (`src/magnus_compression.c`) is therefore 4:
+  the fastest quality that still clearly beats gzip, not the single
+  best ratio Brotli can produce -- the same "fast end of the range, not
+  the library default" reasoning `magnus_zstd_compress()` already
+  established in 2a-5. zstd still wins first place: it edged out
+  Brotli on ratio on the larger of the two fixtures at a comparable
+  speed, so a client offering both still gets zstd; a client offering
+  only Brotli and gzip gets Brotli, since it still clearly beats gzip
+  at that same speed budget.
+
+  Unlike zstd (2a-5), Brotli's runtime libraries were *not* already
+  present in the image -- `libbrotlienc.so.1`/`libbrotlicommon.so.1`
+  are new `cp -L` lines in the Dockerfile's runtime stage (confirmed via
+  `ldd` that `libbrotlienc.so.1` depends only on `libbrotlicommon.so.1`,
+  never on the decoder, so `libbrotlidec.so.1` -- Magnus only ever
+  compresses, never decompresses, a response body -- is correctly left
+  out); the builder stage gained `libbrotli-dev`. `LDLIBS` gained
+  `-lbrotlienc -lbrotlicommon`, both explicit per this codebase's own
+  established convention (`-lssl -lcrypto` already lists both sides of
+  an equivalent transitive dependency rather than relying on implicit
+  resolution).
+
+  `magnus_encoding_t` gained `MAGNUS_ENCODING_BROTLI`; `magnus_encoding_
+  name()` returns `"br"` for it -- the actual IANA-registered Content-
+  Encoding token (RFC 7932), not `"brotli"`. A new `magnus_brotli_
+  compress()` (`BrotliEncoderCompress()`/`BrotliEncoderMaxCompressedSize()`,
+  the same one-shot shape `magnus_gzip_compress()`/`magnus_zstd_
+  compress()` already have) sits alongside them. With three compress
+  functions now behind `magnus_negotiate_encoding()`'s result, every
+  call site that used to hand-roll a two-way `encoding == MAGNUS_
+  ENCODING_ZSTD ? zstd(...) : gzip(...)` ternary (there are five: each
+  protocol's own proxy-dispatch `finish_compression()`, plus `magnus_
+  compress_static()` and its h3 analogue) was replaced with a single
+  shared dispatcher, `magnus_compress(encoding, ...)`, rather than
+  growing five near-identical three-way branches.
+
+  One test regression found and fixed, not a code bug: several `tests/
+  test-core.sh` blocks used curl's `--compressed` flag to prove gzip
+  negotiation worked, relying on libcurl to both send `Accept-Encoding`
+  and transparently decompress the response for a byte-exact `cmp`.
+  This host's own curl was built with Brotli support (confirmed via
+  `curl --version`), so `--compressed` now offers `br` too -- and
+  magnus correctly starts preferring it over gzip, which is exactly the
+  new behavior this increment intends, but broke the *old* assertion
+  that the response would still be gzip. Fixed by switching those
+  blocks to an explicit `-H 'Accept-Encoding: gzip'` (decoded manually
+  via the `gzip` CLI, the same shape the zstd blocks already used since
+  neither zstd nor Brotli get transparent libcurl decompression without
+  `--compressed`) for the gzip-specific assertions, and adding new,
+  dedicated Brotli blocks that use `--compressed` deliberately -- now
+  as live confirmation that a real, unmodified client actually gets
+  Brotli back, not despite it.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; `tests/test-compression.c` gained `brotli_round_trip()` (the
+  Brotli analogue of the existing `gzip_round_trip()`/`zstd_round_
+  trip()`) plus negotiation assertions covering Brotli alone, its
+  preference position relative to both other encodings in every
+  offered order, and that `"brotli"` itself (not a valid Accept-
+  Encoding token) does not match; `tests/fuzz-compression.c`'s seed
+  corpus gained Brotli-shaped entries. `tests/test-proxy.c`'s
+  `compressed_content_encoding` coverage now includes a `"br"` case.
+  New `tests/test-core.sh` blocks (static-file and proxy-dispatch, all
+  three protocols) confirm `Accept-Encoding: br` gets back a byte-exact
+  `brotli`-decodable body with `Content-Encoding: br`/`Vary: Accept-
+  Encoding`, that Brotli beats gzip but loses to zstd in preference
+  regardless of offered order, and (via `--compressed`) that this
+  host's real curl actually receives and decodes it --
+  `tests/quic-handshake-check.c`'s `[gzip|zstd|br|-]` argument (extended
+  from 2a-5's own `[gzip|zstd|-]`) drives the HTTP/3 cases. Docker image
+  rebuilt and a live container tested directly across all three
+  protocols, static and proxied alike.
+
 ## 1.41.0
 
 ### Added

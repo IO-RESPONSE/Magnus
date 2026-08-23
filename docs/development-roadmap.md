@@ -512,6 +512,35 @@ connection-pool and common-request-model decisions).
       header rewriter emits whichever encoding was actually negotiated
       instead of a hardcoded `"gzip"`. See `CHANGELOG.md` 1.41.0 for the
       full detail.
+    - **2a-6 — Brotli as a third negotiable encoding. Shipped in
+      1.42.0.** Closes the deferral 2a-5 left open. Preference order
+      becomes zstd > Brotli > gzip -- benchmarked (a ~230 KB and a
+      ~4.6 MB HTML-shaped fixture, swept across Brotli's whole quality
+      range against gzip -9 and zstd's default), not assumed: quality 4
+      stayed in the same speed ballpark as gzip/zstd while beating
+      gzip's ratio by roughly 2x, so `MAGNUS_BROTLI_QUALITY` is 4, not
+      the library's own default of 11 (confirmed 20x-plus slower on the
+      smaller fixture alone). zstd still wins outright when offered
+      alongside Brotli -- it edged out Brotli on ratio on the larger
+      fixture at a comparable speed. Unlike zstd, Brotli's runtime
+      libraries were genuinely new to the image (`libbrotlienc.so.1`/
+      `libbrotlicommon.so.1`; the decoder is never bundled, since Magnus
+      only ever compresses). Every one of the five call sites that used
+      to hand-roll a two-way `zstd ? ... : gzip` ternary (each
+      protocol's own proxy-dispatch `finish_compression()`, plus
+      `magnus_compress_static()` and its h3 analogue) was replaced with
+      one shared `magnus_compress()` dispatcher rather than growing five
+      near-identical three-way branches. One test regression found and
+      fixed, not a code bug: several `tests/test-core.sh` blocks used
+      curl's `--compressed` flag to prove gzip negotiation, relying on
+      libcurl to both request and transparently decompress -- this
+      host's curl was built with Brotli support, so `--compressed` now
+      offers `br` too, and magnus correctly started preferring it,
+      breaking the old gzip-specific assertion. Fixed by switching those
+      to an explicit `-H 'Accept-Encoding: gzip'` and adding new,
+      dedicated Brotli blocks that use `--compressed` deliberately, as
+      live confirmation a real client actually gets Brotli back. See
+      `CHANGELOG.md` 1.42.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route
