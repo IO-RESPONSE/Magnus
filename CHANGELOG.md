@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.45.0
+
+### Fixed
+
+- **A second real, previously-latent bug found while building this
+  release's own streaming-compression feature: zstd- and Brotli-
+  compressed HTTP/3 static files could hang outright.** `ZSTD_
+  compressStream2()`'s own documentation states that `ZSTD_e_continue`
+  "is guaranteed to make some forward progress... but doesn't
+  guarantee maximal forward progress" -- it may legally consume input
+  and produce *zero* output on a given call, buffering internally
+  instead (`BrotliEncoderCompressStream()`'s `BROTLI_OPERATION_PROCESS`
+  behaves the same way; zlib's `deflate()` does not have this property,
+  which is exactly why gzip alone never exposed the bug). The h3
+  `nghttp3_data_reader` callback this release's own 2a-9 streaming path
+  first shipped called the streaming compressor exactly once per
+  invocation and treated a zero-output result as "would block, wait to
+  be resumed" -- but nghttp3's own resume mechanism has nothing to
+  trigger it without a chunk ever having been offered in the first
+  place, a genuine deadlock reproduced directly with both zstd and
+  Brotli on any static file needing more than a trivial amount of
+  compressed output. Fixed by looping inside the callback, feeding more
+  input and re-calling the compressor, until a call actually produces
+  output or the stream is genuinely done -- the same discipline every
+  other streaming-compression write loop in this codebase already
+  follows. Applied the identical fix to HTTP/2's own equivalent
+  callback too: it never reproduced a hang in testing, but that turned
+  out to rest on nghttp2's own eager retry timing rather than on any
+  contract this codebase could actually rely on, so it now shares the
+  same real guarantee instead of a codepath that merely never got
+  caught. Verified: a file that previously timed out at 5+ seconds for
+  both encoders now completes in under 250ms, byte-exact, across
+  repeated trials; direct ASan/UBSan testing of the live server (9
+  runs, all three encodings, zero findings) clean.
+
+### Added
+
+- **Streaming compression for HTTP/3 static files past the 8 MiB bound
+  (roadmap 2a-9) -- the third and final static-file slice, following
+  2a-7's own HTTP/1.1 one and 2a-8's own HTTP/2 one.** Like HTTP/2, no
+  close-delimited-framing workaround was needed: HTTP/3 never requires
+  a Content-Length ahead of a DATA-frame response either, so the
+  stream simply ends on the frame carrying its own FIN once the
+  streaming compressor reports done.
+
+  Unlike HTTP/2 (where nghttp2 hands the read callback a reusable
+  buffer to fill directly), HTTP/3's own `nghttp3_data_reader` contract
+  is the strictest of the three: each offered chunk must be its own
+  independent allocation, kept alive until the *peer has acknowledged*
+  it, not merely until it was handed off -- the same ACK-gated
+  discipline roadmap 2a-4's own HTTP/3 proxy-dispatch compression
+  already established (`struct magnus_quic_stream_t`'s own
+  `body_chunk`/`body_chunk_length`/`body_chunk_offered`/
+  `body_chunk_end_offset`/`body_offered_total`/`body_acked_total`/
+  `nghttp3_wants_resume` fields), reused directly here rather than
+  duplicated: exactly one of `is_proxy` or a non-NULL `stream_compress`
+  is ever true for a given stream, so both features can safely share
+  one field set. `magnus_quic_http_acked_stream_data()` (the shared ack
+  callback) was extended to free the in-flight chunk and resume the
+  stream for this case too, alongside its existing proxy-dispatch
+  logic. Unlike the mmap-based whole-file relay every other h3 static
+  response uses, this path needed its own persistent file descriptor
+  (`struct magnus_quic_stream_t` gained `file_fd`/`file_offset`) since
+  it reads the source file in bounded chunks via `pread()` rather than
+  mapping it all at once.
+
+  `tests/quic-handshake-check.c` (the only way to exercise HTTP/3 at
+  all in this project, absent HTTP/3 support in its own curl) had its
+  fixed response-body buffer bumped from 1 MiB to 16 MiB so it can
+  actually hold a whole well-past-8-MiB response for verification,
+  rather than only ever proving the first 1 MiB decoded correctly.
+
+  Verified: `make test` (twice) and direct ASan/UBSan testing of the
+  live server (9 runs across all three encodings, zero findings) both
+  clean; a 12 MB fixture streamed and decoded byte-exact over HTTP/3
+  under gzip, zstd, and Brotli. New `tests/test-core.sh` blocks confirm
+  byte-exact decode for all three encodings, that a plain request on
+  the same oversized file stays on the unmodified relay with a real
+  Content-Length, and that the server keeps answering ordinary requests
+  normally right after. Docker image rebuilt and a live container
+  tested directly.
+
 ## 1.44.0
 
 ### Fixed

@@ -356,9 +356,10 @@ independently by IORESPONSE.
   HTTP/2 needs none of HTTP/1.1's close-delimited-framing workaround,
   since no protocol requires a Content-Length ahead of a DATA-frame
   response, so the connection stays alive and multiplexed after a
-  streamed response exactly like any other. HTTP/3 static files and
-  proxy dispatch on every protocol remain later increments. Found and
-  fixed one real, previously-latent, more serious bug along the way:
+  streamed response exactly like any other. HTTP/3 static files
+  (below) and proxy dispatch on every protocol remain later increments
+  after this one. Found and fixed one real, previously-latent, more
+  serious bug along the way:
   `magnus_h2_drain_send()` retried a failed/partial `SSL_write()`
   against a *different* buffer address than the original attempt saw,
   violating OpenSSL's own same-address retry contract -- silently
@@ -368,7 +369,23 @@ independently by IORESPONSE.
   mid-transfer, invisible until something exercised a response that
   large, which nothing in this codebase's own test suite did before
   this increment's own well-past-8-MiB fixture
-- Container image: 10,723,178 bytes (~10.23 MiB), non-root, read-only rootfs
+- Streaming compression for HTTP/3 static files past the 8 MiB bound
+  (roadmap 2a-9): the third and final static-file slice. Like HTTP/2,
+  needed no close-delimited-framing workaround either. Unlike HTTP/2,
+  each offered chunk must be its own independent allocation kept alive
+  until the peer actually acknowledges it -- nghttp3's own strictest-
+  of-the-three `read_data` contract -- so this reuses the exact
+  ACK-gated `body_chunk` machinery roadmap 2a-4's own HTTP/3 proxy-
+  dispatch compression already established, rather than duplicating
+  it. Found and fixed a second real, previously-latent bug along the
+  way: zstd's and Brotli's own streaming APIs don't guarantee output
+  on every call (only forward input consumption), which deadlocked a
+  single-call-per-invocation `read_data` callback outright for both
+  encoders -- fixed by looping internally until real progress happens,
+  and applied to HTTP/2's own equivalent callback too (which never
+  reproduced a hang in testing, but only because of nghttp2's own
+  retry timing, not any actual guarantee)
+- Container image: 10,724,093 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

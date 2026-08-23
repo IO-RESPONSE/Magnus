@@ -638,6 +638,56 @@ connection-pool and common-request-model decisions).
       requests for a 12 MB file over HTTP/2+TLS, byte-exact every time
       (previously ~25-40% truncated). See `CHANGELOG.md` 1.44.0 for the
       full detail.
+    - **2a-9 — streaming compression, HTTP/3 static files past the 8
+      MiB bound. Shipped in 1.45.0.** The third and final static-file
+      slice. Like HTTP/2, no close-delimited-framing workaround was
+      needed -- HTTP/3 never requires a Content-Length ahead of a
+      DATA-frame response either. Unlike HTTP/2 (where nghttp2 hands
+      the read callback a reusable buffer to fill directly), HTTP/3's
+      own `nghttp3_data_reader` contract is the strictest of the three:
+      each offered chunk must be its own independent allocation, kept
+      alive until the *peer has acknowledged* it. Rather than duplicate
+      that machinery, this reuses `struct magnus_quic_stream_t`'s own
+      `body_chunk`/`body_chunk_length`/`body_chunk_offered`/
+      `body_chunk_end_offset`/`body_offered_total`/`body_acked_total`/
+      `nghttp3_wants_resume` fields directly -- the exact same ones
+      roadmap 2a-4's own HTTP/3 proxy-dispatch compression already
+      established this discipline for, safe because exactly one of
+      `is_proxy` or a non-NULL `stream_compress` is ever true for a
+      given stream. `magnus_quic_http_acked_stream_data()` (the shared
+      ack callback) was extended to free the in-flight chunk and resume
+      the stream for this case too. Unlike the mmap-based whole-file
+      relay every other h3 static response uses, this path needed its
+      own persistent file descriptor (`file_fd`/`file_offset`, new
+      fields) since it reads the source file in bounded chunks via
+      `pread()` rather than mapping it all at once.
+      `tests/quic-handshake-check.c` (the only way to exercise HTTP/3
+      at all in this project) had its fixed response-body buffer
+      bumped from 1 MiB to 16 MiB so it could actually hold a whole
+      well-past-8-MiB response for verification.
+
+      Found and fixed a second real, previously-latent bug along the
+      way: zstd's `ZSTD_compressStream2()` (`ZSTD_e_continue`) and
+      Brotli's `BrotliEncoderCompressStream()` (`BROTLI_OPERATION_
+      PROCESS`) both document that a single call is only guaranteed to
+      make forward progress *consuming input*, not producing output --
+      unlike zlib's `deflate()`, which is why gzip alone never exposed
+      this. A single-call-per-invocation `nghttp3_data_reader` callback
+      treated a zero-output result as "would block, wait to be
+      resumed" -- but nghttp3's own resume mechanism has nothing to
+      trigger it without a chunk ever having been offered, a genuine
+      deadlock reproduced directly with both encoders on any file
+      needing more than a trivial amount of compressed output. Fixed
+      by looping inside the callback until real progress happens, the
+      same discipline every other streaming-compression write loop in
+      this codebase already follows; applied the identical fix to
+      HTTP/2's own equivalent callback too, which never reproduced a
+      hang in testing but only because of nghttp2's own eager retry
+      timing, not any real guarantee. Verified: a file that previously
+      timed out at 5+ seconds for both encoders now completes in under
+      250ms, byte-exact, across repeated trials; direct ASan/UBSan
+      testing of the live server (9 runs, all three encodings, zero
+      findings) clean. See `CHANGELOG.md` 1.45.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

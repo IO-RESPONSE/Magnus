@@ -47,7 +47,13 @@
 #include <unistd.h>
 
 #define QUIC_HANDSHAKE_CHECK_DEADLINE_SECONDS 5
-#define QUIC_HANDSHAKE_CHECK_MAX_BODY (1u << 20)
+/* Roadmap 2a-9: bumped from 1 MiB to comfortably exceed MAGNUS_
+ * COMPRESSION_MAX_SIZE (8 MiB, src/magnus_compression.h) -- this tool
+ * is the only way to exercise HTTP/3 at all (no HTTP/3 support in this
+ * project's own curl), so verifying streaming compression's own
+ * well-past-8-MiB fixtures needs a body cap that can actually hold one
+ * whole response, not just proving the first 1 MiB decodes correctly. */
+#define QUIC_HANDSHAKE_CHECK_MAX_BODY (16u << 20)
 
 static ngtcp2_conn *g_conn;
 static nghttp3_conn *g_httpconn;

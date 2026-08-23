@@ -81,13 +81,6 @@
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_PROXY_MAX_ATTEMPTS 2
-/* Roadmap 2a-7: both the raw-file-chunk read size and the compressed-
- * output staging buffer size for streaming compression -- 64 KiB is the
- * same "one syscall/one library call's worth of work per event-loop
- * turn" sizing every other chunked I/O buffer in this file already
- * uses (magnus_proxy_compress_capture()'s own growth increment,
- * MAGNUS_PROXY_BUFFER above), not tuned independently. */
-#define MAGNUS_STREAM_COMPRESS_CHUNK (64 * 1024)
 /* TLS passthrough / SNI routing (roadmap 3b): how long a stream
  * connection may sit in MAGNUS_STREAM_PEEKING before giving up and
  * falling back to the default stream_upstream cluster -- the same
@@ -4095,7 +4088,28 @@ magnus_h2_read_file(nghttp2_session *session, int32_t stream_id, uint8_t *buf,
  * plain relay above -- see struct magnus_h2_stream's own comment on
  * why that reuse is safe here, unlike the HTTP/1.1 connection struct)
  * track the *raw* source file being read into stream->stream_compress_
- * inbuf as needed; the compressor itself is fed from there. */
+ * inbuf as needed; the compressor itself is fed from there.
+ *
+ * Loops calling magnus_stream_compress_step() internally, feeding more
+ * input as needed, until a call actually produces output (or the
+ * stream is genuinely done) -- required, not merely defensive: unlike
+ * zlib's deflate(), zstd's own ZSTD_compressStream2() documents that
+ * ZSTD_e_continue "is guaranteed to make some forward progress... but
+ * doesn't guarantee maximal forward progress" -- it can legally consume
+ * input and produce *zero* output on a given call (Brotli's own
+ * BROTLI_OPERATION_PROCESS behaves the same way). Confirmed the hard
+ * way on the h3 analogue of this function (magnus_quic_http_read_
+ * stream_compressed(), roadmap 2a-9): a single-call version deadlocked
+ * outright there, since nghttp3 needs an explicit resume signal this
+ * codebase only wires to a chunk actually being offered. A single-call
+ * version of *this* function never reproduced a hang in testing --
+ * nghttp2's own send loop (magnus_h2_push()) retries far more eagerly
+ * than nghttp3's ack-gated one does -- but relying on that timing
+ * difference for correctness, rather than on this function's own
+ * contract, is exactly the kind of thing that stops being true under a
+ * different nghttp2 version or network condition; looped here too so
+ * both protocols share one real guarantee instead of one codepath that
+ * merely happened not to get caught. */
 static nghttp2_ssize
 magnus_h2_read_stream_compressed(nghttp2_session *session, int32_t stream_id,
                                  uint8_t *buf, size_t length,
@@ -4110,26 +4124,32 @@ magnus_h2_read_stream_compressed(nghttp2_session *session, int32_t stream_id,
     (void) session;
     (void) stream_id;
     (void) user_data;
-    if (stream->stream_compress_inbuf_sent == stream->stream_compress_inbuf_length
-        && !stream->stream_compress_input_eof) {
-        ssize_t got = pread(stream->file_fd, stream->stream_compress_inbuf,
-                            MAGNUS_STREAM_COMPRESS_CHUNK, stream->file_offset);
-        if (got < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
-        if (got == 0) {
-            stream->stream_compress_input_eof = true;
-        } else {
-            stream->stream_compress_inbuf_length = (size_t) got;
-            stream->stream_compress_inbuf_sent = 0;
-            stream->file_offset += got;
+    for (;;) {
+        if (stream->stream_compress_inbuf_sent
+                == stream->stream_compress_inbuf_length
+            && !stream->stream_compress_input_eof) {
+            ssize_t got = pread(stream->file_fd, stream->stream_compress_inbuf,
+                                MAGNUS_STREAM_COMPRESS_CHUNK,
+                                stream->file_offset);
+            if (got < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (got == 0) {
+                stream->stream_compress_input_eof = true;
+            } else {
+                stream->stream_compress_inbuf_length = (size_t) got;
+                stream->stream_compress_inbuf_sent = 0;
+                stream->file_offset += got;
+            }
         }
+        ok = magnus_stream_compress_step(stream->stream_compress,
+            stream->stream_compress_inbuf + stream->stream_compress_inbuf_sent,
+            stream->stream_compress_inbuf_length
+                - stream->stream_compress_inbuf_sent,
+            stream->stream_compress_input_eof, &consumed, buf, length,
+            &produced, &done);
+        if (!ok) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        stream->stream_compress_inbuf_sent += consumed;
+        if (produced > 0 || done) break;
     }
-    ok = magnus_stream_compress_step(stream->stream_compress,
-        stream->stream_compress_inbuf + stream->stream_compress_inbuf_sent,
-        stream->stream_compress_inbuf_length - stream->stream_compress_inbuf_sent,
-        stream->stream_compress_input_eof, &consumed, buf, length, &produced,
-        &done);
-    if (!ok) return NGHTTP2_ERR_CALLBACK_FAILURE;
-    stream->stream_compress_inbuf_sent += consumed;
     if (done) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     return (nghttp2_ssize) produced;
 }

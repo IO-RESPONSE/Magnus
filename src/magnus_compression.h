@@ -7,6 +7,16 @@
 #define MAGNUS_COMPRESSION_MIN_SIZE 256
 #define MAGNUS_COMPRESSION_MAX_SIZE (8 * 1024 * 1024)
 
+/* Roadmap 2a-7: both the raw-file-chunk read size and the compressed-
+ * output staging buffer size for streaming compression, shared by
+ * every protocol's own streaming-compression code (magnus.c's HTTP/1.1
+ * and HTTP/2 paths, magnus_quic.c's HTTP/3 one) -- 64 KiB is the same
+ * "one syscall/one library call's worth of work per event-loop turn"
+ * sizing every other chunked I/O buffer in this codebase already uses
+ * (magnus_proxy_compress_capture()'s own growth increment,
+ * MAGNUS_PROXY_BUFFER in magnus.c), not tuned independently. */
+#define MAGNUS_STREAM_COMPRESS_CHUNK (64 * 1024)
+
 /* MAGNUS_ENCODING_NONE is always 0 so `magnus_negotiate_encoding(...)
  * != MAGNUS_ENCODING_NONE` reads as the eligibility check every caller
  * already wants, the same shape magnus_accepts_gzip()'s own bool

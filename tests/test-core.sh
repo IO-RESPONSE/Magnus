@@ -4349,6 +4349,68 @@ grep -qE '^content-encoding: br$' "$web_root/quic-compress-brotli-out"
 grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-brotli-out"
 tail -n +5 "$web_root/quic-compress-brotli-out" | brotli -dc \
   | diff - "$web_root/quic-compress.html"
+
+# Roadmap 2a-9: streaming compression for an HTTP/3 static file past
+# MAGNUS_COMPRESSION_MAX_SIZE (8 MiB) -- the third slice, after 2a-7
+# (HTTP/1.1) and 2a-8 (HTTP/2). Random content is fine here for the
+# same reason it is in the h1/h2 blocks: this is about the framing/
+# plumbing at this size, not ratio. quic-handshake-check's own
+# QUIC_HANDSHAKE_CHECK_MAX_BODY was bumped past 8 MiB specifically so
+# it can hold a whole response this size (its "content-length" line is
+# always a synthetic received-byte count, never a real header value --
+# see its own comment -- so it is not asserted against here the way the
+# h1/h2 blocks assert an *absent* Content-Length header; the framing
+# guarantee itself is exercised by construction, since the tool has no
+# way to know the body length ahead of receiving all of it either).
+head -c 9000000 /dev/urandom | base64 >"$web_root/quic-stream.html"
+quic_stream_size=$(wc -c <"$web_root/quic-stream.html")
+test "$quic_stream_size" -gt $((8 * 1024 * 1024))
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-stream.html gzip > "$web_root/quic-stream-gzip-out"
+grep -qE '^status: 200$' "$web_root/quic-stream-gzip-out"
+grep -qE '^content-encoding: gzip$' "$web_root/quic-stream-gzip-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-stream-gzip-out"
+tail -n +5 "$web_root/quic-stream-gzip-out" | gzip -dc \
+  | cmp "$web_root/quic-stream.html" -
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-stream.html zstd > "$web_root/quic-stream-zstd-out"
+grep -qE '^status: 200$' "$web_root/quic-stream-zstd-out"
+grep -qE '^content-encoding: zstd$' "$web_root/quic-stream-zstd-out"
+tail -n +5 "$web_root/quic-stream-zstd-out" | zstd -dc \
+  | cmp "$web_root/quic-stream.html" -
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-stream.html br > "$web_root/quic-stream-brotli-out"
+grep -qE '^status: 200$' "$web_root/quic-stream-brotli-out"
+grep -qE '^content-encoding: br$' "$web_root/quic-stream-brotli-out"
+tail -n +5 "$web_root/quic-stream-brotli-out" | brotli -dc \
+  | cmp "$web_root/quic-stream.html" -
+
+# Plain (no Accept-Encoding) stays on the unmodified relay -- a real
+# Content-Length, completely unaffected by the streaming path existing
+# now.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /quic-stream.html > "$web_root/quic-stream-plain-out"
+grep -qE '^status: 200$' "$web_root/quic-stream-plain-out"
+! grep -q '^content-encoding:' "$web_root/quic-stream-plain-out"
+grep -qE "^content-length: $quic_stream_size\$" "$web_root/quic-stream-plain-out"
+tail -n +3 "$web_root/quic-stream-plain-out" | cmp "$web_root/quic-stream.html" -
+
+# A second, independent request against the same server right after a
+# streamed one still gets served normally -- unlike the HTTP/1.1 case
+# (roadmap 2a-7), h3 never had a per-connection close-after-write
+# workaround that could leave the *server side* in a bad state either
+# (quic-handshake-check itself opens one connection per invocation, so
+# this does not exercise a *single* connection surviving the way h2's
+# curl --next check does -- see magnus_quic_http_dispatch_static_
+# streaming()'s own doc comment for why h3 needed no such workaround at
+# all, proven structurally rather than by this particular check).
+"$project_dir/build/quic-handshake-check" 127.0.0.1 "$port_quic_udp" \
+  /healthz > "$web_root/quic-stream-followup"
+grep -qE '^status: 200$' "$web_root/quic-stream-followup"
+
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=

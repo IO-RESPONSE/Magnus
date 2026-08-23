@@ -14,20 +14,26 @@
  * own source_cidr route matching and client-IP-based cluster selection;
  * 2a-5 zstd joining gzip as a second negotiable encoding, 2a-6 Brotli
  * joining as a third, both across static-file and proxy-dispatch
- * compression alike, on all three protocols; 2a-7 streaming compression
- * for HTTP/1.1 static files past 2a's own 8 MiB bound; 2a-8 the same
- * for HTTP/2 static files -- narrowing the item this list itself used
- * to carry further still, see that item's own scope below. 2a-8 also
- * fixed a real, previously-latent bug it found along the way:
- * magnus_h2_drain_send() (magnus.c) retried a failed/partial SSL_write()
- * against a *different* buffer address than the original attempt saw,
- * violating OpenSSL's own same-address retry contract -- silently
- * truncated any h2-over-TLS response large enough to hit a partial
- * write mid-transfer, invisible until something exercised a response
- * that large, which nothing in this codebase's own test suite did
- * before 2a-8's own streaming-compression fixtures started reusing a
- * well-past-8-MiB file against the *existing*, unmodified static-file
- * relay too)
+ * compression alike, on all three protocols; 2a-7/2a-8/2a-9 streaming
+ * compression for static files past 2a's own 8 MiB bound, on HTTP/1.1,
+ * HTTP/2, and now HTTP/3 too -- narrowing the item this list itself
+ * used to carry down to just proxy dispatch, see that item's own scope
+ * below. 2a-8 fixed a real, previously-latent bug it found along the
+ * way: magnus_h2_drain_send() (magnus.c) retried a failed/partial
+ * SSL_write() against a *different* buffer address than the original
+ * attempt saw, violating OpenSSL's own same-address retry contract --
+ * silently truncated any h2-over-TLS response large enough to hit a
+ * partial write mid-transfer. 2a-9 found a second: zstd's own
+ * ZSTD_compressStream2() (and Brotli's BrotliEncoderCompressStream())
+ * do not guarantee output on every call, only forward input
+ * consumption -- a single-call-per-invocation h3 read_data callback
+ * deadlocked outright for both encoders on any file needing more than
+ * one packet's worth of compressed output, since nghttp3's own resume
+ * mechanism has nothing to trigger it without a chunk ever having been
+ * offered; fixed by looping internally until real progress happens
+ * (and applied to HTTP/2's own equivalent callback too, which never
+ * reproduced a hang in testing but relied on nghttp2's own eager retry
+ * timing rather than on any real guarantee to avoid it))
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -40,14 +46,11 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - streaming compression for HTTP/3 static files, and for proxy-
- *     dispatch responses on all three protocols, past 2a's own 8 MiB
- *     bound -- 2a-7/2a-8 narrowed this from "streaming/chunked
- *     compression above 8 MiB, cross-cutting across h1/h2/h3" down to
- *     just static files on h1 and h2; h3 needs no Content-Length ahead
- *     of a DATA-frame response either (same reasoning that made 2a-8
- *     genuinely easier than 2a-7, not harder, confirmed once actually
- *     built), so it is plausibly a similarly easy follow-up
+ *   - streaming compression for proxy-dispatch responses, on all three
+ *     protocols, past 2a's own 8 MiB bound -- 2a-7/2a-8/2a-9 narrowed
+ *     this from "streaming/chunked compression above 8 MiB, cross-
+ *     cutting across h1/h2/h3" down to just this one remaining
+ *     dimension; static files now stream on every protocol
  *   - a real HTTP/1.1 `Transfer-Encoding: chunked` response writer,
  *     which would let 2a-7's own streaming-compressed responses keep
  *     the connection alive afterward instead of always closing -- 2a-7
@@ -80,7 +83,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.44.0"
+#define MAGNUS_VERSION "1.45.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

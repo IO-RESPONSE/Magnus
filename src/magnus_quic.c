@@ -294,6 +294,40 @@ typedef struct {
     size_t compress_capture_capacity;
     char compress_raw_headers[MAGNUS_QUIC_PROXY_HEADER_LIMIT + 1];
     size_t compress_raw_headers_length;
+    /* Streaming compression, HTTP/3 static files past
+     * MAGNUS_COMPRESSION_MAX_SIZE (roadmap 2a-9) -- the h3 analogue of
+     * struct magnus_h2_stream's own 2a-8 fields, distinct from proxy
+     * dispatch compression's compress_pending/compress_encoding/
+     * compress_capture above (different feature, different lifecycle).
+     * Unlike h1/h2, this needs its own dedicated file_fd/file_offset --
+     * the static-file dispatch's existing mmap_base/mmap_length pair
+     * (reused across the plain-relay and one-shot-compressed cases,
+     * see their own comment) maps the *whole* file at dispatch time,
+     * which is exactly the buffer-then-compress shape too large a file
+     * cannot use; this path never mmaps, reading the file in bounded
+     * chunks via pread() instead, so it needs a persistent fd of its
+     * own. No dedicated output buffer either: unlike HTTP/1.1's write
+     * loop (which owns its socket writes outright) or even HTTP/2's
+     * read_callback (which nghttp2 hands a reusable buffer to fill),
+     * nghttp3's own read_data contract requires each offered chunk to
+     * be its own fresh, independently-freed allocation, valid until the
+     * peer actually acknowledges it (see body_chunk's own comment above
+     * for the full rationale, already learned the hard way for proxy
+     * dispatch) -- magnus_quic_http_read_stream_compressed() therefore
+     * reuses body_chunk/body_chunk_length/body_chunk_offered/
+     * body_chunk_end_offset/body_offered_total/body_acked_total/
+     * nghttp3_wants_resume directly, the exact same fields and the
+     * exact same one-chunk-in-flight-at-a-time discipline the proxy
+     * path already established, rather than a second near-identical
+     * field set: safe because exactly one of is_proxy or
+     * stream_compress-non-NULL is ever true for a given stream. */
+    magnus_stream_compressor_t *stream_compress;
+    int file_fd;
+    off_t file_offset;
+    unsigned char *stream_compress_inbuf;
+    size_t stream_compress_inbuf_length;
+    size_t stream_compress_inbuf_sent;
+    bool stream_compress_input_eof;
     time_t connect_started;
     time_t last_activity;
     char *proxy_request;
@@ -561,6 +595,13 @@ magnus_quic_http_stream_free(magnus_quic_stream_t *stream)
      * reach this function) still needs its upstream leg, if any, torn
      * down the same as a clean completion would have. */
     if (stream->is_proxy) magnus_quic_proxy_teardown_upstream(stream);
+    /* Roadmap 2a-9: a stream can close mid-stream at any point (client
+     * disconnect, connection teardown, ...) -- magnus_stream_compress_
+     * end() itself tolerates that, same as freeing the not-necessarily-
+     * fully-drained buffers this whole function already handles. */
+    if (stream->file_fd >= 0) close(stream->file_fd);
+    magnus_stream_compress_end(stream->stream_compress);
+    free(stream->stream_compress_inbuf);
     free(stream->header_buffer);
     free(stream->body_chunk);
     free(stream->proxy_request);
@@ -897,6 +938,119 @@ magnus_quic_http_read_file(nghttp3_conn *conn, int64_t stream_id,
     vec[0].base = stream->mmap_base;
     vec[0].len = stream->mmap_length;
     *pflags |= NGHTTP3_DATA_FLAG_EOF;
+    return 1;
+}
+
+/* Roadmap 2a-9: the h3 analogue of magnus_h2_read_stream_compressed()
+ * (magnus.c's own 2a-8 function) -- see struct magnus_quic_stream_t's
+ * own comment on why this reuses body_chunk et al. directly rather
+ * than a second field set, and why (unlike HTTP/2, where nghttp2 hands
+ * the callback a reusable buffer to fill) each offered chunk here must
+ * be its own fresh allocation.
+ *
+ * Unlike magnus_quic_proxy_read_body() (which only ever *offers* an
+ * already-produced chunk, relying on a separate producer -- upstream
+ * socket reads -- to fill body_chunk asynchronously), this callback
+ * produces a chunk itself, synchronously, the moment nghttp3 actually
+ * wants one: a local pread() has no "not ready yet" state the way a
+ * socket recv() does, so there is nothing to gain from a separate
+ * producer function here, and every failure mode below is genuinely
+ * unrecoverable (headers, and possibly earlier chunks, are already on
+ * the wire) exactly like the proxy path's own abort-on-failure cases.
+ * body_chunk != NULL still means exactly the same thing it does for
+ * the proxy path, though -- an offered-but-not-yet-acked chunk that
+ * must not be touched again until magnus_quic_http_acked_stream_data()
+ * (extended in 2a-9 to also cover this case) frees it -- so this
+ * callback still correctly reports WOULDBLOCK and defers to that ack
+ * callback's own resume whenever backpressure applies.
+ *
+ * Loops calling magnus_stream_compress_step() internally, feeding more
+ * input as needed, until a call actually produces output (or the
+ * stream is genuinely done) -- found necessary, not assumed: unlike
+ * zlib's deflate(), zstd's own ZSTD_compressStream2() documents that
+ * ZSTD_e_continue "is guaranteed to make some forward progress...
+ * but doesn't guarantee maximal forward progress" -- it can legally
+ * consume input and produce *zero* output on a given call, buffering
+ * internally instead (Brotli's own BROTLI_OPERATION_PROCESS behaves
+ * the same way). A single-call version of this function (this
+ * increment's first attempt) treated that as WOULDBLOCK and waited for
+ * magnus_quic_http_acked_stream_data() to resume it -- but with no
+ * chunk ever offered, there is nothing to ack and nothing left to ever
+ * call resume, a genuine deadlock reproduced directly with both zstd
+ * and Brotli (gzip's own deflate() happened not to trigger it against
+ * the fixtures tested, which is exactly the kind of encoder-dependent
+ * gap this comment is here so nobody "fixes" it back out narrowly for
+ * gzip alone). Every other write loop in this codebase (magnus.c's own
+ * HTTP/1.1 and HTTP/2 streaming-compression loops included) already
+ * calls magnus_stream_compress_step() in a loop for exactly this
+ * reason; this callback simply could not skip that discipline just
+ * because nghttp3's own call shape looks like a single request. */
+static nghttp3_ssize
+magnus_quic_http_read_stream_compressed(nghttp3_conn *conn, int64_t stream_id,
+                                        nghttp3_vec *vec, size_t veccnt,
+                                        uint32_t *pflags, void *conn_user_data,
+                                        void *stream_user_data)
+{
+    magnus_quic_stream_t *stream = stream_user_data;
+    size_t consumed = 0;
+    size_t produced = 0;
+    bool done = false;
+    bool ok;
+    unsigned char outbuf[MAGNUS_STREAM_COMPRESS_CHUNK];
+    (void) conn;
+    (void) stream_id;
+    (void) veccnt;
+    (void) conn_user_data;
+    if (stream->body_chunk != NULL) {
+        stream->nghttp3_wants_resume = true;
+        return NGHTTP3_ERR_WOULDBLOCK;
+    }
+    for (;;) {
+        if (stream->stream_compress_inbuf_sent
+                == stream->stream_compress_inbuf_length
+            && !stream->stream_compress_input_eof) {
+            ssize_t got = pread(stream->file_fd, stream->stream_compress_inbuf,
+                                MAGNUS_STREAM_COMPRESS_CHUNK,
+                                stream->file_offset);
+            if (got < 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
+            if (got == 0) {
+                stream->stream_compress_input_eof = true;
+            } else {
+                stream->stream_compress_inbuf_length = (size_t) got;
+                stream->stream_compress_inbuf_sent = 0;
+                stream->file_offset += got;
+            }
+        }
+        ok = magnus_stream_compress_step(stream->stream_compress,
+            stream->stream_compress_inbuf + stream->stream_compress_inbuf_sent,
+            stream->stream_compress_inbuf_length
+                - stream->stream_compress_inbuf_sent,
+            stream->stream_compress_input_eof, &consumed, outbuf,
+            sizeof(outbuf), &produced, &done);
+        if (!ok) return NGHTTP3_ERR_CALLBACK_FAILURE;
+        stream->stream_compress_inbuf_sent += consumed;
+        if (produced > 0 || done) break;
+    }
+    if (produced == 0) {
+        /* done, and nothing left to flush -- genuinely finished, not
+         * merely a would-block. */
+        stream->response_complete = true;
+        *pflags |= NGHTTP3_DATA_FLAG_EOF;
+        return 0;
+    }
+    stream->body_chunk = malloc(produced);
+    if (stream->body_chunk == NULL) return NGHTTP3_ERR_CALLBACK_FAILURE;
+    memcpy(stream->body_chunk, outbuf, produced);
+    stream->body_chunk_length = produced;
+    stream->body_chunk_offered = true;
+    stream->body_offered_total += produced;
+    stream->body_chunk_end_offset = stream->body_offered_total;
+    vec[0].base = stream->body_chunk;
+    vec[0].len = produced;
+    if (done) {
+        stream->response_complete = true;
+        *pflags |= NGHTTP3_DATA_FLAG_EOF;
+    }
     return 1;
 }
 
@@ -2276,6 +2430,66 @@ magnus_quic_compress_static(int fd, const struct stat *metadata,
     return encoding;
 }
 
+/* Roadmap 2a-9: the h3 analogue of magnus_h2_dispatch_static_streaming()
+ * (magnus.c's own 2a-8 function) -- see that function's own doc comment
+ * for the shared design rationale (the one-shot magnus_quic_compress_
+ * static()'s buffer-then-compress shape refuses anything past
+ * MAGNUS_COMPRESSION_MAX_SIZE by design; no Content-Length is knowable
+ * ahead of a streamed body). Like HTTP/2, no close-delimited-framing
+ * workaround is needed here either -- HTTP/3 never requires a
+ * Content-Length ahead of a DATA-frame response; the stream simply
+ * ends on the frame carrying its own FIN, decided by magnus_quic_http_
+ * read_stream_compressed() itself reporting NGHTTP3_DATA_FLAG_EOF --
+ * so this response stays on the same multiplexed connection afterward
+ * exactly like any other. Returns true if it took the streaming path
+ * (the caller must not fall through to its own one-shot/uncompressed
+ * handling in that case, and must not close `fd` itself -- ownership
+ * transfers to `stream->file_fd`); false leaves `stream` untouched and
+ * lets the caller's existing path handle `fd` instead, the same
+ * graceful-fallback contract magnus_quic_compress_static() itself
+ * already has on its own allocation-failure path. */
+static bool
+magnus_quic_http_dispatch_static_streaming(magnus_quic_connection_t *connection,
+                                           magnus_quic_stream_t *stream, int fd,
+                                           const struct stat *metadata,
+                                           const char *content_type)
+{
+    magnus_encoding_t encoding;
+    nghttp3_nv headers[5];
+    if (stream->head_only || metadata->st_size <= MAGNUS_COMPRESSION_MAX_SIZE
+        || !magnus_content_type_compressible(content_type))
+        return false;
+    encoding = magnus_negotiate_encoding(
+        magnus_http_header_find(&stream->parsed, "accept-encoding"));
+    if (encoding == MAGNUS_ENCODING_NONE) return false;
+    stream->stream_compress = magnus_stream_compress_begin(encoding);
+    if (stream->stream_compress == NULL) return false;
+    stream->stream_compress_inbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+    if (stream->stream_compress_inbuf == NULL) {
+        magnus_stream_compress_end(stream->stream_compress);
+        stream->stream_compress = NULL;
+        return false;
+    }
+    stream->file_fd = fd;
+    stream->file_offset = 0;
+    stream->stream_compress_inbuf_length = 0;
+    stream->stream_compress_inbuf_sent = 0;
+    stream->stream_compress_input_eof = false;
+    headers[0] = magnus_quic_nv(":status", "200");
+    headers[1] = magnus_quic_nv("server", "Magnus/" MAGNUS_VERSION);
+    headers[2] = magnus_quic_nv("content-type", content_type);
+    headers[3] = magnus_quic_nv("content-encoding", magnus_encoding_name(encoding));
+    headers[4] = magnus_quic_nv("vary", "Accept-Encoding");
+    {
+        nghttp3_data_reader reader
+            = { .read_data = magnus_quic_http_read_stream_compressed };
+        (void) nghttp3_conn_submit_response(connection->http3_conn,
+                                            stream->stream_id, headers, 5,
+                                            &reader);
+    }
+    return true;
+}
+
 /* Serves stream->parsed.target as a static file -- the fallback once
  * magnus_quic_http_dispatch() below has ruled out /healthz, /metrics,
  * and every route (roadmap 4f). Method/head_only validation already
@@ -2302,6 +2516,9 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
         return;
     }
     content_type = magnus_content_type(stream->parsed.target);
+    if (magnus_quic_http_dispatch_static_streaming(connection, stream, fd,
+            &metadata, content_type))
+        return;
     /* Computed unconditionally, ahead of the head_only check below --
      * a HEAD response still needs the *compressed* Content-Length to
      * be accurate (what a subsequent GET would actually transfer),
@@ -2542,7 +2759,15 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
  * magnus_quic_proxy_stream_response() is retried immediately -- epoll
  * will not necessarily refire on its own if the upstream socket's
  * already-available bytes were fully drained while backpressure
- * (stream->body_chunk != NULL) was blocking a further read. */
+ * (stream->body_chunk != NULL) was blocking a further read. Roadmap
+ * 2a-9 extends this same gate/free logic to a streaming-compression
+ * static-file stream: there is no separate producer function to retry
+ * there (magnus_quic_http_read_stream_compressed() produces its own
+ * next chunk lazily, synchronously, the moment it is next called), so
+ * freeing body_chunk here just needs to wake nghttp3 back up via
+ * nghttp3_conn_resume_stream() when that callback last deferred with
+ * WOULDBLOCK, exactly like its own NGHTTP3_ERR_WOULDBLOCK contract
+ * requires. */
 static int
 magnus_quic_http_acked_stream_data(nghttp3_conn *conn, int64_t stream_id,
                                    uint64_t datalen, void *conn_user_data,
@@ -2550,9 +2775,8 @@ magnus_quic_http_acked_stream_data(nghttp3_conn *conn, int64_t stream_id,
 {
     magnus_quic_connection_t *connection = conn_user_data;
     magnus_quic_stream_t *stream = stream_user_data;
-    (void) conn;
-    (void) stream_id;
-    if (stream == NULL || !stream->is_proxy) return 0;
+    if (stream == NULL || (!stream->is_proxy && stream->stream_compress == NULL))
+        return 0;
     stream->body_acked_total += datalen;
     if (stream->body_chunk != NULL
         && stream->body_acked_total >= stream->body_chunk_end_offset) {
@@ -2560,8 +2784,13 @@ magnus_quic_http_acked_stream_data(nghttp3_conn *conn, int64_t stream_id,
         stream->body_chunk = NULL;
         stream->body_chunk_length = 0;
         stream->body_chunk_offered = false;
-        if (stream->upstream_fd >= 0)
-            magnus_quic_proxy_stream_response(connection, stream);
+        if (stream->is_proxy) {
+            if (stream->upstream_fd >= 0)
+                magnus_quic_proxy_stream_response(connection, stream);
+        } else if (stream->nghttp3_wants_resume) {
+            stream->nghttp3_wants_resume = false;
+            (void) nghttp3_conn_resume_stream(conn, stream_id);
+        }
     }
     return 0;
 }
@@ -2610,6 +2839,7 @@ magnus_quic_http_begin_headers(nghttp3_conn *conn, int64_t stream_id,
      * already during this project's Phase 4/M5 work; not repeating it
      * here). */
     stream->upstream_fd = -1;
+    stream->file_fd = -1; /* roadmap 2a-9 -- same "0 is a valid fd" reasoning */
     (void) nghttp3_conn_set_stream_user_data(conn, stream_id, stream);
     /* Also registered at the *ngtcp2* level (magnus_quic_stream_close()'s
      * own `stream_user_data` parameter, not a separate lookup) --
