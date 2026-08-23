@@ -1865,16 +1865,19 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 
-# Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2): unlike the
-# static-file gzip block just above, this must go all the way through a
-# real upstream fetch -- the compressed bytes come from a body that only
-# exists once relayed through magnus_proxy_finish_compression()'s own
-# buffer-then-compress path, not an mmap'd file. A response the client
-# never asked to compress (no Accept-Encoding), a non-compressible
+# Proxy dispatch response compression, HTTP/1.1 and HTTP/2 (roadmap
+# 2a-2/2a-3): unlike the static-file gzip block just above, this must go
+# all the way through a real upstream fetch -- the compressed bytes come
+# from a body that only exists once relayed through magnus_proxy_
+# finish_compression()'s (h1) or magnus_h2_proxy_finish_compression()'s
+# (h2) own buffer-then-compress path, not an mmap'd file. A response the
+# client never asked to compress (no Accept-Encoding), a non-compressible
 # content-type (image/png, gated exactly like the static-file path
 # already is), and a body under MAGNUS_COMPRESSION_MIN_SIZE all stay on
 # the ordinary streaming relay -- only the one eligible case takes the
-# buffered path.
+# buffered path. TLS is needed here (unlike the plain-HTTP block this
+# one replaces) purely so curl can negotiate --http2 against the same
+# running instance the --http1.1 pass already covers.
 port_compress_proxy_upstream=$((port + 128))
 port_compress_proxy=$((port + 129))
 compress_proxy_root="$web_root/compress-proxy"
@@ -1894,43 +1897,52 @@ for attempt in 1 2 3 4 5; do
     && break
   sleep 1
 done
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout "$web_root/compress-proxy-server.key" \
+  -out "$web_root/compress-proxy-server.crt" >/dev/null 2>&1
 "$binary" --port "$port_compress_proxy" --root "$web_root" \
+  --tls-cert "$web_root/compress-proxy-server.crt" \
+  --tls-key "$web_root/compress-proxy-server.key" \
   --upstream "127.0.0.1:$port_compress_proxy_upstream" 2>>"$log" &
 server_pid=$!
 for attempt in 1 2 3 4 5; do
-  curl --fail --silent "http://127.0.0.1:$port_compress_proxy/healthz" \
-    >/dev/null && break
+  curl --insecure --fail --silent \
+    "https://127.0.0.1:$port_compress_proxy/healthz" >/dev/null && break
   sleep 1
 done
 
-plain_headers="$web_root/compress-proxy-plain.headers"
-gzip_headers="$web_root/compress-proxy-gzip.headers"
-decoded_body="$web_root/compress-proxy-decoded.html"
+for protocol in --http1.1 --http2; do
+  plain_headers="$web_root/compress-proxy-plain-${protocol#--}.headers"
+  gzip_headers="$web_root/compress-proxy-gzip-${protocol#--}.headers"
+  decoded_body="$web_root/compress-proxy-decoded-${protocol#--}.html"
 
-curl --fail --silent --dump-header "$plain_headers" --output "$decoded_body" \
-  "http://127.0.0.1:$port_compress_proxy/proxy/page.html"
-! grep -qi '^content-encoding: gzip' "$plain_headers"
-cmp "$compress_proxy_root/page.html" "$decoded_body"
+  curl "$protocol" --insecure --fail --silent --dump-header "$plain_headers" \
+    --output "$decoded_body" \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  ! grep -qi '^content-encoding: gzip' "$plain_headers"
+  cmp "$compress_proxy_root/page.html" "$decoded_body"
 
-curl --fail --silent --compressed --dump-header "$gzip_headers" \
-  --output "$decoded_body" \
-  "http://127.0.0.1:$port_compress_proxy/proxy/page.html"
-grep -qi '^content-encoding: gzip' "$gzip_headers"
-grep -qi '^vary: Accept-Encoding' "$gzip_headers"
-cmp "$compress_proxy_root/page.html" "$decoded_body"
-curl --fail --silent -H 'Accept-Encoding: gzip' \
-  "http://127.0.0.1:$port_compress_proxy/proxy/page.html" \
+  curl "$protocol" --insecure --fail --silent --compressed \
+    --dump-header "$gzip_headers" --output "$decoded_body" \
+    "https://127.0.0.1:$port_compress_proxy/proxy/page.html"
+  grep -qi '^content-encoding: gzip' "$gzip_headers"
+  grep -qi '^vary: Accept-Encoding' "$gzip_headers"
+  cmp "$compress_proxy_root/page.html" "$decoded_body"
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+    --dump-header "$gzip_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compress_proxy/proxy/image.png"
+  ! grep -qi '^content-encoding: gzip' "$gzip_headers"
+
+  curl "$protocol" --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+    --dump-header "$gzip_headers" --output /dev/null \
+    "https://127.0.0.1:$port_compress_proxy/proxy/tiny.html"
+  ! grep -qi '^content-encoding: gzip' "$gzip_headers"
+done
+
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  "https://127.0.0.1:$port_compress_proxy/proxy/page.html" \
   | gzip -dc | cmp "$compress_proxy_root/page.html" -
-
-curl --fail --silent -H 'Accept-Encoding: gzip' \
-  --dump-header "$gzip_headers" --output /dev/null \
-  "http://127.0.0.1:$port_compress_proxy/proxy/image.png"
-! grep -qi '^content-encoding: gzip' "$gzip_headers"
-
-curl --fail --silent -H 'Accept-Encoding: gzip' \
-  --dump-header "$gzip_headers" --output /dev/null \
-  "http://127.0.0.1:$port_compress_proxy/proxy/tiny.html"
-! grep -qi '^content-encoding: gzip' "$gzip_headers"
 
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true

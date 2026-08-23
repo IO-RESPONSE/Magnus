@@ -21,13 +21,13 @@
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
  *   - proxied-response compression over HTTP/3 (4e is static files
- *     only; roadmap 2a-2 shipped this for proxy dispatch on HTTP/1.1
- *     only so far -- HTTP/2 and HTTP/3 remain their own later
- *     increments, not a QUIC-specific gap; a *cached* response reuses
- *     whatever the origin itself sent, uncompressed here too, matching
- *     2a-2's own explicit choice not to compress a cache HIT on any
- *     protocol); Brotli/zstd; streaming/chunked compression for
- *     responses above 2a's own 8 MiB bound
+ *     only; roadmap 2a-2/2a-3 shipped this for proxy dispatch on
+ *     HTTP/1.1 and HTTP/2 -- HTTP/3 remains its own later increment,
+ *     not a QUIC-specific gap; a *cached* response reuses whatever the
+ *     origin itself sent, uncompressed here too, matching 2a-2's own
+ *     explicit choice not to compress a cache HIT on any protocol);
+ *     Brotli/zstd; streaming/chunked compression for responses above
+ *     2a's own 8 MiB bound
  *   - Real-IP-aware (trusted-proxy-resolved) source_cidr route
  *     matching (4f) or client-IP-based cluster selection (4h's own
  *     fallback when no sticky cookie applies) -- both match against
@@ -51,7 +51,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.37.0"
+#define MAGNUS_VERSION "1.38.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

@@ -295,15 +295,16 @@ independently by IORESPONSE.
   ngtcp2 from ever observing the change at all. A new
   `magnus_quic_migration_total` `/metrics` counter tracks successful
   validations
-- Proxy dispatch response compression, HTTP/1.1 (roadmap 2a-2): a
-  `"/proxy"` response now negotiates gzip the same way static-file
-  serving already has since 2a -- `Accept-Encoding: gzip`, a
-  compressible `Content-Type`, and a body within the same 256-byte..8-MiB
-  window, except the body is buffered from a live upstream fetch first
-  rather than read from an mmap'd file. Pooling, caching, and session
-  affinity all keep working unmodified alongside it. HTTP/2 and HTTP/3
-  proxy dispatch remain uncompressed for now -- a later increment
-- Container image: 10,355,698 bytes (~9.88 MiB), non-root, read-only rootfs
+- Proxy dispatch response compression, HTTP/1.1 and HTTP/2 (roadmap
+  2a-2/2a-3): a `"/proxy"` response now negotiates gzip the same way
+  static-file serving already has since 2a -- `Accept-Encoding: gzip`,
+  a compressible `Content-Type`, and a body within the same
+  256-byte..8-MiB window, except the body is buffered from a live
+  upstream fetch first rather than read from an mmap'd file. Pooling,
+  caching, and session affinity all keep working unmodified alongside
+  it. HTTP/3 proxy dispatch remains uncompressed for now -- a later
+  increment
+- Container image: 10,356,152 bytes (~9.88 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

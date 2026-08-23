@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.38.0
+
+### Added
+
+- **Proxy dispatch response compression, HTTP/2 (roadmap 2a-3):
+  extends 1.37.0's own HTTP/1.1 increment to the second protocol,
+  reusing the exact same `magnus_proxy_sanitize_response_headers()`
+  `compressed_content_length` override -- deferred-submission-until-
+  compressed shape as HTTP/1.1, adapted to h2's own frame-based,
+  pull-driven response model instead of a push write loop.** h2 never
+  submits a `HEADERS` frame the moment upstream headers arrive the way
+  it always used to (`magnus_h2_proxy_submit_response()`, previously
+  unconditional): a new `stream->compress_pending` flag defers that
+  call -- along with the `nghttp2_data_provider2` it registers -- until
+  `magnus_h2_proxy_finish_compression()` (the h2 analogue of
+  `magnus_proxy_finish_compression()`) has compressed the full body and
+  re-sanitized the raw header block a second time.
+
+  No dedicated compressed-body field was needed the way HTTP/1.1's own
+  fixed 16 KiB `proxy_buffer` required a new `proxy_compressed_body`:
+  `stream->io_buffer` is already a generically reassignable heap
+  pointer, reused directly for the compressed output the exact same way
+  the *static-file* h2 compression path (`magnus_h2_dispatch_static()`,
+  part of 2a's own first increment) already does. No `proxy_accept_gzip`
+  field either: `stream->parsed` (h2's own persistent per-stream copy of
+  the client's request, unlike HTTP/1.1's stack-local one) is read
+  directly at header-arrival time instead. A new `magnus_h2_proxy_
+  compress_capture()` (mirroring `magnus_proxy_compress_capture()`) is
+  called from *two* sites -- the header-arrival leftover chunk in
+  `magnus_h2_proxy_receive_headers()`, and every subsequent chunk
+  `magnus_h2_proxy_stream_response()` reads from the upstream socket --
+  the second of which was the one real bug this increment found: an
+  initial implementation only redirected the header-arrival leftover
+  into the capture buffer and forgot the second site, so a response
+  whose headers and body arrived as two separate reads (routine, not an
+  edge case) silently compressed zero captured bytes into a valid but
+  empty gzip stream instead of the real body. Caught by decoding the
+  compressed response and diff'ing against the original during manual
+  verification, not by code review.
+
+  Verified: `make test` (twice) and `make sanitize` (ASan/UBSan) both
+  clean; the existing `tests/test-core.sh` proxy-compression block
+  (from 1.37.0) now loops `--http1.1`/`--http2` against one TLS-enabled
+  instance, the same `for protocol in ...` shape the static-file
+  compression block above it already uses, so both protocols' plain,
+  gzip, non-compressible-content-type, and under-the-floor-size cases
+  are all exercised identically. Docker image rebuilt and a live
+  container tested directly -- an HTTP/2 proxy request decompresses
+  byte-for-byte identical to the original, and a plain HTTP/2 proxy
+  request (no `Accept-Encoding`) relays the uncompressed body unchanged.
+
 ## 1.37.0
 
 ### Added

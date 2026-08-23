@@ -452,6 +452,23 @@ connection-pool and common-request-model decisions).
       Pooling/caching/affinity keep working unmodified alongside it.
       HTTP/2 and HTTP/3 proxy dispatch remain uncompressed -- a later
       increment. See `CHANGELOG.md` 1.37.0 for the full detail.
+    - **2a-3 — proxy dispatch response compression, HTTP/2. Shipped in
+      1.38.0.** The same deferred-submission-until-compressed shape as
+      2a-2, adapted to h2's own frame-based, pull-driven response model
+      (`nghttp2_data_provider2`) instead of a push write loop --
+      `magnus_h2_proxy_submit_response()` is now deferred, not
+      unconditional, gated on a new `stream->compress_pending`. No
+      dedicated compressed-body field was needed the way HTTP/1.1's own
+      fixed-size scratch buffer required one: `stream->io_buffer` is
+      already a generically reassignable heap pointer, reused directly
+      the exact same way the *static-file* h2 compression path already
+      does. One real bug found (not by review): an initial
+      implementation only captured the header-arrival leftover chunk
+      into the new capture buffer and forgot the *subsequent* upstream
+      reads, so a response whose headers and body arrived as two
+      separate reads (routine) silently compressed zero bytes into an
+      empty-but-valid gzip stream. See `CHANGELOG.md` 1.38.0 for the
+      full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route
