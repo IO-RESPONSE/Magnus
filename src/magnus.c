@@ -1329,6 +1329,13 @@ static volatile sig_atomic_t magnus_reload_requested;
 static int magnus_update_interest(int epoll_fd,
                                   magnus_connection_t *connection,
                                   uint32_t events);
+/* Roadmap 2a-14: magnus_proxy_flush() (defined well ahead of
+ * magnus_chunk_header()'s own definition in file order) needs one
+ * too, for the exact same in-place RFC 9112 7.1 chunk framing
+ * magnus_prepare_streaming_compressed_file_response()'s own write
+ * loop (2a-13) already uses. */
+static void magnus_chunk_header(size_t data_length,
+                                char out[MAGNUS_CHUNK_HEADER_SIZE + 1]);
 static ssize_t magnus_socket_write(magnus_connection_t *connection,
                                    const void *buffer, size_t length);
 static ssize_t magnus_socket_read(magnus_connection_t *connection,
@@ -2573,6 +2580,7 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
             {
                 size_t consumed = 0, produced = 0;
                 bool done = false;
+                unsigned char *outbuf = connection->proxy_stream_compress_outbuf;
                 bool ok = magnus_stream_compress_step(
                     connection->proxy_stream_compress,
                     (const unsigned char *) connection->proxy_buffer
@@ -2580,7 +2588,7 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
                     connection->proxy_buffer_length
                         - connection->proxy_buffer_sent,
                     complete_by_length || connection->proxy_eof, &consumed,
-                    connection->proxy_stream_compress_outbuf,
+                    outbuf + MAGNUS_CHUNK_HEADER_SIZE,
                     MAGNUS_STREAM_COMPRESS_CHUNK, &produced, &done);
                 if (!ok) return magnus_proxy_abort(epoll_fd, connection);
                 connection->proxy_buffer_sent += consumed;
@@ -2589,8 +2597,23 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
                     connection->proxy_buffer_length = 0;
                     connection->proxy_buffer_sent = 0;
                 }
-                connection->proxy_stream_compress_outbuf_length = produced;
+                /* Roadmap 2a-14: frame this chunk in place (RFC 9112
+                 * 7.1) -- see magnus_chunk_header()'s own doc comment.
+                 * The write loop above (already draining outbuf before
+                 * this block ever runs on a resumed call) neither knows
+                 * nor cares that these bytes are chunk-framed rather
+                 * than raw compressed output. */
                 connection->proxy_stream_compress_outbuf_sent = 0;
+                connection->proxy_stream_compress_outbuf_length = 0;
+                if (produced > 0) {
+                    char header[MAGNUS_CHUNK_HEADER_SIZE + 1];
+                    magnus_chunk_header(produced, header);
+                    memcpy(outbuf, header, MAGNUS_CHUNK_HEADER_SIZE);
+                    outbuf[MAGNUS_CHUNK_HEADER_SIZE + produced] = '\r';
+                    outbuf[MAGNUS_CHUNK_HEADER_SIZE + produced + 1] = '\n';
+                    connection->proxy_stream_compress_outbuf_length
+                        = MAGNUS_CHUNK_HEADER_SIZE + produced + 2;
+                }
                 if (done) {
                     /* magnus_stream_compress_step()'s own contract
                      * (roadmap 2a-9's own doc comment on why a single
@@ -2607,7 +2630,16 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
                      * correct here, never a repeat of that deadlock. */
                     magnus_stream_compress_end(connection->proxy_stream_compress);
                     connection->proxy_stream_compress = NULL;
-                    connection->close_after_write = true;
+                    /* Roadmap 2a-14: close_after_write was already
+                     * decided correctly, once, from the client's own
+                     * stated preference, when headers went out (see
+                     * magnus_proxy_receive_headers()'s own streaming
+                     * branch) -- no longer forced true here now that a
+                     * real last-chunk terminator (appended below) closes
+                     * this response out properly instead. */
+                    memcpy(outbuf + connection->proxy_stream_compress_outbuf_length,
+                          "0\r\n\r\n", 5);
+                    connection->proxy_stream_compress_outbuf_length += 5;
                     /* Defensive, not expected: done becoming true always
                      * implies proxy_buffer was already fully consumed
                      * (see this block's own reasoning on why), but never
@@ -3051,7 +3083,8 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             = magnus_stream_compress_begin(connection->proxy_accept_encoding);
         if (connection->proxy_stream_compress != NULL) {
             connection->proxy_stream_compress_outbuf
-                = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+                = malloc(MAGNUS_STREAM_COMPRESS_CHUNK
+                        + MAGNUS_CHUNK_FRAME_OVERHEAD);
             if (connection->proxy_stream_compress_outbuf == NULL) {
                 magnus_stream_compress_end(connection->proxy_stream_compress);
                 connection->proxy_stream_compress = NULL;
@@ -3071,9 +3104,10 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             connection->proxy_issue_affinity_cookie
                 ? connection->proxy_affinity_key : NULL,
             connection->proxy_client_wants_close,
-            (size_t) -2 /* streaming: Content-Encoding/Vary, no
-                         * Content-Length, forces Connection: close --
-                         * see magnus_proxy_sanitize_response_headers()'s
+            (size_t) -3 /* streaming, chunked (roadmap 2a-14):
+                         * Content-Encoding/Vary/Transfer-Encoding:
+                         * chunked, no Content-Length -- see
+                         * magnus_proxy_sanitize_response_headers()'s
                          * own doc comment */,
             magnus_encoding_name(connection->proxy_accept_encoding),
             &stream_info, NULL);
@@ -3098,6 +3132,14 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
               (size_t) stream_sanitized_length);
         connection->proxy_header_out_length = (size_t) stream_sanitized_length;
         connection->proxy_header_out_sent = 0;
+        /* Roadmap 2a-14: unlike 2a-10's own original close-only shape,
+         * this response's real Connection value (respecting the
+         * client's own stated preference, per the chunked sentinel's
+         * own keep_client_alive logic) is decided right here, from
+         * *this* second sanitize call's own stream_info -- not from
+         * the later, unconditional assignment below this whole block,
+         * which still only ever applies to the non-streaming cases. */
+        connection->close_after_write = !stream_info.keep_client_alive;
         connection->proxy_stream_compress_outbuf_length = 0;
         connection->proxy_stream_compress_outbuf_sent = 0;
     } else if (!try_compress) {
@@ -3181,16 +3223,17 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
         connection->proxy_buffer_sent = 0;
     }
     connection->proxy_headers_received = true;
-    /* Roadmap 2a-10: info here is still the *first*, uncompressed-framing
-     * sanitize call's own (the streaming path's real client-facing
-     * headers came from a second, separate call above) -- its own
-     * keep_client_alive reflects the *upstream's* original framing, not
-     * whether this connection is actually emitting a Content-Length to
-     * the client, so it is overridden unconditionally whenever streaming
-     * compression is active, exactly matching the "Connection: close"
-     * text that second call already wrote into proxy_header_out. */
-    connection->close_after_write = connection->proxy_stream_compress != NULL
-        ? true : !info.keep_client_alive;
+    /* Roadmap 2a-10/2a-14: info here is still the *first*, uncompressed-
+     * framing sanitize call's own (the streaming path's real client-
+     * facing headers came from a second, separate call above, whose own
+     * stream_info already set close_after_write correctly right there
+     * -- see that block's own comment) -- info's own keep_client_alive
+     * reflects the *upstream's* original framing, not whether this
+     * connection is actually emitting a Content-Length to the client,
+     * so it must not overwrite what the streaming branch already
+     * decided. */
+    if (connection->proxy_stream_compress == NULL)
+        connection->close_after_write = !info.keep_client_alive;
     connection->proxy_upstream_poolable = info.upstream_poolable;
     connection->proxy_has_response_length = info.has_content_length;
     connection->proxy_response_length = info.content_length;

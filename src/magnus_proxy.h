@@ -119,14 +119,27 @@ typedef struct {
  * Emits `Content-Encoding`/`Vary` exactly like a known compressed
  * length would, but no `Content-Length` line at all, and forces the
  * client-facing `Connection` to "close" regardless of
- * `client_wants_close` -- there is no `Transfer-Encoding: chunked`
- * response writer in this codebase (see magnus_quic.h's own
- * "deliberately still not here" list), so an unknown-length body can
- * only ever be framed by closing, the same choice 2a-7's own static-
- * file streaming compression already made. Intended to be called once,
- * immediately, the moment headers are known -- unlike the buffer-then-
- * compress pattern above, nothing about a streamed response is ever
- * deferred to a second call.
+ * `client_wants_close` -- at the time this sentinel was added there
+ * was no `Transfer-Encoding: chunked` response writer in this codebase
+ * yet, so an unknown-length body could only ever be framed by closing,
+ * the same choice 2a-7's own static-file streaming compression already
+ * made. Still used by HTTP/2 and HTTP/3 proxy dispatch (2a-11/2a-12),
+ * since chunked encoding is an HTTP/1.1-only concept neither protocol
+ * has any use for regardless (both already drop the `Connection`
+ * header entirely on their own, real chunked writer or not). Intended
+ * to be called once, immediately, the moment headers are known --
+ * unlike the buffer-then-compress pattern above, nothing about a
+ * streamed response is ever deferred to a second call.
+ *
+ * `(size_t) -3` (roadmap 2a-14) is a third sentinel, HTTP/1.1's own
+ * real `Transfer-Encoding: chunked` writer (2a-13) applied to this
+ * same streaming-proxy-dispatch case: identical to `(size_t) -2` in
+ * every other respect (still no `Content-Length`, still emits
+ * `Content-Encoding`/`Vary`, still called once immediately), except it
+ * emits `Transfer-Encoding: chunked` instead and leaves the client-
+ * facing `Connection` to the ordinary `client_wants_close` decision
+ * every non-streaming response already gets, rather than forcing
+ * "close" regardless.
  *
  * Returns the number of bytes written to `out` (excluding the NUL
  * terminator) on success, or -1 if the status line is malformed, a

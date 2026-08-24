@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.50.0
+
+### Added
+
+- **The same HTTP/1.1 chunked writer, applied to proxy dispatch
+  streaming compression (roadmap 2a-14).** 2a-13's own "natural next
+  application, not yet wired in": 2a-10's own streaming-compressed
+  proxy responses previously stayed close-delimited unconditionally,
+  the one framing choice left unresolved in the whole "streaming/
+  chunked compression above 8 MiB" thread once every static-file case
+  already had a real chunked writer (2a-13) to fall back on.
+
+  A third sentinel, `(size_t) -3`, joins the existing `(size_t)
+  -1`/`(size_t) -2` ones on `magnus_proxy_sanitize_response_headers()`:
+  identical to `(size_t) -2` in every other respect (still drops the
+  upstream's own Content-Length, still emits `Content-Encoding`/
+  `Vary`, still called once immediately rather than deferred), but
+  emits `Transfer-Encoding: chunked` instead of nothing, and leaves
+  `keep_client_alive` to the ordinary `client_wants_close` decision
+  every non-streaming response already gets, rather than forcing
+  `Connection: close` regardless of what the client asked for.
+  `magnus_proxy_flush()`'s own streaming-compress write loop frames
+  each produced chunk in place using the identical
+  `magnus_chunk_header()`/`MAGNUS_CHUNK_HEADER_SIZE`/
+  `MAGNUS_CHUNK_FRAME_OVERHEAD` machinery 2a-13 already built for the
+  static-file path, reused rather than duplicated -- the existing
+  "drain output, then finish once done" loop shape needed no other
+  change here either. `close_after_write` is now decided once,
+  correctly, from the client's own stated preference the moment
+  headers go out (previously forced `true` unconditionally, both there
+  and again a second time once the compressor finished). HTTP/2 and
+  HTTP/3 proxy dispatch streaming compression (2a-11/2a-12) keep using
+  `(size_t) -2`'s own close-delimited framing unchanged -- chunked
+  encoding is an HTTP/1.1-only concept, and neither protocol ever
+  needed a workaround to stay alive afterward in the first place.
+
+  Verified: a 9 MB (well past the 8 MiB bound) upstream response
+  compresses correctly via gzip/zstd/Brotli through a real live proxy
+  fetch, byte-exact after decoding, with `Transfer-Encoding: chunked`
+  and `Connection: keep-alive` present and no `Content-Length`; a
+  follow-up request issued over the same connection right after
+  (curl's own `--next`, reporting `num_connects: 0`) confirms the
+  connection genuinely stays alive; an explicit client-requested
+  `Connection: close` is still honored; the pre-existing buffer-then-
+  compress and plain-relay proxy dispatch paths are unaffected. `make
+  test` (twice) and direct ASan/UBSan testing of the live server
+  (multiple requests across all three encodings, plus connection-reuse
+  and regression checks against the small buffered-compress and plain-
+  relay paths, zero findings) both clean -- `make sanitize`'s own
+  wrapped test run hit the known pre-existing ASan-timing-sensitive h2
+  stream-flood flake before ever reaching this increment's own code.
+
+  While iterating on this increment, `test-core.sh` also hit several
+  intermittent failures in unrelated sections (the reverse-proxy cache
+  block, general fd-pressure timing) that did not localize to anything
+  this change touches. A `git stash`/rebuild/reproduce/`git stash pop`
+  A/B check confirmed these were pre-existing environmental
+  flakiness, not a regression: the identical failures reproduced
+  against the unmodified v1.49.0 baseline with this increment's own
+  changes fully stashed away.
+
 ## 1.49.0
 
 ### Added

@@ -2180,35 +2180,51 @@ curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
   | gzip -dc | cmp "$compress_proxy_root/page.html" -
 
 # Streaming proxy dispatch response compression, HTTP/1.1 (roadmap
-# 2a-10): the streaming analogue of the buffer-then-compress block
-# above, for exactly the one case its own MAGNUS_COMPRESSION_MAX_SIZE
-# bound excludes -- an upstream response too large to buffer whole
-# before compressing once. Reuses this same already-running upstream/
-# proxy pair; http1.1 only so far -- h2/h3 streaming proxy dispatch
-# compression are their own later increments (see src/magnus_quic.h's
-# own "deliberately still not here" list).
+# 2a-10, chunked-encoded since 2a-14): the streaming analogue of the
+# buffer-then-compress block above, for exactly the one case its own
+# MAGNUS_COMPRESSION_MAX_SIZE bound excludes -- an upstream response
+# too large to buffer whole before compressing once. Reuses this same
+# already-running upstream/proxy pair; http1.1 only so far -- h2/h3
+# streaming proxy dispatch compression (2a-11/2a-12) never needed
+# chunked encoding in the first place (see src/magnus_quic.h's own
+# scope comment on why). --next proves the connection survives a
+# streamed proxy response and stays alive afterward, exactly like
+# 2a-13's own static-file streaming-compression test already proves.
 head -c 9000000 /dev/urandom | base64 >"$compress_proxy_root/stream.html"
 proxy_stream_size=$(wc -c <"$compress_proxy_root/stream.html")
 test "$proxy_stream_size" -gt $((8 * 1024 * 1024))
 
 stream_headers="$web_root/compress-proxy-stream.headers"
 
-curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
-  --dump-header "$stream_headers" \
+stream_reuse_status=$(curl --http1.1 --insecure --fail --silent \
+  -H 'Accept-Encoding: gzip' --dump-header "$stream_headers" \
   --output "$web_root/compress-proxy-stream.gz" \
-  "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
+  "https://127.0.0.1:$port_compress_proxy/proxy/stream.html" \
+  --next --insecure --fail --silent --output /dev/null \
+  --write-out '%{num_connects}' \
+  "https://127.0.0.1:$port_compress_proxy/healthz")
+test "$stream_reuse_status" = '0'
 grep -qi '^content-encoding: gzip' "$stream_headers"
 grep -qi '^vary: Accept-Encoding' "$stream_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_headers"
+grep -qi '^connection: keep-alive' "$stream_headers"
 ! grep -qi '^content-length:' "$stream_headers"
-grep -qi '^connection: close' "$stream_headers"
 gzip -dc "$web_root/compress-proxy-stream.gz" \
   | cmp "$compress_proxy_root/stream.html" -
+
+# An explicit client-requested close is still honored.
+stream_close_headers="$web_root/compress-proxy-stream-close.headers"
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  -H 'Connection: close' --dump-header "$stream_close_headers" \
+  --output /dev/null "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
+grep -qi '^connection: close' "$stream_close_headers"
 
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
   --dump-header "$stream_headers" \
   --output "$web_root/compress-proxy-stream.zst" \
   "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
 grep -qi '^content-encoding: zstd' "$stream_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_headers"
 ! grep -qi '^content-length:' "$stream_headers"
 zstd -dc "$web_root/compress-proxy-stream.zst" \
   | cmp "$compress_proxy_root/stream.html" -
@@ -2218,14 +2234,9 @@ curl --http1.1 --insecure --fail --silent --compressed \
   --output "$web_root/compress-proxy-stream.dec" \
   "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
 grep -qi '^content-encoding: br' "$stream_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_headers"
 ! grep -qi '^content-length:' "$stream_headers"
 cmp "$compress_proxy_root/stream.html" "$web_root/compress-proxy-stream.dec"
-
-# A follow-up plain request confirms the server keeps answering normally
-# right after a streamed proxy response -- the same stability check
-# 2a-7/8/9's own static-file streaming blocks each already run.
-curl --http1.1 --insecure --fail --silent \
-  "https://127.0.0.1:$port_compress_proxy/healthz" >/dev/null
 
 # Streaming proxy dispatch response compression, HTTP/2 (roadmap 2a-11):
 # the second protocol slice, confirming the same prediction 2a-8's own

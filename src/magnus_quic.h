@@ -92,9 +92,15 @@
  * own HTTP/1.1 static-file streaming-compressed responses, which now
  * keep the connection alive afterward (per the client's own stated
  * preference) instead of always closing, same as any other response
- * here. 2a-10's own HTTP/1.1 proxy-dispatch streaming-compressed
- * responses remain close-delimited for now -- a natural next
- * application of the same writer, not yet wired in.
+ * here. 2a-14 applied the identical writer to 2a-10's own HTTP/1.1
+ * proxy-dispatch streaming-compressed responses too, via a third
+ * sentinel (`(size_t) -3`) on magnus_proxy_sanitize_response_headers()
+ * alongside the existing `(size_t) -1`/`(size_t) -2` ones -- emits
+ * Transfer-Encoding: chunked and leaves keep_client_alive to the
+ * client's own stated preference, instead of `(size_t) -2`'s own
+ * forced Connection: close (still used by h2/h3 proxy dispatch
+ * streaming compression, 2a-11/2a-12, since chunked encoding is an
+ * HTTP/1.1-only concept neither protocol has any use for).
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -131,7 +137,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.49.0"
+#define MAGNUS_VERSION "1.50.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

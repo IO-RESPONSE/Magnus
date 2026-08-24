@@ -468,10 +468,22 @@ independently by IORESPONSE.
   (per the client's own stated preference) instead of always closing,
   the same as any other response here -- verified via curl's own
   `--next`, reusing the same connection for a follow-up request
-  (`num_connects: 0`). 2a-10's own HTTP/1.1 proxy-dispatch streaming-
-  compressed responses remain close-delimited for now, a natural next
-  application of the same writer
-- Container image: 10,726,475 bytes (~10.23 MiB), non-root, read-only rootfs
+  (`num_connects: 0`).
+- The same chunked writer applied to HTTP/1.1 proxy dispatch streaming
+  compression too (roadmap 2a-14): 2a-10's own responses now keep the
+  connection alive afterward as well, via a third sentinel
+  (`(size_t) -3`) on `magnus_proxy_sanitize_response_headers()`
+  alongside the existing `(size_t) -1`/`(size_t) -2` ones -- emits
+  `Transfer-Encoding: chunked` and leaves `keep_client_alive` to the
+  client's own stated preference, instead of `(size_t) -2`'s own forced
+  `Connection: close` (still used by HTTP/2 and HTTP/3 proxy dispatch
+  streaming compression, since chunked encoding is an HTTP/1.1-only
+  concept neither protocol has any use for). Verified the same way:
+  byte-exact gzip/zstd/Brotli through a real live proxy fetch, real
+  connection reuse (`--next`, `num_connects: 0`), an explicit
+  client-requested close still honored, and the pre-existing buffer-
+  then-compress and plain-relay proxy paths unaffected
+- Container image: 10,726,527 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

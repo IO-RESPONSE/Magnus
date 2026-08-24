@@ -70,17 +70,35 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     bool has_set_cookie = false;
     bool has_content_encoding = false;
     bool compressing = compressed_content_length != (size_t) -1;
-    /* Roadmap 2a-10: the streaming-proxy-dispatch-compression sentinel --
-     * see this function's own doc comment. Still `compressing` (so the
-     * upstream's own Content-Length line is dropped, same as the
-     * whole-buffered compressed case), but the real length can never be
-     * known ahead of time, so no Content-Length is ever written, and the
-     * client-facing Connection is forced to "close" regardless of
-     * client_wants_close/has_content_length -- there is no chunked
-     * response writer in this codebase yet (see magnus_quic.h's own
-     * "deliberately still not here" list) for a would-be keep-alive
-     * response with no content-length known ahead of time. */
+    /* Roadmap 2a-10: the streaming-proxy-dispatch-compression, close-
+     * delimited sentinel -- see this function's own doc comment. Still
+     * `compressing` (so the upstream's own Content-Length line is
+     * dropped, same as the whole-buffered compressed case), but the
+     * real length can never be known ahead of time, so no Content-
+     * Length is ever written, and (at the time this sentinel was
+     * added) the client-facing Connection was forced to "close"
+     * regardless of client_wants_close/has_content_length, since no
+     * chunked response writer existed in this codebase yet. Superseded
+     * by streaming_chunked below (roadmap 2a-14) for HTTP/1.1's own
+     * proxy dispatch once that writer existed -- kept here, unused by
+     * any current caller, only because h2/h3's own proxy-dispatch
+     * streaming compression (2a-11/2a-12) still route through this
+     * same close-delimited shape (chunked encoding is an HTTP/1.1-only
+     * concept; h2/h3 never needed either sentinel's own Connection
+     * handling in the first place, since both protocols already drop
+     * the Connection header sanitize would otherwise append). */
     bool streaming_compressed = compressed_content_length == (size_t) -2;
+    /* Roadmap 2a-14: the streaming-proxy-dispatch-compression, chunked-
+     * encoded sentinel -- HTTP/1.1's own real Transfer-Encoding:
+     * chunked writer (2a-13) applied to proxy dispatch. Also
+     * `compressing` (drops the upstream's own Content-Length the same
+     * way), but unlike streaming_compressed above, this emits
+     * Transfer-Encoding: chunked instead of forcing Connection: close,
+     * and keep_client_alive below is left to the ordinary
+     * has_content_length-independent client_wants_close check just
+     * like every non-streaming response already gets -- the whole
+     * point of having a chunked writer at all. */
+    bool streaming_chunked = compressed_content_length == (size_t) -3;
     char cache_control[sizeof(info->cache_control)] = "";
     char expires[sizeof(info->expires)] = "";
     char etag[sizeof(info->etag)] = "";
@@ -204,7 +222,14 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
      * passed through above -- two Vary header fields are semantically
      * equivalent to one comma-joined line (RFC 9110 5.3), just not as
      * tidy; narrowed for a later increment, not a correctness gap. */
-    if (compressing && streaming_compressed) {
+    if (compressing && streaming_chunked) {
+        written = snprintf(out + total, out_capacity - total,
+                           "Content-Encoding: %s\r\nVary: Accept-Encoding\r\n"
+                           "Transfer-Encoding: chunked\r\n",
+                           compressed_content_encoding);
+        if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+        total += (size_t) written;
+    } else if (compressing && streaming_compressed) {
         written = snprintf(out + total, out_capacity - total,
                            "Content-Encoding: %s\r\nVary: Accept-Encoding\r\n",
                            compressed_content_encoding);
@@ -232,8 +257,16 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     info->has_content_length = content_length_seen && !transfer_encoding_seen;
     info->content_length = info->has_content_length ? content_length : 0;
     info->upstream_poolable = info->has_content_length && !upstream_wants_close;
-    info->keep_client_alive = !client_wants_close && info->has_content_length
-        && !streaming_compressed;
+    /* Roadmap 2a-14: streaming_chunked never needs has_content_length
+     * (chunked framing has no use for the upstream's own declared
+     * length at all) and is never forced false the way streaming_
+     * compressed's own close-delimited framing still is -- respecting
+     * client_wants_close alone is the whole point of having a chunked
+     * writer to fall back on instead of always closing. */
+    info->keep_client_alive = streaming_chunked
+        ? !client_wants_close
+        : !client_wants_close && info->has_content_length
+              && !streaming_compressed;
     info->has_set_cookie = has_set_cookie;
     strcpy(info->cache_control, cache_control);
     strcpy(info->expires, expires);

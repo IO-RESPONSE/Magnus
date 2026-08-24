@@ -844,7 +844,8 @@ connection-pool and common-request-model decisions).
       connection alive afterward exactly like any other response here,
       instead of always closing. 2a-10's own HTTP/1.1 proxy-dispatch
       streaming-compressed responses remain close-delimited for now --
-      a natural next application of the same writer, not yet wired in.
+      a natural next application of the same writer, not yet wired in
+      (see 2a-14, immediately below, for that follow-up).
 
       Verified: a 9 MB (well past the 8 MiB bound) static file
       compresses correctly via gzip/zstd/Brotli and decodes byte-exact
@@ -858,6 +859,58 @@ connection-pool and common-request-model decisions).
       sanitize` run (ASan/UBSan, the whole suite including this
       increment's own updated test-core.sh assertions) both clean.
       See `CHANGELOG.md` 1.49.0 for the full detail.
+    - **2a-14 — the same chunked writer, applied to HTTP/1.1 proxy
+      dispatch streaming compression. Shipped in 1.50.0.** 2a-13's own
+      "natural next application, not yet wired in" -- 2a-10's own
+      responses previously stayed close-delimited unconditionally, the
+      one framing choice this whole "streaming/chunked compression
+      above 8 MiB" thread had left unresolved once every static-file
+      case (2a-13) already had a real chunked writer to fall back on.
+
+      A third sentinel, `(size_t) -3`, joins the existing `(size_t)
+      -1`/`(size_t) -2` ones on `magnus_proxy_sanitize_response_
+      headers()`: identical to `(size_t) -2` in every other respect
+      (still no `Content-Length`, still emits `Content-Encoding`/
+      `Vary`, still called once immediately rather than deferred), but
+      emits `Transfer-Encoding: chunked` instead and leaves
+      `keep_client_alive` to the ordinary `client_wants_close` decision
+      every non-streaming response already gets, rather than forcing
+      "close" regardless. `magnus_proxy_flush()`'s own streaming-
+      compress write loop frames each produced chunk in place using
+      the identical `magnus_chunk_header()`/`MAGNUS_CHUNK_HEADER_SIZE`/
+      `MAGNUS_CHUNK_FRAME_OVERHEAD` machinery 2a-13 already built,
+      reusing it rather than duplicating it -- the loop shape needed no
+      other change here either. `close_after_write` is now decided
+      once, correctly, from the client's own stated preference the
+      moment headers go out (previously forced `true` unconditionally
+      both there and again when the compressor finished). HTTP/2 and
+      HTTP/3 proxy dispatch streaming compression (2a-11/2a-12) keep
+      using `(size_t) -2`'s own close-delimited framing unchanged --
+      chunked encoding is an HTTP/1.1-only concept, and neither
+      protocol ever needed a workaround to stay alive afterward in the
+      first place.
+
+      Verified: a 9 MB (well past the 8 MiB bound) upstream response
+      compresses correctly via gzip/zstd/Brotli through a real live
+      proxy fetch, byte-exact after decoding, with `Transfer-Encoding:
+      chunked` and `Connection: keep-alive` present and no `Content-
+      Length`; a follow-up request over the same connection right after
+      (curl's own `--next`, `num_connects: 0`) confirms the connection
+      genuinely stays alive; an explicit client-requested `Connection:
+      close` is still honored; the pre-existing buffer-then-compress
+      and plain-relay proxy paths are unaffected. `make test` (twice)
+      and direct ASan/UBSan testing of the live server (multiple
+      requests across all three encodings plus connection-reuse and
+      regression checks, zero findings) both clean -- `make sanitize`'s
+      own wrapped run hit the known pre-existing ASan-timing-sensitive
+      h2 stream-flood flake before ever reaching this increment's own
+      code. A `git stash`/rebuild/reproduce/`git stash pop` A/B check
+      also confirmed several other intermittent `test-core.sh` failures
+      hit while iterating on this increment were pre-existing
+      environmental flakiness, not caused by this change: the identical
+      failures reproduced against the unmodified v1.49.0 baseline with
+      this increment's own changes fully stashed away. See
+      `CHANGELOG.md` 1.50.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route
