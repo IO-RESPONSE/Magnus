@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.54.0
+
+### Added
+
+- **FastCGI connection pooling (roadmap 5a-4), plus a real
+  pre-existing 5a-1 timeout-enforcement gap this increment's own
+  heavier concurrent testing found and fixed along the way.**
+
+  A dedicated idle-connection pool, `magnus_fastcgi_pool[]`, mirroring
+  `magnus_upstream_pool[]`'s own shape via a separate `magnus_fastcgi_
+  pool_checkout()`/`_checkin()`/`_expire_idle()`/`_close_all()` quartet
+  (kept entirely apart from the ordinary proxy pool, same "not a
+  shared namespace" reasoning `magnus_fastcgi_cluster`'s own endpoint
+  index space already established). `magnus_fastcgi_build_request()`
+  now always requests `FCGI_KEEP_CONN` in `BEGIN_REQUEST`'s own flags
+  byte -- a precondition for the application server to keep the TCP
+  connection open at all once it finishes responding; an application
+  server that ignores it (or closes for its own reason) is simply
+  caught by the pool's own `MSG_PEEK` staleness check at reuse time,
+  falling back to a fresh connection exactly as if pooling had found
+  nothing. `magnus_fastcgi_pick_and_start()`/`magnus_fastcgi_connect_
+  failed()` (5a-3) reuse the same `magnus_fastcgi_connect_endpoint()`
+  entry point unchanged -- it now tries a pool checkout first, falling
+  back to a fresh `connect()` -- via a new shared `magnus_fastcgi_
+  attach_upstream()` helper mirroring `magnus_proxy_attach_upstream()`
+  exactly. On a clean completion, `magnus_fastcgi_finish()` now checks
+  the connection back into the pool (mirroring `magnus_proxy_flush()`'s
+  own identical poolable/non-poolable branch) rather than always
+  closing it, as long as nothing was left over in `fastcgi_in` past the
+  record stream.
+
+  **A real bug found and fixed while verifying this against real
+  concurrent load:** `magnus_fastcgi_handle_upstream()` never demoted
+  its `EPOLLOUT` epoll registration to `EPOLLIN` once a request was
+  fully sent, unlike `action=proxy` dispatch's own identical send path,
+  which already does this. This was invisible through every prior
+  FastCGI increment (5a-1 through 5a-3) because a fd was always torn
+  down again within the very same handful of epoll iterations regardless
+  -- too short-lived a window for a stale, level-triggered `EPOLLOUT`
+  registration to matter. Pooling changed that: a reused connection can
+  now sit through many more epoll iterations across this and later
+  requests, and the very first reuse of a pooled connection spun the
+  event loop at high CPU, returning nothing to the client, until this
+  was found and fixed by adding the missing `epoll_ctl` `EPOLL_CTL_MOD`
+  switch, mirroring `magnus_proxy_flush()`'s own equivalent exactly.
+
+  **A second, more fundamental gap found the same way:** FastCGI
+  dispatch never actually enforced any connect/read timeout at all --
+  `fastcgi_connect_started`/`fastcgi_last_activity` were tracked since
+  5a-1 but never checked against anything, so a connect stalled behind
+  a saturated application-server worker pool, or a connected upstream
+  that simply never responds, hung the *client* connection indefinitely
+  (bounded only by the client's own patience, never Magnus's), rather
+  than ever answering a clean `504`. Fixed with a new `magnus_fastcgi_
+  expire()`, mirroring `magnus_expire_proxies()`'s own shape (new
+  `MAGNUS_FASTCGI_CONNECT_TIMEOUT_SECONDS`/`MAGNUS_FASTCGI_READ_
+  TIMEOUT_SECONDS`, same values as the proxy-dispatch equivalents),
+  wired into the same once-per-second sweep. Only the connect-stage
+  timeout retries (via `magnus_fastcgi_connect_failed()`); a
+  connected-but-silent upstream answers `504` directly without
+  retrying, the same retry-storm-avoidance asymmetry `magnus_expire_
+  proxies()` already documents for the identical reason.
+
+  Verified against a real PHP-FPM 8.3.31 backend deliberately
+  under-provisioned (`pm = static`, `pm.max_children = 4`) to surface
+  contention: a sequence of GET requests confirmed connection reuse
+  directly (`ss` showing the same 4-tuple TCP connection persisting,
+  idle, between client requests, not a fresh one each time), a burst of
+  15-40 concurrent GET/POST requests (via a controlled Python
+  `ThreadPoolExecutor` client -- an earlier attempt using many
+  shell-backgrounded `curl &` processes produced spurious client-side
+  failures traced to shell/process contention, not Magnus, and was
+  discarded once a controlled client showed 100% success under the
+  identical load) succeeded overwhelmingly, with the small remainder
+  answered by a clean `504` under genuine backend saturation rather
+  than hanging -- both for a single-endpoint pool and for the
+  retry-cluster (one endpoint always down) case together. CPU stayed
+  at idle throughout every run once the `EPOLLOUT` fix landed (0.0-0.1%,
+  confirmed via direct process inspection), where it had previously
+  spun continuously. `make test` (twice, clean) and direct ASan/UBSan
+  testing of the live server (the same concurrent GET/POST bursts
+  against both cluster shapes, repeated across several trials) zero
+  findings.
+
 ## 1.53.0
 
 ### Added

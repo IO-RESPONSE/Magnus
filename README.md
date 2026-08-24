@@ -125,10 +125,15 @@ independently by IORESPONSE.
   IPv4-literal only; `fastcgi_root=`/`--fastcgi-root` for computing
   `SCRIPT_FILENAME`, the FastCGI equivalent of nginx's own
   `fastcgi_param SCRIPT_FILENAME
-  $document_root$fastcgi_script_name;`). One fresh, non-pooled
-  connection per request (no pooling/affinity yet); any upstream-side
-  failure -- connect, send, receive, or a malformed response, not just
-  a connect-stage one -- retries against a different healthy endpoint
+  $document_root$fastcgi_script_name;`). Idle connections are pooled
+  and reused per endpoint (`FCGI_KEEP_CONN` always requested; a
+  connection the application server closed anyway is caught by a
+  staleness check at reuse time and simply discarded, no different from
+  finding none available) -- no session affinity yet. Both a connect
+  and a stalled read/response are bounded by a timeout, answered with a
+  clean `504` rather than hanging the client; any upstream-side failure
+  -- connect, send, receive, or a malformed response, not just a
+  connect-stage one -- retries against a different healthy endpoint
   once before giving up with a clean 502/504, since nothing is ever
   sent to the client until the whole response is known complete. Any
   HTTP

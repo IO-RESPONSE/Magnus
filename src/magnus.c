@@ -87,6 +87,26 @@
  * before giving up, never an unbounded retry storm against a cluster
  * that is genuinely all down. */
 #define MAGNUS_FASTCGI_MAX_ATTEMPTS 2
+/* Roadmap 5a-4 (fixed alongside the connection pool, though really a
+ * pre-existing 5a-1 gap the pool's own heavier concurrent testing is
+ * what actually exposed it): bounds how long a FastCGI attempt may
+ * spend connecting to, or waiting on, an upstream, mirroring
+ * MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/MAGNUS_PROXY_READ_TIMEOUT_
+ * SECONDS exactly (same values, dedicated constants for the same
+ * "separate everything, identical shape" reasoning every other
+ * FastCGI-specific constant in this file already follows). Before
+ * this, fastcgi_connect_started/fastcgi_last_activity were tracked but
+ * never actually checked against anything -- a connect stalled behind
+ * a saturated application-server worker pool, or a connected upstream
+ * that simply never responds, hung the client connection indefinitely
+ * (bounded only by the *client's* own patience, never Magnus's) rather
+ * than ever answering a clean 504. See magnus_fastcgi_expire()'s own
+ * doc comment for why, unlike magnus_proxy dispatch, no separate
+ * "response already started, must abort" case exists here to handle
+ * differently. */
+#define MAGNUS_FASTCGI_CONNECT_TIMEOUT_SECONDS \
+    MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS
+#define MAGNUS_FASTCGI_READ_TIMEOUT_SECONDS MAGNUS_PROXY_READ_TIMEOUT_SECONDS
 /* HTTP/1.1 chunked response writer (RFC 9112 7.1), roadmap 2a-13 --
  * this codebase's first: each real chunk is framed as a zero-padded
  * 5-hex-digit chunk-size (MAGNUS_CHUNK_HEADER_SIZE bytes, "%05zx\r\n" --
@@ -566,20 +586,24 @@ typedef struct {
      * own binary record protocol -- see src/magnus_fastcgi.h for the
      * wire-framing helpers this uses, and magnus_fastcgi_pick_and_
      * start()'s own doc comment for the full request/response shape
-     * and this codebase's own deliberate scope (HTTP/1.1 only, one
-     * fresh non-pooled connection per request -- no pooling/affinity/
-     * caching yet, the same narrow starting point every other
-     * upstream-protocol dispatch in this codebase began from before
-     * later increments layered those on; roadmap 5a-2 lifted the
-     * original 5a-1 GET-only, no-request-body restriction -- any
-     * method/body magnus_begin_body()/magnus_continue_body() already
-     * buffered generically ahead of dispatch is relayed the same way
-     * proxy dispatch's own body relay is; roadmap 5a-3 added retry
-     * against a different endpoint on any upstream-side failure, up to
-     * MAGNUS_FASTCGI_MAX_ATTEMPTS -- see magnus_fastcgi_connect_
+     * and this codebase's own deliberate scope (HTTP/1.1 only -- no
+     * session affinity/caching yet, the same narrow starting point
+     * every other upstream-protocol dispatch in this codebase began
+     * from before later increments layered those on; roadmap 5a-2
+     * lifted the original 5a-1 GET-only, no-request-body restriction --
+     * any method/body magnus_begin_body()/magnus_continue_body()
+     * already buffered generically ahead of dispatch is relayed the
+     * same way proxy dispatch's own body relay is; roadmap 5a-3 added
+     * retry against a different endpoint on any upstream-side failure,
+     * up to MAGNUS_FASTCGI_MAX_ATTEMPTS -- see magnus_fastcgi_connect_
      * failed()'s own doc comment on why this is safe for *any* failure
      * here, not just a connect-stage one the way magnus_proxy_connect_
-     * failed() is limited to). Kept entirely
+     * failed() is limited to; roadmap 5a-4 added an idle-connection
+     * pool, magnus_fastcgi_pool[], mirroring magnus_upstream_pool[]'s
+     * own shape via a dedicated magnus_fastcgi_pool_checkout()/
+     * _checkin()/_expire_idle()/_close_all() quartet -- see that
+     * array's own doc comment on why it is not shared with the ordinary
+     * proxy pool). Kept entirely
      * separate from the proxy_* / is_proxy fields above (a categorically
      * different upstream protocol, the same reasoning gRPC's own
      * dedicated field set already established) rather than shared. */
@@ -590,6 +614,14 @@ typedef struct {
      * fastcgi_connect_failed() before each attempt) -- mirrors proxy_
      * attempt's own identical role. */
     unsigned fastcgi_attempt;
+    /* Roadmap 5a-4: how many requests the current fastcgi_upstream_fd
+     * has already served -- 0 for a fresh connection, or whatever
+     * magnus_fastcgi_pool_checkout() reports for a reused one. Passed
+     * to magnus_fastcgi_pool_checkin() (incremented by one, for this
+     * request) on a clean completion, and to close()/discard it
+     * outright once MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION is reached
+     * -- mirrors proxy_upstream_requests_served's own identical role. */
+    unsigned fastcgi_upstream_requests_served;
     int fastcgi_upstream_fd;
     bool fastcgi_upstream_connected;
     size_t fastcgi_endpoint_index;
@@ -1070,6 +1102,124 @@ typedef struct {
 } magnus_pool_t;
 
 static magnus_pool_t magnus_upstream_pool[MAGNUS_MAX_UPSTREAMS];
+
+/* Roadmap 5a-4: FastCGI's own idle-connection pool, kept entirely
+ * separate from magnus_upstream_pool[] above -- the same reasoning
+ * magnus_fastcgi_cluster's own "not a shared namespace" comment
+ * already established: magnus_fastcgi_cluster has its own endpoint
+ * index space (0..MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS-1), unrelated to
+ * action=proxy's own magnus_cluster endpoint indices, so sharing one
+ * pool array between them would silently hand out a connection meant
+ * for one protocol's endpoint N to the other protocol's own,
+ * unrelated endpoint N. Reuses magnus_pool_slot_t/magnus_pool_t
+ * verbatim (a plain fd+idle_since+requests_served slot has nothing
+ * proxy-specific about its shape) via a dedicated
+ * magnus_fastcgi_pool_checkout()/_checkin()/_expire_idle()/
+ * _close_all() quartet mirroring magnus_pool_checkout() et al.
+ * exactly, the same "separate everything, identical shape" precedent
+ * magnus_grpc_pool[][]'s own comment already used for gRPC. */
+static magnus_pool_t magnus_fastcgi_pool[MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS];
+
+/* See magnus_pool_checkout()'s own doc comment -- identical contract,
+ * against magnus_fastcgi_pool[] instead. Requires the app server to
+ * have honored FCGI_KEEP_CONN (magnus_fastcgi_build_request() always
+ * requests it); one that does not (or has since closed for its own
+ * reasons) is caught by the same MSG_PEEK staleness check below and
+ * simply discarded, falling back to a fresh connection exactly as if
+ * pooling had found nothing. */
+static int
+magnus_fastcgi_pool_checkout(size_t endpoint_index,
+                             unsigned *out_requests_served)
+{
+    magnus_pool_t *pool;
+    if (endpoint_index >= MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS) return -1;
+    pool = &magnus_fastcgi_pool[endpoint_index];
+    while (pool->count > 0) {
+        magnus_pool_slot_t slot = pool->slots[pool->count - 1];
+        char probe;
+        ssize_t peeked;
+        pool->count--;
+        if (slot.requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+            close(slot.fd);
+            continue;
+        }
+        peeked = recv(slot.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (peeked == 0
+            || (peeked < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            close(slot.fd);
+            continue;
+        }
+        if (peeked > 0) {
+            /* A FastCGI application server has no business sending
+             * anything while idle between requests either -- same
+             * distrust magnus_pool_checkout()'s own identical check
+             * already applies to an HTTP/1.x upstream. */
+            close(slot.fd);
+            continue;
+        }
+        *out_requests_served = slot.requests_served;
+        return slot.fd;
+    }
+    return -1;
+}
+
+/* See magnus_pool_checkin()'s own doc comment -- identical contract,
+ * against magnus_fastcgi_pool[] instead. */
+static void
+magnus_fastcgi_pool_checkin(size_t endpoint_index, int fd,
+                            unsigned requests_served)
+{
+    magnus_pool_t *pool;
+    if (endpoint_index >= MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS) {
+        close(fd);
+        return;
+    }
+    pool = &magnus_fastcgi_pool[endpoint_index];
+    if (pool->count == MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT
+        || requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+        close(fd);
+        return;
+    }
+    pool->slots[pool->count] = (magnus_pool_slot_t) {
+        .fd = fd, .idle_since = time(NULL), .requests_served = requests_served
+    };
+    pool->count++;
+}
+
+/* See magnus_pool_expire_idle()'s own doc comment -- identical
+ * contract, against magnus_fastcgi_pool[] instead. */
+static void
+magnus_fastcgi_pool_expire_idle(time_t now)
+{
+    for (size_t endpoint = 0; endpoint < MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS;
+         endpoint++) {
+        magnus_pool_t *pool = &magnus_fastcgi_pool[endpoint];
+        size_t write_index = 0;
+        for (size_t read_index = 0; read_index < pool->count; read_index++) {
+            magnus_pool_slot_t slot = pool->slots[read_index];
+            if (now - slot.idle_since > MAGNUS_POOL_IDLE_TIMEOUT_SECONDS) {
+                close(slot.fd);
+                continue;
+            }
+            pool->slots[write_index++] = slot;
+        }
+        pool->count = write_index;
+    }
+}
+
+/* See magnus_pool_close_all()'s own doc comment -- identical contract,
+ * against magnus_fastcgi_pool[] instead. */
+static void
+magnus_fastcgi_pool_close_all(void)
+{
+    for (size_t endpoint = 0; endpoint < MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS;
+         endpoint++) {
+        magnus_pool_t *pool = &magnus_fastcgi_pool[endpoint];
+        for (size_t index = 0; index < pool->count; index++)
+            close(pool->slots[index].fd);
+        pool->count = 0;
+    }
+}
 
 /* Returns a still-live, reusable fd for `endpoint_index` if the pool has
  * one, discarding any dead (peer-closed) or exhausted
@@ -8878,8 +9028,16 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
 
     magnus_fastcgi_write_header(out + offset, MAGNUS_FASTCGI_BEGIN_REQUEST, 1, 8);
     offset += MAGNUS_FASTCGI_HEADER_LEN;
+    /* Roadmap 5a-4: always requests FCGI_KEEP_CONN -- the application
+     * server keeping the connection open after FCGI_END_REQUEST is a
+     * precondition for magnus_fastcgi_finish()'s own pool-checkin to
+     * ever find a live connection worth pooling; one that ignores this
+     * (or closes for its own unrelated reason) is simply caught by
+     * magnus_fastcgi_pool_checkout()'s own staleness check at reuse
+     * time, so requesting it unconditionally is always safe, not just
+     * when pooling this particular endpoint actually pans out. */
     magnus_fastcgi_write_begin_request_body(out + offset,
-        MAGNUS_FASTCGI_ROLE_RESPONDER, 0);
+        MAGNUS_FASTCGI_ROLE_RESPONDER, MAGNUS_FASTCGI_KEEP_CONN);
     offset += 8;
 
     magnus_fastcgi_write_header(out + offset, MAGNUS_FASTCGI_PARAMS, 1,
@@ -8926,20 +9084,62 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
     return true;
 }
 
-/* Roadmap 5a-3: opens a non-blocking connect() to cluster endpoint
- * `endpoint_index`, reusing connection->fastcgi_out (already built by
- * the caller -- see magnus_fastcgi_build_request()) and registers the
- * socket with epoll. Resets every per-attempt fastcgi_* field
- * (including fastcgi_out_sent back to 0, so a fresh connection always
- * resends the whole pre-built request from the start), so this is
- * safe to call again for a retry once the previous attempt's upstream
- * has been torn down via magnus_fastcgi_teardown_upstream() -- the
- * same "connect helper separated from the request-building caller"
- * shape magnus_proxy_connect_endpoint() already established for the
- * identical reason. Returns 0 once the attempt is in flight, -1 on
- * immediate failure (fd already closed by the time this returns -1;
- * the caller records the failure and decides whether to retry or give
- * up). */
+/* Roadmap 5a-3/5a-4: common state setup once a socket (freshly
+ * connected, or handed out of magnus_fastcgi_pool -- roadmap 5a-4) is
+ * ready to be this connection's active FastCGI upstream: resets every
+ * per-attempt fastcgi_* field (including fastcgi_out_sent back to 0,
+ * so this always resends the whole pre-built request from the start,
+ * a fresh BEGIN_REQUEST/PARAMS/STDIN cycle regardless of whether the
+ * fd itself is new or reused -- FastCGI's own request_id framing,
+ * always 1 here, does not multiplex more than one request per
+ * connection at a time either way) and registers it with epoll.
+ * `connected` is true immediately for a pooled fd (already established
+ * by definition) or a fresh connect() that happened to complete
+ * synchronously; otherwise EPOLLOUT will report completion later. The
+ * exact shape magnus_proxy_attach_upstream() already established for
+ * the identical reason. Returns 0 once the attempt is in flight, -1 on
+ * immediate failure (fd already closed by the time this returns -1). */
+static int
+magnus_fastcgi_attach_upstream(int epoll_fd, magnus_connection_t *connection,
+                               size_t endpoint_index, int fd, bool connected,
+                               unsigned requests_served)
+{
+    struct epoll_event event;
+
+    connection->fastcgi_upstream_fd = fd;
+    connection->fastcgi_upstream_connected = connected;
+    connection->fastcgi_active = true;
+    connection->fastcgi_endpoint_index = endpoint_index;
+    connection->fastcgi_upstream_requests_served = requests_served;
+    magnus_cluster_endpoint_begin(&magnus_fastcgi_cluster, endpoint_index);
+    connection->fastcgi_endpoint_counted = true;
+    connection->fastcgi_connect_started = time(NULL);
+    connection->fastcgi_last_activity = connection->fastcgi_connect_started;
+    connection->fastcgi_end_request_seen = false;
+    connection->fastcgi_out_sent = 0;
+    magnus_fastcgi_owner[fd] = connection;
+    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
+                                   .data.fd = fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        magnus_fastcgi_owner[fd] = NULL;
+        close(fd);
+        connection->fastcgi_upstream_fd = -1;
+        connection->fastcgi_active = false;
+        return -1;
+    }
+    return 0;
+}
+
+/* Roadmap 5a-3/5a-4: a pooled idle connection for this endpoint is
+ * tried first -- skipping the TCP handshake entirely -- before falling
+ * back to opening a fresh one, exactly as magnus_proxy_connect_
+ * endpoint() already does for the ordinary HTTP/1.x proxy path.
+ * Reuses connection->fastcgi_out (already built by the caller -- see
+ * magnus_fastcgi_build_request()); safe to call again for a retry once
+ * the previous attempt's upstream has been torn down via magnus_
+ * fastcgi_teardown_upstream(). Returns 0 once the attempt is in
+ * flight, -1 on immediate failure (the caller records the failure and
+ * decides whether to retry or give up). */
 static int
 magnus_fastcgi_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
                                 size_t endpoint_index)
@@ -8947,7 +9147,19 @@ magnus_fastcgi_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
     struct sockaddr_in address;
     int fd;
     int result;
-    struct epoll_event event;
+    unsigned pooled_requests_served;
+    int pooled_fd = magnus_fastcgi_pool_checkout(endpoint_index,
+                                                 &pooled_requests_served);
+
+    if (pooled_fd >= 0) {
+        if (magnus_fastcgi_attach_upstream(epoll_fd, connection,
+                                           endpoint_index, pooled_fd, true,
+                                           pooled_requests_served) == 0)
+            return 0;
+        /* attach itself failed (epoll_ctl) -- the fd is already closed;
+         * fall through to a fresh connection rather than giving up the
+         * whole attempt over what the pool offered. */
+    }
 
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
@@ -8967,27 +9179,8 @@ magnus_fastcgi_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
         close(fd);
         return -1;
     }
-    connection->fastcgi_upstream_fd = fd;
-    connection->fastcgi_upstream_connected = (result == 0);
-    connection->fastcgi_active = true;
-    connection->fastcgi_endpoint_index = endpoint_index;
-    magnus_cluster_endpoint_begin(&magnus_fastcgi_cluster, endpoint_index);
-    connection->fastcgi_endpoint_counted = true;
-    connection->fastcgi_connect_started = time(NULL);
-    connection->fastcgi_last_activity = connection->fastcgi_connect_started;
-    connection->fastcgi_end_request_seen = false;
-    connection->fastcgi_out_sent = 0;
-    magnus_fastcgi_owner[fd] = connection;
-    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
-                                   .data.fd = fd };
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-        magnus_fastcgi_owner[fd] = NULL;
-        close(fd);
-        connection->fastcgi_upstream_fd = -1;
-        connection->fastcgi_active = false;
-        return -1;
-    }
-    return 0;
+    return magnus_fastcgi_attach_upstream(epoll_fd, connection, endpoint_index,
+                                          fd, result == 0, 0);
 }
 
 /* Roadmap 5a-1/5a-2: dispatches a matched action=fastcgi route.
@@ -9215,18 +9408,22 @@ magnus_fastcgi_consume_records(magnus_connection_t *connection)
     return true;
 }
 
-/* Roadmap 5a-1: translates the CGI-shaped response now fully
+/* Roadmap 5a-1/5a-4: translates the CGI-shaped response now fully
  * accumulated in connection->fastcgi_stdout (see magnus_fastcgi_
  * translate_headers()'s own doc comment for the exact shape) into a
  * real HTTP/1.1 response and hands it to magnus_handle_write()'s own
  * new fastcgi_response_headers/fastcgi_stdout(+fastcgi_body_offset)
- * drain loop to actually send. Tears the upstream down first -- this
- * first slice never pools/reuses a FastCGI connection (see struct
- * magnus_connection_t's own fastcgi_* comment on why). A malformed
- * response (no header/body boundary ever found, or an unparseable
- * Status: line) is answered with a clean 502, exactly like any other
- * decode failure this far still gets one (nothing has reached the
- * client yet). */
+ * drain loop to actually send. The upstream leg either goes back into
+ * magnus_fastcgi_pool (cleanly finished, with nothing left over in
+ * fastcgi_in past the record stream -- the same "poolable" signal
+ * magnus_proxy_flush()'s own identical branch uses its own
+ * complete_by_length for) or gets torn down exactly as before this
+ * pool existed; independently, the client leg either stays open for
+ * its next request or closes, per fastcgi_client_wants_close. A
+ * malformed response (no header/body boundary ever found, or an
+ * unparseable Status: line) is answered with a clean 502, exactly like
+ * any other decode failure this far still gets one (nothing has
+ * reached the client yet). */
 static int
 magnus_fastcgi_finish(int epoll_fd, magnus_connection_t *connection)
 {
@@ -9237,8 +9434,29 @@ magnus_fastcgi_finish(int epoll_fd, magnus_connection_t *connection)
     int headers_length;
     unsigned status = 200;
     magnus_request_t request = {0};
+    bool poolable = connection->fastcgi_upstream_fd >= 0
+        && connection->fastcgi_in_length == 0;
 
-    magnus_fastcgi_teardown_upstream(epoll_fd, connection);
+    if (poolable) {
+        int fd = connection->fastcgi_upstream_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+        magnus_fastcgi_owner[fd] = NULL;
+        connection->fastcgi_upstream_fd = -1;
+        magnus_fastcgi_pool_checkin(connection->fastcgi_endpoint_index, fd,
+            connection->fastcgi_upstream_requests_served + 1);
+        if (connection->fastcgi_endpoint_counted) {
+            magnus_cluster_endpoint_end(&magnus_fastcgi_cluster,
+                                        connection->fastcgi_endpoint_index);
+            connection->fastcgi_endpoint_counted = false;
+        }
+        connection->fastcgi_active = false;
+        free(connection->fastcgi_in);
+        connection->fastcgi_in = NULL;
+        connection->fastcgi_in_length = 0;
+        connection->fastcgi_in_capacity = 0;
+    } else {
+        magnus_fastcgi_teardown_upstream(epoll_fd, connection);
+    }
     /* The whole request was already fully sent by definition (this is
      * only ever reached once FCGI_END_REQUEST was seen) -- no retry
      * will ever need fastcgi_out again, so free it here rather than
@@ -9339,7 +9557,29 @@ magnus_fastcgi_handle_upstream(int epoll_fd, magnus_connection_t *connection,
                                                  "Bad Gateway");
         }
     }
-    if ((flags & (EPOLLIN | EPOLLRDHUP)) == 0) return 0;
+    if ((flags & (EPOLLIN | EPOLLRDHUP)) == 0) {
+        /* The whole request is now sent -- switch epoll interest away
+         * from EPOLLOUT (level-triggered, so it would otherwise keep
+         * firing on every epoll_wait() for as long as the socket's own
+         * send buffer stays writable, a busy-spin this codebase's
+         * proxy-dispatch equivalent already guards against the same
+         * way at its own identical point). A fresh connection's
+         * request is typically small enough to finish in the very same
+         * send() call that first observes it as writable, so this gap
+         * was previously invisible -- short-lived enough (this attempt
+         * finishes and the fd is torn down or checked in within the
+         * same handful of epoll iterations) that the wasted wakeups
+         * never accumulated into anything visible. Roadmap 5a-4's own
+         * pool changed that: a pooled connection can now sit through
+         * many additional epoll iterations across this and later
+         * requests, giving a stale EPOLLOUT registration real time to
+         * spin. */
+        struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                     .data.fd = connection->fastcgi_upstream_fd };
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fastcgi_upstream_fd,
+                 &event);
+        return 0;
+    }
     for (;;) {
         unsigned char buffer[MAGNUS_PROXY_BUFFER];
         ssize_t received = recv(connection->fastcgi_upstream_fd, buffer,
@@ -9378,6 +9618,53 @@ magnus_fastcgi_handle_upstream(int epoll_fd, magnus_connection_t *connection,
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return magnus_fastcgi_connect_failed(epoll_fd, connection, 502,
                                              "Bad Gateway");
+    }
+}
+
+/* Roadmap 5a-4: bounds how long a FastCGI attempt may spend connecting
+ * to, or waiting on, an upstream -- see MAGNUS_FASTCGI_CONNECT_
+ * TIMEOUT_SECONDS/MAGNUS_FASTCGI_READ_TIMEOUT_SECONDS's own doc
+ * comment for why this exists at all. Mirrors magnus_expire_proxies()'s
+ * own shape closely, with one simplification: magnus_proxy dispatch
+ * needs a separate "response already started, must abort uncleanly"
+ * case for its own read-timeout branch, but FastCGI dispatch never
+ * does (see magnus_fastcgi_fail()'s own doc comment -- nothing ever
+ * reaches the client before magnus_fastcgi_finish() runs), so a
+ * read-timeout here always answers cleanly via magnus_fastcgi_fail()
+ * with no abort() counterpart to choose between. Only the connect-stage
+ * timeout retries (magnus_fastcgi_connect_failed()) -- a connected-but-
+ * silent upstream is deliberately NOT retried, the same retry-storm/
+ * tail-latency-amplification avoidance magnus_expire_proxies()'s own
+ * identical asymmetry already documents (the endpoint already accepted
+ * the connection; retrying would only double the wait without
+ * addressing a genuinely slow responder), though it still counts as a
+ * passive-health failure either way. */
+static void
+magnus_fastcgi_expire(int epoll_fd, time_t now)
+{
+    int fd;
+    for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
+        magnus_connection_t *connection = magnus_connections[fd];
+        int result;
+        if (connection == NULL || !connection->fastcgi_active) continue;
+        if (!connection->fastcgi_upstream_connected) {
+            if (now - connection->fastcgi_connect_started
+                < MAGNUS_FASTCGI_CONNECT_TIMEOUT_SECONDS) continue;
+            result = magnus_fastcgi_connect_failed(epoll_fd, connection, 504,
+                                                   "Gateway Timeout");
+        } else if (now - connection->fastcgi_last_activity
+                   >= MAGNUS_FASTCGI_READ_TIMEOUT_SECONDS) {
+            magnus_cluster_result(&magnus_fastcgi_cluster,
+                                  connection->fastcgi_endpoint_index, false,
+                                  magnus_now_ms());
+            result = magnus_fastcgi_fail(epoll_fd, connection, 504,
+                                         "Gateway Timeout");
+        } else {
+            continue;
+        }
+        if (result < 0 && magnus_connections[connection->fd] != NULL) {
+            magnus_close_connection(epoll_fd, connection);
+        }
     }
 }
 
@@ -12141,10 +12428,11 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_grpc_pool_close_all();
     magnus_grpc_cluster = new_grpc_cluster;
     magnus_grpc_upstream_enabled = new_grpc_cluster.count > 0;
-    /* FastCGI dispatch (roadmap 5a-1): no connection pool of its own
-     * yet to flush (see this increment's own "no pooling" scope note),
-     * so this is just the cluster/root swap, the same shape stream's
-     * own comment just above gives for the identical reason. */
+    /* Same stale-by-position hazard as magnus_pool_close_all()/
+     * magnus_grpc_pool_close_all() above, for FastCGI's own connection
+     * pool (roadmap 5a-4) -- flush it before swapping in the new
+     * cluster, not after. */
+    magnus_fastcgi_pool_close_all();
     magnus_fastcgi_cluster = new_fastcgi_cluster;
     magnus_fastcgi_upstream_enabled = new_fastcgi_cluster.count > 0;
     if (config->has_fastcgi_root) strcpy(magnus_fastcgi_root, config->fastcgi_root);
@@ -13377,6 +13665,7 @@ main(int argc, char **argv)
         }
         if (now != last_sweep) {
             magnus_expire_proxies(epoll_fd, now);
+            magnus_fastcgi_expire(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             magnus_stream_expire_idle(epoll_fd, now);
             magnus_udp_expire_idle(epoll_fd, now);
@@ -13384,6 +13673,7 @@ main(int argc, char **argv)
                 magnus_quic_tick(magnus_quic_listener, now);
             magnus_pool_expire_idle(now);
             magnus_grpc_pool_expire(now);
+            magnus_fastcgi_pool_expire_idle(now);
             magnus_cache_expire_sweep(magnus_cache_now_ms());
             magnus_dns_tick(now);
             magnus_health_tick(epoll_fd, now);
@@ -13433,6 +13723,7 @@ main(int argc, char **argv)
     }
     magnus_pool_close_all();
     magnus_grpc_pool_close_all();
+    magnus_fastcgi_pool_close_all();
     magnus_cache_purge_all();
     magnus_dns_stop();
     close(epoll_fd);

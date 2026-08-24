@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-image=${MAGNUS_IMAGE:-ioresponse/magnus:1.53.0}
+image=${MAGNUS_IMAGE:-ioresponse/magnus:1.54.0}
 base_image=${BASE_IMAGE:-ioresponse/glibc71-base:poc}
 
 mkdir -p dist

@@ -1491,10 +1491,27 @@ connection-pool and common-request-model decisions).
   1.53.0 for the pre-existing 5a-1 gap (a missing `magnus_cluster_
   result()` call on `EPOLLERR`/`EPOLLHUP`) it fixed along the way.
 
-  Still ahead for Phase 5: connection pooling and session affinity for
-  FastCGI (parity with what proxy/gRPC dispatch already have), SCGI,
-  uWSGI, Runtime API expansion, and the zero-downtime binary upgrade
-  mechanism itself.
+  **5a-4 (FastCGI connection pooling) shipped in 1.54.0** -- a
+  dedicated idle-connection pool (`magnus_fastcgi_pool[]`, mirroring
+  `magnus_upstream_pool[]`'s own shape) plus `FCGI_KEEP_CONN` always
+  requested in `BEGIN_REQUEST`. Verified against a deliberately
+  under-provisioned real PHP-FPM backend (4 static workers) that
+  connections genuinely persist and get reused (`ss` showing the same
+  TCP 4-tuple idle between requests) and that concurrent bursts succeed
+  overwhelmingly. This increment's own heavier concurrent testing found
+  and fixed two real gaps along the way, both documented in full in
+  `CHANGELOG.md` 1.54.0: a missing `EPOLLOUT`→`EPOLLIN` epoll-interest
+  demotion (invisible in every prior FastCGI increment since a fd was
+  always short-lived until pooling kept one alive long enough to spin
+  the event loop), and a complete absence of connect/read timeout
+  enforcement since 5a-1 (a stalled upstream previously hung the
+  *client* indefinitely rather than ever answering a clean `504`; fixed
+  with a new `magnus_fastcgi_expire()` mirroring `magnus_expire_
+  proxies()`).
+
+  Still ahead for Phase 5: session affinity for FastCGI (parity with
+  what proxy/gRPC dispatch already have), SCGI, uWSGI, Runtime API
+  expansion, and the zero-downtime binary upgrade mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously
