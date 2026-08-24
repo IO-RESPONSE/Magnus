@@ -385,7 +385,24 @@ independently by IORESPONSE.
   and applied to HTTP/2's own equivalent callback too (which never
   reproduced a hang in testing, but only because of nghttp2's own
   retry timing, not any actual guarantee)
-- Container image: 10,724,093 bytes (~10.23 MiB), non-root, read-only rootfs
+- Streaming proxy dispatch response compression, HTTP/1.1 (roadmap
+  2a-10): the one remaining dimension of "streaming/chunked compression
+  above 8 MiB" once 2a-7/2a-8/2a-9 covered every static-file case --
+  a `"/proxy"` response too large to buffer whole before compressing
+  once (past `MAGNUS_COMPRESSION_MAX_SIZE`) now compresses incrementally
+  as bytes arrive from the upstream fetch instead of simply staying
+  uncompressed past that bound. Unlike the static-file streaming paths,
+  input is never pulled on demand (there is no file to `pread()` more
+  of) -- it only ever arrives pushed, asynchronously, by the same
+  upstream `recv()` the ordinary uncompressed relay already uses, so
+  the compressor is fed from `proxy_buffer` directly and the drain loop
+  simply waits for the next upstream read when it runs out of input
+  rather than looping on its own. Response headers (`Content-Encoding`/
+  `Vary`, no `Content-Length`, `Connection: close`) go out immediately
+  once the upstream's own headers are known, rather than deferred the
+  way the buffer-then-compress path's own headers are. HTTP/2 and
+  HTTP/3 proxy dispatch streaming compression remain later increments
+- Container image: 10,724,922 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

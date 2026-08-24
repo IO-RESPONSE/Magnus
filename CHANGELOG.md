@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.46.0
+
+### Added
+
+- **Streaming proxy dispatch response compression, HTTP/1.1 (roadmap
+  2a-10) -- the one remaining dimension of "streaming/chunked
+  compression above 8 MiB" once 2a-7/2a-8/2a-9 covered every static-
+  file case.** A `"/proxy"` response too large for 2a-2's own buffer-
+  then-compress shape (past `MAGNUS_COMPRESSION_MAX_SIZE`) previously
+  stayed uncompressed no matter what the client's `Accept-Encoding`
+  offered; it now compresses incrementally as bytes arrive from the
+  upstream fetch instead.
+
+  Structurally different from every static-file streaming path this
+  codebase already has: there is no file to `pread()` more of on
+  demand the moment the write side wants it. Upstream body bytes only
+  ever arrive pushed, asynchronously, by `magnus_handle_upstream()`'s
+  own `recv()` off the upstream socket -- the same one the ordinary
+  uncompressed relay already uses. Rather than add a dedicated input
+  buffer, this reuses `proxy_buffer`/`proxy_buffer_length`/
+  `proxy_buffer_sent` directly as the compressor's own pending-input
+  queue (`proxy_buffer_sent` now plays "how much of the current chunk
+  has been fed to the compressor" instead of "how much has been
+  written to the client"), and `magnus_proxy_flush()`'s new streaming-
+  compress block -- entered from both the upstream-read path and the
+  client-writable path, exactly like its own header/body drain loops
+  already are -- simply re-arms the upstream fd for reading and
+  returns once it runs out of buffered input, rather than looping to
+  fetch more itself the way a `pread()`-backed loop safely could.
+
+  Unlike 2a-2's own buffer-then-compress path (which defers every
+  client-visible byte until the whole body is known, so it can emit a
+  real compressed `Content-Length`), nothing here is deferred: the
+  real compressed length can never be known ahead of time for a
+  streamed body any more than a streamed static file's own can, so
+  response headers go out the moment the upstream's own headers are
+  known, via a new `(size_t) -2` sentinel on
+  `magnus_proxy_sanitize_response_headers()` that emits `Content-
+  Encoding`/`Vary` but no `Content-Length`, and forces the client-
+  facing `Connection` to "close" regardless of what the client asked
+  for -- the same close-delimited-framing choice 2a-7's own HTTP/1.1
+  static-file streaming compression already made, for the same reason
+  (no `Transfer-Encoding: chunked` response writer exists in this
+  codebase yet).
+
+  `done` becoming true (the compressor has consumed every remaining
+  buffered byte and fully flushed, per `magnus_stream_compress_step()`'s
+  own contract, unchanged since 2a-7/8/9) tears the compressor down and
+  marks the connection to close after the final chunk drains; a
+  defensive zero-out of `proxy_buffer_length`/`_sent` at that point
+  guards against ever relaying stale, would-be-raw bytes to the client
+  if that contract were ever violated, even though nothing in this
+  increment's own testing ever observed it be. HTTP/2 and HTTP/3 proxy
+  dispatch streaming compression remain later increments -- see
+  `src/magnus_quic.h`'s own "deliberately still not here" list.
+
+  Verified: a 9 MB (well past the 8 MiB bound) upstream response
+  compresses correctly via gzip/zstd/Brotli through a real live proxy
+  fetch, byte-exact after decoding, with no `Content-Length` header and
+  `Connection: close` present, and the server keeps answering normally
+  right afterward; `make test` (twice, including the pre-existing
+  buffer-then-compress proxy dispatch regression block, unaffected)
+  and a full Docker image rebuild plus live container verification both
+  clean.
+
 ## 1.45.0
 
 ### Fixed

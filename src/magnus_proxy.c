@@ -70,6 +70,17 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     bool has_set_cookie = false;
     bool has_content_encoding = false;
     bool compressing = compressed_content_length != (size_t) -1;
+    /* Roadmap 2a-10: the streaming-proxy-dispatch-compression sentinel --
+     * see this function's own doc comment. Still `compressing` (so the
+     * upstream's own Content-Length line is dropped, same as the
+     * whole-buffered compressed case), but the real length can never be
+     * known ahead of time, so no Content-Length is ever written, and the
+     * client-facing Connection is forced to "close" regardless of
+     * client_wants_close/has_content_length -- there is no chunked
+     * response writer in this codebase yet (see magnus_quic.h's own
+     * "deliberately still not here" list) for a would-be keep-alive
+     * response with no content-length known ahead of time. */
+    bool streaming_compressed = compressed_content_length == (size_t) -2;
     char cache_control[sizeof(info->cache_control)] = "";
     char expires[sizeof(info->expires)] = "";
     char etag[sizeof(info->etag)] = "";
@@ -193,7 +204,13 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
      * passed through above -- two Vary header fields are semantically
      * equivalent to one comma-joined line (RFC 9110 5.3), just not as
      * tidy; narrowed for a later increment, not a correctness gap. */
-    if (compressing) {
+    if (compressing && streaming_compressed) {
+        written = snprintf(out + total, out_capacity - total,
+                           "Content-Encoding: %s\r\nVary: Accept-Encoding\r\n",
+                           compressed_content_encoding);
+        if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+        total += (size_t) written;
+    } else if (compressing) {
         written = snprintf(out + total, out_capacity - total,
                            "Content-Length: %zu\r\nContent-Encoding: %s\r\n"
                            "Vary: Accept-Encoding\r\n", compressed_content_length,
@@ -215,7 +232,8 @@ magnus_proxy_sanitize_response_headers(char *raw, size_t header_length,
     info->has_content_length = content_length_seen && !transfer_encoding_seen;
     info->content_length = info->has_content_length ? content_length : 0;
     info->upstream_poolable = info->has_content_length && !upstream_wants_close;
-    info->keep_client_alive = !client_wants_close && info->has_content_length;
+    info->keep_client_alive = !client_wants_close && info->has_content_length
+        && !streaming_compressed;
     info->has_set_cookie = has_set_cookie;
     strcpy(info->cache_control, cache_control);
     strcpy(info->expires, expires);

@@ -111,6 +111,23 @@ typedef struct {
  * -- a compressed response is never stored in the cache this way (see
  * CHANGELOG.md's own 2a-2 entry for why); callers doing so pass NULL.
  *
+ * `(size_t) -2` (roadmap 2a-10) is a second sentinel, for a caller
+ * that knows it will compress the body but, unlike the pattern above,
+ * can never know the real compressed length ahead of time because it
+ * is streaming the response as upstream bytes arrive rather than
+ * buffering the whole thing first (past MAGNUS_COMPRESSION_MAX_SIZE).
+ * Emits `Content-Encoding`/`Vary` exactly like a known compressed
+ * length would, but no `Content-Length` line at all, and forces the
+ * client-facing `Connection` to "close" regardless of
+ * `client_wants_close` -- there is no `Transfer-Encoding: chunked`
+ * response writer in this codebase (see magnus_quic.h's own
+ * "deliberately still not here" list), so an unknown-length body can
+ * only ever be framed by closing, the same choice 2a-7's own static-
+ * file streaming compression already made. Intended to be called once,
+ * immediately, the moment headers are known -- unlike the buffer-then-
+ * compress pattern above, nothing about a streamed response is ever
+ * deferred to a second call.
+ *
  * Returns the number of bytes written to `out` (excluding the NUL
  * terminator) on success, or -1 if the status line is malformed, a
  * Content-Length was malformed or duplicated, or `out` is too small to

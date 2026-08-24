@@ -16,8 +16,9 @@
  * joining as a third, both across static-file and proxy-dispatch
  * compression alike, on all three protocols; 2a-7/2a-8/2a-9 streaming
  * compression for static files past 2a's own 8 MiB bound, on HTTP/1.1,
- * HTTP/2, and now HTTP/3 too -- narrowing the item this list itself
- * used to carry down to just proxy dispatch, see that item's own scope
+ * HTTP/2, and HTTP/3; 2a-10 the same for HTTP/1.1 proxy dispatch
+ * responses -- narrowing the item this list itself used to carry down
+ * to just HTTP/2/HTTP/3 proxy dispatch, see that item's own scope
  * below. 2a-8 fixed a real, previously-latent bug it found along the
  * way: magnus_h2_drain_send() (magnus.c) retried a failed/partial
  * SSL_write() against a *different* buffer address than the original
@@ -33,7 +34,15 @@
  * offered; fixed by looping internally until real progress happens
  * (and applied to HTTP/2's own equivalent callback too, which never
  * reproduced a hang in testing but relied on nghttp2's own eager retry
- * timing rather than on any real guarantee to avoid it))
+ * timing rather than on any real guarantee to avoid it)). Unlike every
+ * static-file streaming path, 2a-10's own proxy-dispatch input only
+ * ever arrives pushed, asynchronously, by the ordinary uncompressed
+ * relay's own recv() off the upstream socket, not pulled on demand --
+ * so magnus_proxy_flush()'s own new streaming-compress block reuses
+ * proxy_buffer/_length/_sent directly as the compressor's pending-
+ * input queue and simply waits for the next upstream read when it
+ * runs out, rather than fetching more itself the way a pread()-backed
+ * loop safely could.
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -83,7 +92,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.45.0"
+#define MAGNUS_VERSION "1.46.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

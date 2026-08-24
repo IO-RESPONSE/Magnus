@@ -688,6 +688,32 @@ connection-pool and common-request-model decisions).
       250ms, byte-exact, across repeated trials; direct ASan/UBSan
       testing of the live server (9 runs, all three encodings, zero
       findings) clean. See `CHANGELOG.md` 1.45.0 for the full detail.
+    - **2a-10 — streaming proxy dispatch response compression, HTTP/1.1.
+      Shipped in 1.46.0.** The one remaining dimension of "streaming/
+      chunked compression above 8 MiB" once 2a-7/2a-8/2a-9 covered
+      every static-file case: a `"/proxy"` response too large for
+      2a-2's own buffer-then-compress shape (past
+      `MAGNUS_COMPRESSION_MAX_SIZE`) now compresses incrementally
+      instead of simply staying excluded, the same way it always was
+      through 2a-9. Structurally different from every static-file
+      streaming path: there is no file to `pread()` more of on demand
+      -- upstream body bytes only ever arrive pushed, asynchronously,
+      by the same `recv()` the ordinary uncompressed relay already
+      uses (`magnus_handle_upstream()`), so this reuses `proxy_buffer`/
+      `_length`/`_sent` directly as the compressor's own pending-input
+      queue instead of adding a dedicated one, and the drain loop
+      (`magnus_proxy_flush()`) simply re-arms the upstream fd and
+      returns when it runs out of buffered input rather than looping
+      to fetch more itself. Response headers go out immediately, the
+      moment the upstream's own headers are known (`Content-Encoding`/
+      `Vary`, no `Content-Length`, `Connection: close` -- the same
+      framing choice 2a-7's own static-file streaming already made,
+      via a new `(size_t) -2` sentinel on
+      `magnus_proxy_sanitize_response_headers()`), rather than
+      deferred the way 2a-2's own buffer-then-compress headers still
+      are. HTTP/2 and HTTP/3 proxy dispatch streaming compression
+      remain later increments. See `CHANGELOG.md` 1.46.0 for the full
+      detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

@@ -513,6 +513,28 @@ typedef struct {
     unsigned char *proxy_compressed_body;
     size_t proxy_compressed_body_length;
     size_t proxy_compressed_body_sent;
+    /* Streaming proxy dispatch response compression, HTTP/1.1 (roadmap
+     * 2a-10) -- the one case try_compress/proxy_compress_pending's own
+     * MAGNUS_COMPRESSION_MAX_SIZE bound excludes: a response too large
+     * to buffer whole before compressing once. Unlike proxy_compress_
+     * capture (buffer everything, then compress in one shot), this
+     * compresses incrementally as bytes arrive from upstream --
+     * response headers (Content-Encoding/Vary, no Content-Length,
+     * Connection: close, exactly like 2a-7's own static-file streaming
+     * decision) go out immediately rather than being deferred, and
+     * proxy_buffer/_length/_sent (the same three fields the ordinary
+     * uncompressed relay already uses) become the pending-input queue
+     * magnus_proxy_flush()'s own streaming-compress block feeds the
+     * compressor from, instead of writing them to the client raw --
+     * see that block's own comment. proxy_stream_compress_outbuf is
+     * malloc()'d (MAGNUS_STREAM_COMPRESS_CHUNK, same as the static-file
+     * streaming path's own stream_compress_outbuf) only once eligibility
+     * is confirmed, not kept around unconditionally on every connection
+     * the way the small, fixed-size proxy_buffer already is. */
+    magnus_stream_compressor_t *proxy_stream_compress;
+    unsigned char *proxy_stream_compress_outbuf;
+    size_t proxy_stream_compress_outbuf_length;
+    size_t proxy_stream_compress_outbuf_sent;
     struct in_addr client_address;
     struct in_addr raw_peer_address;
     bool proxy_proto_done;
@@ -1446,6 +1468,11 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     free(connection->cache_serve_body);
     free(connection->proxy_compress_capture);
     free(connection->proxy_compressed_body);
+    /* Roadmap 2a-10: same "a client/upstream can disconnect mid-stream"
+     * tolerance as stream_compress_end() above -- see that call's own
+     * comment. */
+    magnus_stream_compress_end(connection->proxy_stream_compress);
+    free(connection->proxy_stream_compress_outbuf);
     free(connection->ws_buffer);
     magnus_h2_close(connection);
     /* Safety net: normally already freed by magnus_free_body_if_unowned()
@@ -2241,6 +2268,20 @@ magnus_proxy_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
     connection->proxy_compressed_body = NULL;
     connection->proxy_compressed_body_length = 0;
     connection->proxy_compressed_body_sent = 0;
+    /* Roadmap 2a-10: same "a retry must not carry a failed/finished
+     * attempt's partial state forward" reasoning as proxy_compress_
+     * capture just above -- a successful, streamed completion has
+     * already finished and freed this compressor from within magnus_
+     * proxy_flush()'s own streaming-compress block before ever reaching
+     * here (magnus_stream_compress_end()/free() below are therefore
+     * both already-NULL no-ops on that path, same tolerance every other
+     * teardown call in this codebase relies on). */
+    magnus_stream_compress_end(connection->proxy_stream_compress);
+    connection->proxy_stream_compress = NULL;
+    free(connection->proxy_stream_compress_outbuf);
+    connection->proxy_stream_compress_outbuf = NULL;
+    connection->proxy_stream_compress_outbuf_length = 0;
+    connection->proxy_stream_compress_outbuf_sent = 0;
 }
 
 /* Ends an in-flight proxy attempt before any response bytes have reached
@@ -2409,6 +2450,17 @@ magnus_proxy_finish_compression(magnus_connection_t *connection)
 static int
 magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
 {
+    /* Hoisted to function scope (roadmap 2a-10): the streaming-compress
+     * block below needs this exact same "has every upstream body byte
+     * this response will ever have already arrived" fact to know when
+     * to finish=true its last magnus_stream_compress_step() call, same
+     * as the pre-existing "response complete" block further down that
+     * originally computed it locally -- see that block's own comment,
+     * unchanged other than no longer redeclaring this. */
+    bool complete_by_length = connection->proxy_has_response_length
+        && connection->proxy_response_received
+           >= connection->proxy_response_length;
+
     while (connection->proxy_header_out != NULL
            && connection->proxy_header_out_sent
               < connection->proxy_header_out_length) {
@@ -2432,6 +2484,123 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
         free(connection->proxy_header_out);
         connection->proxy_header_out = NULL;
         connection->proxy_response_started = true;
+    }
+    /* Roadmap 2a-10: streaming proxy dispatch response compression --
+     * entered either while proxy_stream_compress is still live, or (an
+     * EAGAIN on the very last write below left some already-produced
+     * bytes undrained) while it has already finished but
+     * proxy_stream_compress_outbuf itself has not yet fully drained.
+     * Unlike the static-file streaming path (2a-7/2a-8/2a-9), input is
+     * never pulled on demand here (there is no pread() to call for
+     * more) -- it only ever arrives pushed, asynchronously, by
+     * magnus_handle_upstream()'s own recv() off the upstream socket,
+     * into proxy_buffer/_length exactly like the ordinary uncompressed
+     * relay already uses those same three fields (proxy_buffer_sent
+     * here plays the same "how much of the current chunk has been
+     * consumed" role that field already plays there). So when this
+     * function is entered with nothing left to consume and upstream
+     * has not signaled complete_by_length/proxy_eof yet, it simply
+     * re-arms the upstream fd for reading and returns -- exactly the
+     * same wait this same situation already gets on the uncompressed
+     * path just below -- rather than looping: there is nothing for it
+     * to do until magnus_handle_upstream() calls back in with more. */
+    if (connection->proxy_stream_compress != NULL
+        || connection->proxy_stream_compress_outbuf_sent
+           < connection->proxy_stream_compress_outbuf_length) {
+        for (;;) {
+            while (connection->proxy_stream_compress_outbuf_sent
+                   < connection->proxy_stream_compress_outbuf_length) {
+                ssize_t sent = magnus_socket_write(connection,
+                    connection->proxy_stream_compress_outbuf
+                        + connection->proxy_stream_compress_outbuf_sent,
+                    connection->proxy_stream_compress_outbuf_length
+                        - connection->proxy_stream_compress_outbuf_sent);
+                if (sent > 0) {
+                    connection->proxy_stream_compress_outbuf_sent
+                        += (size_t) sent;
+                    connection->last_active = time(NULL);
+                    connection->proxy_last_activity = connection->last_active;
+                    connection->proxy_response_started = true;
+                    continue;
+                }
+                if (sent < 0 && errno == EINTR) continue;
+                if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    return magnus_update_interest(epoll_fd, connection,
+                                                  EPOLLOUT | EPOLLRDHUP);
+                return magnus_proxy_abort(epoll_fd, connection);
+            }
+            connection->proxy_stream_compress_outbuf_length = 0;
+            connection->proxy_stream_compress_outbuf_sent = 0;
+
+            /* Fully drained. Nothing left to feed the compressor either
+             * (it already reported done, on a prior iteration/call) --
+             * fall out to the ordinary "response complete" reasoning
+             * below, exactly like the whole-buffered proxy_compressed_
+             * body case already does once IT finishes draining. */
+            if (connection->proxy_stream_compress == NULL) break;
+
+            if (connection->proxy_buffer_sent == connection->proxy_buffer_length
+                && !complete_by_length && !connection->proxy_eof) {
+                if (connection->upstream_fd >= 0) {
+                    struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                                 .data.fd = connection->upstream_fd };
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->upstream_fd,
+                             &event);
+                }
+                return magnus_update_interest(epoll_fd, connection, EPOLLRDHUP);
+            }
+
+            {
+                size_t consumed = 0, produced = 0;
+                bool done = false;
+                bool ok = magnus_stream_compress_step(
+                    connection->proxy_stream_compress,
+                    (const unsigned char *) connection->proxy_buffer
+                        + connection->proxy_buffer_sent,
+                    connection->proxy_buffer_length
+                        - connection->proxy_buffer_sent,
+                    complete_by_length || connection->proxy_eof, &consumed,
+                    connection->proxy_stream_compress_outbuf,
+                    MAGNUS_STREAM_COMPRESS_CHUNK, &produced, &done);
+                if (!ok) return magnus_proxy_abort(epoll_fd, connection);
+                connection->proxy_buffer_sent += consumed;
+                if (connection->proxy_buffer_sent
+                    == connection->proxy_buffer_length) {
+                    connection->proxy_buffer_length = 0;
+                    connection->proxy_buffer_sent = 0;
+                }
+                connection->proxy_stream_compress_outbuf_length = produced;
+                connection->proxy_stream_compress_outbuf_sent = 0;
+                if (done) {
+                    /* magnus_stream_compress_step()'s own contract
+                     * (roadmap 2a-9's own doc comment on why a single
+                     * call cannot be trusted to ever produce output at
+                     * all, let alone signal done, for zstd/Brotli) means
+                     * this loop must never treat a zero-progress call as
+                     * a reason to stop retrying on its own -- but done
+                     * becoming true is always real forward progress
+                     * (finish=true was passed, and every one of the
+                     * three encoders' own "am I finished" flags only
+                     * ever turns true together with actually having
+                     * flushed everything), so looping back to the top to
+                     * drain this final chunk and then break is always
+                     * correct here, never a repeat of that deadlock. */
+                    magnus_stream_compress_end(connection->proxy_stream_compress);
+                    connection->proxy_stream_compress = NULL;
+                    connection->close_after_write = true;
+                    /* Defensive, not expected: done becoming true always
+                     * implies proxy_buffer was already fully consumed
+                     * (see this block's own reasoning on why), but never
+                     * leave stale, would-be-relayed-raw bytes sitting in
+                     * proxy_buffer for the plain-relay code just below
+                     * this whole block to mistake for an ordinary
+                     * uncompressed response if that assumption is ever
+                     * wrong. */
+                    connection->proxy_buffer_length = 0;
+                    connection->proxy_buffer_sent = 0;
+                }
+            }
+        }
     }
     /* Roadmap 2a-2: once magnus_proxy_finish_compression() has run,
      * proxy_compressed_body (heap, sized to the actual compressed --
@@ -2489,10 +2658,6 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
         return magnus_ws_update_interest(epoll_fd, connection);
 
     {
-        bool complete_by_length = connection->proxy_has_response_length
-            && connection->proxy_response_received
-               >= connection->proxy_response_length;
-
         /* Roadmap 2a-2: the whole point of proxy_compress_pending was
          * to hold every client-visible byte back until this exact
          * moment -- both write loops above were no-ops the entire time
@@ -2807,19 +2972,32 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
      * (status/content-type/content-length/an existing Content-Encoding,
      * if any) are known. MAGNUS_COMPRESSION_MIN_SIZE/_MAX_SIZE are the
      * exact same bounds magnus_compress_static() already applies to
-     * static files -- a tiny body is not worth the framing overhead,
-     * and anything past 8 MiB stays on the ordinary streaming path
-     * (deferred, same as static-file compression's own identical
-     * bound). A response with no unambiguous Content-Length is also
-     * never eligible: "buffer exactly this many bytes, then compress"
-     * has no sensible answer for a chunked/close-delimited body. */
+     * static files -- a tiny body is not worth the framing overhead;
+     * anything past MAX_SIZE falls to try_stream_compress just below
+     * instead (roadmap 2a-10) rather than being simply excluded the way
+     * it still was through 2a-9. A response with no unambiguous
+     * Content-Length is also never eligible for either mode: "read
+     * exactly this many bytes from upstream, compressing as they
+     * arrive (whole-buffered or streamed)" has no sensible answer for
+     * a chunked/close-delimited upstream body. */
     bool try_compress = connection->proxy_accept_encoding != MAGNUS_ENCODING_NONE
         && info.status == 200
         && !info.has_content_encoding && info.has_content_length
         && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
         && info.content_length <= MAGNUS_COMPRESSION_MAX_SIZE
         && magnus_content_type_compressible(info.content_type);
+    /* Roadmap 2a-10: the streaming analogue of try_compress, for exactly
+     * the one case its own MAGNUS_COMPRESSION_MAX_SIZE bound excludes --
+     * a response too large to buffer whole before compressing once.
+     * MAGNUS_COMPRESSION_MIN_SIZE is not checked: anything past
+     * MAX_SIZE is already far past MIN_SIZE. */
+    bool try_stream_compress = connection->proxy_accept_encoding != MAGNUS_ENCODING_NONE
+        && info.status == 200
+        && !info.has_content_encoding && info.has_content_length
+        && info.content_length > MAGNUS_COMPRESSION_MAX_SIZE
+        && magnus_content_type_compressible(info.content_type);
     connection->proxy_compress_pending = try_compress;
+    connection->proxy_stream_compress = NULL;
     if (try_compress) {
         /* Defer everything client-visible until the whole body is
          * captured and compressed (see magnus_proxy_flush()'s own
@@ -2837,7 +3015,72 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
         connection->proxy_compress_capture = NULL;
         connection->proxy_compress_capture_length = 0;
         connection->proxy_compress_capture_capacity = 0;
-    } else {
+    } else if (try_stream_compress) {
+        /* Unlike try_compress, nothing here is deferred: a streamed
+         * response's real compressed length can never be known ahead of
+         * time any more than a streamed static file's own can (roadmap
+         * 2a-7), so headers go out right now instead of waiting for a
+         * body that may never finish arriving. A genuine allocation
+         * failure (the compressor itself, or its output buffer) simply
+         * declines streaming -- proxy_stream_compress stays NULL, and
+         * the plain uncompressed relay below runs exactly as if
+         * try_stream_compress had been false, the same graceful
+         * degradation magnus_proxy_finish_compression() already has for
+         * try_compress's own encoder-allocation-failure case. */
+        connection->proxy_stream_compress
+            = magnus_stream_compress_begin(connection->proxy_accept_encoding);
+        if (connection->proxy_stream_compress != NULL) {
+            connection->proxy_stream_compress_outbuf
+                = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+            if (connection->proxy_stream_compress_outbuf == NULL) {
+                magnus_stream_compress_end(connection->proxy_stream_compress);
+                connection->proxy_stream_compress = NULL;
+            }
+        }
+    }
+    if (connection->proxy_stream_compress != NULL) {
+        char stream_sanitize_scratch[MAGNUS_PROXY_HEADER_LIMIT + 1];
+        char stream_sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
+        magnus_proxy_response_info_t stream_info;
+        int stream_sanitized_length;
+
+        memcpy(stream_sanitize_scratch, header_copy, header_length + 1);
+        stream_sanitized_length = magnus_proxy_sanitize_response_headers(
+            stream_sanitize_scratch, header_length, stream_sanitized,
+            sizeof(stream_sanitized),
+            connection->proxy_issue_affinity_cookie
+                ? connection->proxy_affinity_key : NULL,
+            connection->proxy_client_wants_close,
+            (size_t) -2 /* streaming: Content-Encoding/Vary, no
+                         * Content-Length, forces Connection: close --
+                         * see magnus_proxy_sanitize_response_headers()'s
+                         * own doc comment */,
+            magnus_encoding_name(connection->proxy_accept_encoding),
+            &stream_info, NULL);
+        if (stream_sanitized_length < 0) {
+            magnus_stream_compress_end(connection->proxy_stream_compress);
+            connection->proxy_stream_compress = NULL;
+            free(connection->proxy_stream_compress_outbuf);
+            connection->proxy_stream_compress_outbuf = NULL;
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
+        }
+        connection->proxy_header_out = malloc((size_t) stream_sanitized_length);
+        if (connection->proxy_header_out == NULL) {
+            magnus_stream_compress_end(connection->proxy_stream_compress);
+            connection->proxy_stream_compress = NULL;
+            free(connection->proxy_stream_compress_outbuf);
+            connection->proxy_stream_compress_outbuf = NULL;
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
+        }
+        memcpy(connection->proxy_header_out, stream_sanitized,
+              (size_t) stream_sanitized_length);
+        connection->proxy_header_out_length = (size_t) stream_sanitized_length;
+        connection->proxy_header_out_sent = 0;
+        connection->proxy_stream_compress_outbuf_length = 0;
+        connection->proxy_stream_compress_outbuf_sent = 0;
+    } else if (!try_compress) {
         connection->proxy_header_out = malloc((size_t) sanitized_length);
         if (connection->proxy_header_out == NULL)
             return magnus_proxy_connect_failed(epoll_fd, connection, 502,
@@ -2918,7 +3161,16 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
         connection->proxy_buffer_sent = 0;
     }
     connection->proxy_headers_received = true;
-    connection->close_after_write = !info.keep_client_alive;
+    /* Roadmap 2a-10: info here is still the *first*, uncompressed-framing
+     * sanitize call's own (the streaming path's real client-facing
+     * headers came from a second, separate call above) -- its own
+     * keep_client_alive reflects the *upstream's* original framing, not
+     * whether this connection is actually emitting a Content-Length to
+     * the client, so it is overridden unconditionally whenever streaming
+     * compression is active, exactly matching the "Connection: close"
+     * text that second call already wrote into proxy_header_out. */
+    connection->close_after_write = connection->proxy_stream_compress != NULL
+        ? true : !info.keep_client_alive;
     connection->proxy_upstream_poolable = info.upstream_poolable;
     connection->proxy_has_response_length = info.has_content_length;
     connection->proxy_response_length = info.content_length;
