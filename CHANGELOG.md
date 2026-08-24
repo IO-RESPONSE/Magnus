@@ -1,5 +1,124 @@
 # Changelog
 
+## 1.51.0
+
+### Added
+
+- **FastCGI dispatch (roadmap 5a-1) -- Phase 5's own first slice,
+  and the first Phase 5 increment of any kind.** Relays a matched
+  `action=fastcgi` route to a real FastCGI application server
+  (PHP-FPM et al.) over the original FastCGI Specification's own
+  binary record protocol, the same protocol every real web-server
+  integration still speaks unchanged. Deliberately narrow, following
+  this codebase's own "narrow the first cut, extend later" pattern
+  every other upstream-protocol dispatch (proxy, gRPC) already used:
+  HTTP/1.1 GET/HEAD only, no request body relayed (`CONTENT_LENGTH`
+  always `"0"`), one fresh, non-pooled connection per request (no
+  pooling/retry/affinity/caching/active health probing yet -- passive
+  circuit-breaker health via the existing cluster machinery still
+  works generically), and the whole upstream response is buffered
+  before any translation happens (matches how proxy dispatch
+  compression itself started, before 2a-7 through 2a-14 later added
+  streaming as its own distinct increment) -- which also means every
+  upstream-side failure this first slice can hit (connect failure,
+  read failure, malformed record, truncation) is answered with a
+  clean, synthesized 502/504, since nothing has ever reached the
+  client yet.
+
+  New protocol module, `src/magnus_fastcgi.h`/`.c`: pure wire-format
+  encode/decode helpers with no I/O of their own (mirrors
+  `magnus_proxy.h`/`.c`'s own "framing only" scope) -- record
+  header read/write, `BEGIN_REQUEST` body, name-value pair encoding
+  for `PARAMS`, and `magnus_fastcgi_translate_headers()`, which turns
+  a CGI-shaped response (RFC 3875 6: an optional `Status: NNN
+  [reason]` line, ordinary headers, a blank line, then the body) into
+  a real HTTP/1.1 response -- `Content-Length` is always the real,
+  already-known body size (never whatever the application itself
+  claimed), `Connection` always reflects the client's own original
+  preference (never passed through from the application), and any
+  `Status`/`Content-Length`/`Connection` header the application sent
+  is consumed rather than relayed.
+
+  `magnus.c` gains a dedicated, non-shared cluster
+  (`magnus_fastcgi_cluster`, round-robin only, same "not a shared
+  namespace" precedent gRPC's own `magnus_grpc_cluster` already
+  established), a dedicated fd-ownership table, and dedicated
+  `--fastcgi-upstream`/`fastcgi_upstream` (CLI/config) plus
+  `--fastcgi-root`/`fastcgi_root` (the FastCGI equivalent of nginx's
+  own `fastcgi_param SCRIPT_FILENAME
+  $document_root$fastcgi_script_name;`) surfaces. A new route action,
+  `action=fastcgi`, dispatches through
+  `magnus_fastcgi_pick_and_start()`, which builds the whole outbound
+  byte stream up front (`BEGIN_REQUEST` + one `PARAMS` record + the
+  empty `PARAMS`/`STDIN` terminators -- there is no body to stream
+  for this first slice's GET-only scope) and opens a non-blocking
+  connect; `magnus_fastcgi_handle_upstream()` drives connect
+  completion, sending, and receiving/parsing off the main epoll loop,
+  the same three-stage shape `magnus_handle_upstream()` already has
+  for the ordinary HTTP/1.x proxy path.
+
+  One real bug found and fixed before this shipped: the access-log
+  line for a completed FastCGI request originally hardcoded
+  `request.status = 200` regardless of what the application server
+  actually returned -- a `Status: 201`/`404`/etc. response still
+  reached the client correctly (the real status line was already
+  right), but every access-log entry for it read `status=200`
+  anyway. Fixed by having `magnus_fastcgi_translate_headers()` report
+  the real, parsed status back to its caller via a new `unsigned
+  *out_status` parameter, rather than the caller re-deriving it a
+  second time.
+
+  New unit test `tests/test-fastcgi.c` covers the protocol module in
+  isolation: record header roundtrip (including version-byte
+  rejection), `BEGIN_REQUEST` body encoding, name-value encoding in
+  both the 1-byte and 4-byte (>= 128 bytes) length forms plus a
+  too-small-buffer failure, header/body boundary detection for both
+  `\r\n\r\n` and bare `\n\n` (and the "not yet complete" case), and
+  `magnus_fastcgi_translate_headers()` across a default-200 response,
+  an explicit `Status:` override with reason phrase, a `Status:` line
+  with no reason (defaults to "OK"), a malformed `Status:` code, and
+  an output buffer too small to hold the result.
+
+  Verified end-to-end against a real PHP-FPM 8.3.31 backend (not a
+  hand-rolled mock, consistent with this codebase's standing
+  practice): a real PHP script executing via GET with a query string
+  (`$_GET`/`$_SERVER['REQUEST_METHOD']`/`QUERY_STRING` all correct),
+  an application-set response header passed through, a `Status: 201
+  Created` override honored, PHP-FPM's own "File not found." 404 for
+  a missing script translated correctly, `Connection: keep-alive`
+  (proven via curl's own `--next`, `num_connects: 0`) and an explicit
+  `Connection: close` both honored, HEAD correctly returning an empty
+  body (PHP-FPM's own CGI SAPI suppresses body output for `REQUEST_
+  METHOD=HEAD`, not a Magnus-side special case), a clean synchronized
+  502 when PHP-FPM is stopped mid-test (and clean recovery once it
+  restarts), and a client aborting mid-request. `make test` (twice,
+  clean) and direct ASan/UBSan testing of the live server (repeated
+  requests across every case above, 20 concurrent requests, an
+  upstream-down 502 path, and a client-abort path, zero findings) --
+  `make sanitize`'s own wrapped run was not used this time, since the
+  known pre-existing h2 stream-flood ASan-timing flake would have hit
+  before ever reaching this increment's own code anyway (same
+  reasoning 2a-14 already documented).
+
+  While iterating, `test-core.sh` again hit its own well-established
+  intermittent failure -- the same "cuts off right before the
+  reverse-proxy cache block, no crash/ASan signature at all, different
+  run each time" pattern already A/B-verified as pre-existing
+  environmental flakiness during 2a-14 (see that entry below). It
+  reproduced twice more during this increment's own testing (once
+  concurrently with an in-flight `make clean`/ASan rebuild -- discarded
+  outright as unreliable rather than treated as evidence either way --
+  and once from a fully clean, sequential `make test`), and a
+  standalone `bash tests/test-core.sh` retry passed cleanly through
+  the identical spot both times, the same signature this session has
+  now seen and confirmed pre-existing many times over.
+
+  A categorically new roadmap phase (Phase 5) starting from this
+  increment -- see docs/development-roadmap.md for the fuller list of
+  what is still ahead (request-body/POST support, SCGI, uWSGI,
+  connection pooling, Runtime API expansion, zero-downtime binary
+  upgrade).
+
 ## 1.50.0
 
 ### Added

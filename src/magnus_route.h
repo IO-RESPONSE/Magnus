@@ -60,7 +60,16 @@ typedef enum {
      * matching this action is answered with an explicit error instead of
      * silently falling through to proxy/static (see
      * magnus_dispatch_request()). */
-    MAGNUS_ROUTE_ACTION_GRPC
+    MAGNUS_ROUTE_ACTION_GRPC,
+    /* FastCGI dispatch (roadmap 5a-1, Phase 5's own first slice):
+     * relays to a FastCGI application server (PHP-FPM et al.) over its
+     * own binary record protocol -- a categorically different upstream
+     * protocol from the ordinary action=proxy path's raw HTTP/1.x
+     * relay, the same reasoning action=grpc already established its
+     * own dedicated cluster/dispatch machinery for. HTTP/1.1 only for
+     * this first slice (see magnus_route_parse()'s own comment on the
+     * exact GET-only, no-request-body scope). */
+    MAGNUS_ROUTE_ACTION_FASTCGI
 } magnus_route_action_t;
 
 typedef struct {
@@ -83,7 +92,7 @@ typedef struct {
 /* Parses one `route = ...` config value into `out`: semicolon-separated
  * conditions (each `key=value`, or `key:subkey=value` for header/
  * header_prefix/cookie/query, which need a field name as well as an
- * expected value) plus exactly one `action=proxy|deny|static|grpc`, plus
+ * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi`, plus
  * an optional `cache=on|off` modifier (roadmap 2d-1; only valid alongside
  * `action=proxy` -- see magnus_route_t's own `cache_enabled` field), in
  * any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with

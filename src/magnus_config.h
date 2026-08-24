@@ -18,6 +18,12 @@
  * has far fewer distinct backend clusters than a general reverse-proxy
  * fleet might, so 8 is generous without copying the 16 bound blindly. */
 #define MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS 8
+/* FastCGI dispatch (roadmap 5a-1): the same "own pool, not a shared
+ * namespace" reasoning as MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own -- a
+ * FastCGI application-server tier (PHP-FPM et al.) is typically one or
+ * a small handful of distinct pools, not a general reverse-proxy
+ * fleet's worth. */
+#define MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS 8
 /* TLS passthrough / SNI routing (roadmap 3b): a modest cap on the number
  * of *distinct patterns*, matching MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own
  * "a real deployment has far fewer of these than the main upstream list"
@@ -97,6 +103,23 @@ typedef struct {
      * ordinary one. Targeted only by a route with action=grpc. */
     size_t grpc_upstream_count;
     magnus_config_upstream_t grpc_upstreams[MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS];
+    /* FastCGI dispatch (roadmap 5a-1, Phase 5's own first slice): same
+     * ipv4:port[:weight] shape/validation as grpc_upstreams above (a
+     * hostname entry is rejected here too, for the identical "DNS
+     * resolution is not wired up for this cluster" reason), targeted
+     * only by a route with action=fastcgi. fastcgi_root is this
+     * cluster's own DOCUMENT_ROOT -- the base directory
+     * SCRIPT_FILENAME is computed against (fastcgi_root + the
+     * request's own path), exactly the way every real FastCGI web-
+     * server integration (nginx's own `fastcgi_param SCRIPT_FILENAME
+     * $document_root$fastcgi_script_name;`, in particular) already
+     * does; required whenever fastcgi_upstream is present, the same
+     * "requires X" pairing stream_listen/stream_upstream already
+     * have. */
+    size_t fastcgi_upstream_count;
+    magnus_config_upstream_t fastcgi_upstreams[MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS];
+    bool has_fastcgi_root;
+    char fastcgi_root[MAGNUS_CONFIG_PATH_MAX];
     /* L4 TCP passthrough (roadmap 3a): a second, independent listener that
      * never goes through magnus_http_parse() at all -- raw bytes relayed
      * bidirectionally to whichever endpoint stream_lb_policy picks, with

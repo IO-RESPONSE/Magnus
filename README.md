@@ -118,6 +118,21 @@ independently by IORESPONSE.
   TCP+h2 handshake per RPC -- pool for parallelism, multiplex for
   overflow once the pool is warm; a connection recycles gracefully after
   a request-count/idle budget or on GOAWAY/a fatal I/O error
+- FastCGI dispatch: a route with `action=fastcgi` relays to a real
+  FastCGI application server (PHP-FPM et al.) over the original
+  FastCGI Specification's own binary record protocol
+  (`fastcgi_upstream=`/`--fastcgi-upstream`, its own separate cluster,
+  IPv4-literal only; `fastcgi_root=`/`--fastcgi-root` for computing
+  `SCRIPT_FILENAME`, the FastCGI equivalent of nginx's own
+  `fastcgi_param SCRIPT_FILENAME
+  $document_root$fastcgi_script_name;`). Deliberately narrow first
+  slice: HTTP/1.1 GET/HEAD only, no request body relayed, one fresh,
+  non-pooled connection per request. `Content-Length`/`Connection` on
+  the translated response are always real (recomputed from the actual
+  body, decided from the client's own preference), never whatever the
+  application itself sent; an application `Status: NNN [reason]` line
+  sets the real status/reason, defaulting to 200 OK when absent, per
+  CGI convention
 - Reverse-proxy response cache: a bounded, in-memory, LRU-evicted cache
   shared by both the HTTP/1.1 and HTTP/2 proxy dispatch paths (one cache;
   a response stored via one protocol is servable to the other), opt-in

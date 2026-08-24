@@ -1445,6 +1445,32 @@ connection-pool and common-request-model decisions).
   old-process drain) touches `magnusd`'s supervision model directly and
   should be designed together with a review of the existing SIGHUP-reload
   atomicity guarantees, not bolted on separately.
+  **5a-1 (FastCGI dispatch, HTTP/1.1 GET/HEAD only, no request body, one
+  connection per request -- no pooling/retry/affinity/caching/active
+  health probing yet, the same deliberately narrow first cut every other
+  upstream-protocol dispatch in this codebase began from) shipped in
+  1.51.0** — new `src/magnus_fastcgi.h`/`.c` protocol module (record
+  encode/decode + CGI-response-to-HTTP/1.1 translation, no I/O of its
+  own, mirroring `magnus_proxy.h`/`.c`'s own framing-only scope), a
+  dedicated `magnus_fastcgi_cluster` (round-robin only, same
+  not-a-shared-namespace precedent gRPC's own cluster already
+  established), `--fastcgi-upstream`/`fastcgi_upstream` and
+  `--fastcgi-root`/`fastcgi_root` (config's FastCGI equivalent of
+  nginx's own `fastcgi_param SCRIPT_FILENAME
+  $document_root$fastcgi_script_name;`), and a new `action=fastcgi`
+  route action. Verified end-to-end against a real PHP-FPM 8.3.31
+  backend (query strings, application-set headers, a `Status:` override,
+  PHP-FPM's own 404-for-missing-script, keep-alive/close framing, HEAD,
+  a clean 502 on upstream failure, a client-abort mid-request) plus a
+  new `tests/test-fastcgi.c` unit test for the protocol module in
+  isolation and direct ASan/UBSan testing of the live server — see
+  `CHANGELOG.md` 1.51.0 for the one real bug this increment found and
+  fixed along the way (the access-log line originally hardcoded
+  `status=200` regardless of the application's real response status).
+  Still ahead for Phase 5: FastCGI request-body/POST support, connection
+  pooling/retry/affinity for FastCGI (parity with what proxy/gRPC
+  dispatch already have), SCGI, uWSGI, Runtime API expansion, and the
+  zero-downtime binary upgrade mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously

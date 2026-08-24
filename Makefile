@@ -29,7 +29,8 @@ LDLIBS ?= -lssl -lcrypto -lpthread -lnghttp2 -lz -lzstd -lbrotlienc \
 
 SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_compression.c \
-           src/magnus_config.c src/magnus_dns.c src/magnus_h2.c \
+           src/magnus_config.c src/magnus_dns.c src/magnus_fastcgi.c \
+           src/magnus_h2.c \
            src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
            src/magnus_proxy.c src/magnus_quic.c src/magnus_realip.c \
            src/magnus_route.c src/magnus_sni.c src/magnus_ws.c
@@ -88,7 +89,8 @@ build/magnusctl: src/magnusctl.c src/magnus_config.c src/magnus_config.h \
 test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
 		build/test-base64 build/test-compression build/test-realip \
-		build/test-cache build/test-sni build/quic-handshake-check \
+		build/test-cache build/test-sni build/test-fastcgi \
+		build/quic-handshake-check \
 		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2 \
 		build/fuzz-base64 build/fuzz-compression build/fuzz-realip \
 		build/fuzz-sni
@@ -105,6 +107,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-realip
 	./build/test-cache
 	./build/test-sni
+	./build/test-fastcgi
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
@@ -143,6 +146,10 @@ build/test-route: tests/test-route.c src/magnus_route.c src/magnus_route.h \
 build/test-cache: tests/test-cache.c src/magnus_cache.c src/magnus_cache.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-cache.c src/magnus_cache.c -o $@
+
+build/test-fastcgi: tests/test-fastcgi.c src/magnus_fastcgi.c src/magnus_fastcgi.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-fastcgi.c src/magnus_fastcgi.c -o $@
 
 build/test-dns: tests/test-dns.c src/magnus_dns.c src/magnus_dns.h
 	mkdir -p build
