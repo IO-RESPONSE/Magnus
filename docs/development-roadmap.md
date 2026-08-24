@@ -808,6 +808,56 @@ connection-pool and common-request-model decisions).
       dispatch response, across HTTP/1.1/HTTP/2/HTTP/3, and gzip/zstd/
       Brotli, now streams past the 8 MiB buffer-then-compress bound.
       See `CHANGELOG.md` 1.48.0 for the full detail.
+    - **2a-13 — a real HTTP/1.1 `Transfer-Encoding: chunked` response
+      writer. Shipped in 1.49.0.** This codebase's first -- the
+      follow-up 2a-7's own doc comment always named as a natural next
+      step, once a real chunked writer existed to build on (2a-7 itself
+      deliberately chose the narrower close-delimited option to ship
+      its own first slice without building one). Each produced chunk is
+      framed *in place*, per RFC 9112 7.1, with no extra copy of the
+      data itself: a fixed-width, zero-padded 5-hex-digit chunk-size
+      header (`magnus_chunk_header()`, `MAGNUS_CHUNK_HEADER_SIZE` --
+      five digits comfortably covers up to 0xFFFFF, well past
+      `MAGNUS_STREAM_COMPRESS_CHUNK`'s own 0x10000 maximum, so it can
+      never overflow) is written into a small reserved prefix
+      immediately before wherever the real chunk data already landed,
+      followed by its own trailing CRLF; the fixed 5-byte last-chunk
+      (`"0\r\n\r\n"`, no trailer section -- this codebase never has one
+      to send) is appended directly after the final real chunk's own
+      trailing CRLF the moment the underlying producer reports done,
+      all in the same buffer fill (`MAGNUS_CHUNK_FRAME_OVERHEAD` is the
+      total extra capacity a chunk-framing buffer must reserve: header
+      + data trailer + last-chunk = 7 + 2 + 5 = 14, rounded up to 16).
+      This meant the existing "drain output, then finish once done"
+      loop shape every streaming write loop in `magnus.c` already has
+      needed no other change to support chunked framing -- the write
+      loop neither knows nor cares that what it is draining is now
+      chunk-framed rather than raw bytes, the same way it never needed
+      to know the bytes were compressed at all.
+
+      Applied to 2a-7's own HTTP/1.1 static-file streaming-compressed
+      responses: `magnus_prepare_streaming_compressed_file_response()`
+      now emits `Transfer-Encoding: chunked` and a real `Connection: %s`
+      reflecting the client's own stated preference (`close_connection`,
+      previously an unused parameter -- the response always forced
+      `Connection: close` before), so these responses keep the
+      connection alive afterward exactly like any other response here,
+      instead of always closing. 2a-10's own HTTP/1.1 proxy-dispatch
+      streaming-compressed responses remain close-delimited for now --
+      a natural next application of the same writer, not yet wired in.
+
+      Verified: a 9 MB (well past the 8 MiB bound) static file
+      compresses correctly via gzip/zstd/Brotli and decodes byte-exact
+      through curl's own transparent chunked-decoding, with
+      `Transfer-Encoding: chunked` and `Connection: keep-alive` present
+      and no `Content-Length`; a follow-up request over the same
+      connection right after (curl's own `--next`, `num_connects: 0`)
+      confirms the connection genuinely stays alive; an explicit
+      client-requested `Connection: close` is still honored, not
+      silently overridden. `make test` (twice) and a full `make
+      sanitize` run (ASan/UBSan, the whole suite including this
+      increment's own updated test-core.sh assertions) both clean.
+      See `CHANGELOG.md` 1.49.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

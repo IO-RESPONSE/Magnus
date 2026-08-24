@@ -451,7 +451,27 @@ independently by IORESPONSE.
   is exactly why this one needed a live trace (not just review) to
   catch. Fixed by gating that call on the compressor itself being done,
   not merely on a chunk having been produced.
-- Container image: 10,726,359 bytes (~10.23 MiB), non-root, read-only rootfs
+- A real HTTP/1.1 `Transfer-Encoding: chunked` response writer (roadmap
+  2a-13) -- this codebase's first, the follow-up 2a-7's own doc comment
+  always named as a natural next step. Each produced chunk is framed
+  *in place* (RFC 9112 7.1: a fixed-width, zero-padded 5-hex-digit
+  chunk-size header written into a small reserved prefix immediately
+  before wherever the real chunk data already landed, no extra copy of
+  it, plus its own trailing CRLF), and the fixed 5-byte last-chunk
+  (`"0\r\n\r\n"`, no trailer section) is appended directly after the
+  final real chunk's own trailing CRLF the moment the underlying
+  producer reports done -- all in the same buffer fill, so the existing
+  "drain output, then finish once done" loop shape every streaming
+  write loop in `magnus.c` already had needed no other change to
+  support it. Applied to 2a-7's own HTTP/1.1 static-file streaming-
+  compressed responses, which now keep the connection alive afterward
+  (per the client's own stated preference) instead of always closing,
+  the same as any other response here -- verified via curl's own
+  `--next`, reusing the same connection for a follow-up request
+  (`num_connects: 0`). 2a-10's own HTTP/1.1 proxy-dispatch streaming-
+  compressed responses remain close-delimited for now, a natural next
+  application of the same writer
+- Container image: 10,726,475 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

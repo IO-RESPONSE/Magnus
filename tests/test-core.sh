@@ -1918,16 +1918,35 @@ head -c 9000000 /dev/urandom | base64 >"$compression_root/streaming.html"
 stream_size=$(wc -c <"$compression_root/streaming.html")
 test "$stream_size" -gt $((8 * 1024 * 1024))
 
+# Roadmap 2a-13: a real Transfer-Encoding: chunked writer means this
+# response keeps the connection alive afterward now, same as any other
+# response here -- proven below via curl's own --next reusing the same
+# connection for a second, ordinary request right after the streamed
+# one (num_connects reported as 0 for that second request), the same
+# proof 2a-8's own h2 streaming block already uses.
 stream_gzip_headers="$web_root/stream-gzip.headers"
-curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
-  --dump-header "$stream_gzip_headers" \
+stream_reuse_status=$(curl --http1.1 --insecure --fail --silent \
+  -H 'Accept-Encoding: gzip' --dump-header "$stream_gzip_headers" \
   --output "$web_root/stream.out.gz" \
-  "https://127.0.0.1:$port_compression/streaming.html"
+  "https://127.0.0.1:$port_compression/streaming.html" \
+  --next --insecure --fail --silent --output /dev/null \
+  --write-out '%{num_connects}' \
+  "https://127.0.0.1:$port_compression/healthz")
+test "$stream_reuse_status" = '0'
 grep -qi '^content-encoding: gzip' "$stream_gzip_headers"
 grep -qi '^vary: Accept-Encoding' "$stream_gzip_headers"
-grep -qi '^connection: close' "$stream_gzip_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_gzip_headers"
+grep -qi '^connection: keep-alive' "$stream_gzip_headers"
 ! grep -qi '^content-length:' "$stream_gzip_headers"
 gzip -dc "$web_root/stream.out.gz" | cmp "$compression_root/streaming.html" -
+
+# An explicit client-requested close is still honored (not silently
+# forced to keep-alive regardless of what the client asked for).
+stream_close_headers="$web_root/stream-close.headers"
+curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  -H 'Connection: close' --dump-header "$stream_close_headers" \
+  --output /dev/null "https://127.0.0.1:$port_compression/streaming.html"
+grep -qi '^connection: close' "$stream_close_headers"
 
 stream_zstd_headers="$web_root/stream-zstd.headers"
 curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
@@ -1935,6 +1954,7 @@ curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
   --output "$web_root/stream.out.zst" \
   "https://127.0.0.1:$port_compression/streaming.html"
 grep -qi '^content-encoding: zstd' "$stream_zstd_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_zstd_headers"
 ! grep -qi '^content-length:' "$stream_zstd_headers"
 zstd -dc "$web_root/stream.out.zst" | cmp "$compression_root/streaming.html" -
 
@@ -1944,6 +1964,7 @@ curl --http1.1 --insecure --fail --silent -H 'Accept-Encoding: br' \
   --output "$web_root/stream.out.br" \
   "https://127.0.0.1:$port_compression/streaming.html"
 grep -qi '^content-encoding: br' "$stream_brotli_headers"
+grep -qi '^transfer-encoding: chunked' "$stream_brotli_headers"
 ! grep -qi '^content-length:' "$stream_brotli_headers"
 brotli -dc "$web_root/stream.out.br" | cmp "$compression_root/streaming.html" -
 
@@ -1971,11 +1992,13 @@ grep -qi "^content-length: $stream_size" "$stream_head_headers"
 
 # Roadmap 2a-8: the same streaming compression, over HTTP/2 --
 # magnus_h2_dispatch_static_streaming()'s own doc comment explains why
-# no Connection: close/no-keep-alive workaround is needed here at all
-# (no protocol requires a Content-Length ahead of a DATA-frame
-# response), confirmed below by reusing the same connection for a
-# second, ordinary request right after the streamed one via curl's own
-# --next. Reuses streaming.html from the HTTP/1.1 block above --
+# it never needed a workaround at all to keep the connection alive
+# afterward, unlike HTTP/1.1's own 2a-7 (no protocol requires a
+# Content-Length ahead of a DATA-frame response -- 2a-13 is what later
+# let HTTP/1.1 catch up, via a real Transfer-Encoding: chunked writer),
+# confirmed below by reusing the same connection for a second, ordinary
+# request right after the streamed one via curl's own --next. Reuses
+# streaming.html from the HTTP/1.1 block above --
 # same fixture, same server instance, still running.
 h2_stream_headers="$web_root/h2-stream.headers"
 curl --http2 --insecure --fail --silent -H 'Accept-Encoding: gzip' \

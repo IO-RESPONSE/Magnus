@@ -75,7 +75,26 @@
  * (proxy_stream_compress_inbuf) for the not-yet-compressed raw bytes
  * recv() delivers, and all three simply wait for the next upstream
  * read when they run out of input, rather than fetching more
- * themselves the way a pread()-backed loop safely could.
+ * themselves the way a pread()-backed loop safely could. 2a-13 (magnus.c):
+ * this codebase's first real HTTP/1.1 `Transfer-Encoding: chunked`
+ * response writer (RFC 9112 7.1) -- the follow-up 2a-7's own doc
+ * comment always named as a natural next step, once it existed to
+ * build on. Every produced chunk is framed *in place*, no extra copy
+ * of the data itself: a fixed-width, zero-padded 5-hex-digit chunk-
+ * size header is written into a small reserved prefix immediately
+ * before wherever the real chunk data already landed, followed by its
+ * own trailing CRLF, and the fixed 5-byte last-chunk ("0\r\n\r\n", no
+ * trailer section) gets appended directly after the final real chunk's
+ * own trailing CRLF the moment the underlying producer reports done --
+ * all in the same buffer fill, so the existing "drain output, then
+ * finish once done" loop shape every streaming write loop in magnus.c
+ * already has needed no other change to support it. Applied to 2a-7's
+ * own HTTP/1.1 static-file streaming-compressed responses, which now
+ * keep the connection alive afterward (per the client's own stated
+ * preference) instead of always closing, same as any other response
+ * here. 2a-10's own HTTP/1.1 proxy-dispatch streaming-compressed
+ * responses remain close-delimited for now -- a natural next
+ * application of the same writer, not yet wired in.
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -88,14 +107,6 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - a real HTTP/1.1 `Transfer-Encoding: chunked` response writer,
- *     which would let 2a-7's own streaming-compressed responses keep
- *     the connection alive afterward instead of always closing -- 2a-7
- *     deliberately chose the narrower of the two ways to frame a
- *     response with no Content-Length known ahead of time (RFC 9112
- *     6.3 permits either), reusing every existing byte-writing
- *     primitive unchanged rather than building this codebase's first
- *     chunked writer just to ship the first slice
  *   - PROXY protocol v1/v2 for QUIC: genuinely has no analogue here
  *     (no raw preamble concept once ngtcp2/nghttp3 have already framed
  *     a stream's headers, unlike a plain TCP byte stream) -- Forwarded/
@@ -120,7 +131,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.48.0"
+#define MAGNUS_VERSION "1.49.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.49.0
+
+### Added
+
+- **A real HTTP/1.1 `Transfer-Encoding: chunked` response writer
+  (roadmap 2a-13) -- this codebase's first.** The follow-up 2a-7's own
+  doc comment always named as a natural next step: 2a-7 deliberately
+  chose the narrower close-delimited framing (`Connection: close`, RFC
+  9112 6.3) to ship its own first streaming-compression slice without
+  building a chunked writer just for that; this is that writer.
+
+  Each produced chunk is framed *in place*, per RFC 9112 7.1, with no
+  extra copy of the data itself: a fixed-width, zero-padded 5-hex-digit
+  chunk-size header (`magnus_chunk_header()`, using the new
+  `MAGNUS_CHUNK_HEADER_SIZE` constant -- five digits comfortably covers
+  up to 0xFFFFF, well past `MAGNUS_STREAM_COMPRESS_CHUNK`'s own 0x10000
+  maximum, so it can never overflow) is written into a small reserved
+  prefix immediately before wherever the real chunk data already
+  landed (the streaming compressor already writes its own output
+  starting at that offset), followed by its own trailing CRLF. The
+  fixed 5-byte last-chunk (`"0\r\n\r\n"`, no trailer section -- this
+  codebase never has one to send) is appended directly after the final
+  real chunk's own trailing CRLF the moment the underlying producer
+  reports done, all within the same buffer fill (the new
+  `MAGNUS_CHUNK_FRAME_OVERHEAD` constant is the total extra capacity a
+  chunk-framing output buffer must reserve on top of its own real data
+  capacity: header + data trailer + last-chunk = 7 + 2 + 5 = 14,
+  rounded up to 16). This meant the existing "drain output, then finish
+  once done" loop shape every streaming write loop in `magnus.c`
+  already has needed no other change at all to support chunked framing
+  -- the write loop neither knows nor cares that what it is draining to
+  the socket is chunk-framed rather than raw bytes, the same way it
+  never needed to know those bytes were compressed in the first place.
+
+  Applied to 2a-7's own HTTP/1.1 static-file streaming-compressed
+  responses: `magnus_prepare_streaming_compressed_file_response()` now
+  emits `Transfer-Encoding: chunked` and a real `Connection: %s`
+  reflecting the client's own stated preference (the `close_connection`
+  parameter, previously accepted but unused -- the response always
+  forced `Connection: close` regardless before this), so these
+  responses keep the connection alive afterward exactly like any other
+  response in this codebase, instead of always closing. 2a-10's own
+  HTTP/1.1 proxy-dispatch streaming-compressed responses remain
+  close-delimited for now -- a natural next application of the same
+  writer, not yet wired in.
+
+  Verified: a 9 MB (well past the 8 MiB bound) static file compresses
+  correctly via gzip/zstd/Brotli and decodes byte-exact through curl's
+  own transparent chunked-decoding, with `Transfer-Encoding: chunked`
+  and `Connection: keep-alive` present and no `Content-Length`; a
+  follow-up request issued over the same connection right after (curl's
+  own `--next`, reporting `num_connects: 0` for that second request)
+  confirms the connection genuinely stays alive rather than merely
+  claiming to; an explicit client-requested `Connection: close` is
+  still honored, not silently overridden regardless of what the client
+  asked for. `make test` (twice, including this increment's own updated
+  `test-core.sh` assertions) and a full `make sanitize` run (ASan/UBSan,
+  the entire suite) both clean.
+
 ## 1.48.0
 
 ### Fixed

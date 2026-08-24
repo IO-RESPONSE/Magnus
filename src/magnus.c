@@ -81,6 +81,26 @@
 #define MAGNUS_PROXY_HEADER_LIMIT MAGNUS_PROXY_BUFFER
 #define MAGNUS_PROXY_SANITIZED_LIMIT 4096
 #define MAGNUS_PROXY_MAX_ATTEMPTS 2
+/* HTTP/1.1 chunked response writer (RFC 9112 7.1), roadmap 2a-13 --
+ * this codebase's first: each real chunk is framed as a zero-padded
+ * 5-hex-digit chunk-size (MAGNUS_CHUNK_HEADER_SIZE bytes, "%05zx\r\n" --
+ * five digits comfortably covers up to 0xFFFFF, well past
+ * MAGNUS_STREAM_COMPRESS_CHUNK's own 0x10000 maximum, so it can never
+ * overflow) written into a reserved prefix immediately before wherever
+ * the real chunk data already lives (no extra copy of it), followed by
+ * a trailing CRLF; the stream ends with a fixed 5-byte last-chunk,
+ * "0\r\n\r\n" (RFC 9112 7.1's own last-chunk with no trailer section --
+ * this codebase never has one to send), appended directly after the
+ * final real chunk's own trailing CRLF the moment the underlying
+ * producer reports done, all in the same buffer fill, so the ordinary
+ * "drain outbuf, then finish once done" loop shape every streaming
+ * write loop in this file already has needs no other change to
+ * support chunked framing. MAGNUS_CHUNK_FRAME_OVERHEAD (header + data
+ * trailer + last-chunk = 7 + 2 + 5 = 14, rounded up to 16) is the
+ * extra capacity a chunk-framing output buffer must reserve on top of
+ * however many real data bytes it is sized to hold. */
+#define MAGNUS_CHUNK_HEADER_SIZE 7
+#define MAGNUS_CHUNK_FRAME_OVERHEAD 16
 /* TLS passthrough / SNI routing (roadmap 3b): how long a stream
  * connection may sit in MAGNUS_STREAM_PEEKING before giving up and
  * falling back to the default stream_upstream cluster -- the same
@@ -3620,6 +3640,35 @@ magnus_open_static(const char *target, struct stat *metadata)
     return fd;
 }
 
+/* Roadmap 2a-13: writes exactly MAGNUS_CHUNK_HEADER_SIZE bytes --
+ * "%05zx\r\n" -- describing a chunk of `data_length` real data bytes,
+ * into `out` (which must have at least MAGNUS_CHUNK_HEADER_SIZE + 1
+ * bytes available; snprintf's own trailing NUL lands one byte past the
+ * 7 bytes this function actually cares about, deliberately not written
+ * into the caller's real buffer -- see this function's own two call
+ * sites, which always format into a small stack scratch array first,
+ * then memcpy just the 7 formatted bytes into position, rather than
+ * formatting directly into the shared output buffer and risking that
+ * trailing NUL landing on the first byte of real chunk data). Callers
+ * still own writing the chunk data itself and its own trailing CRLF --
+ * this only ever produces the fixed-width header, so the *data* can
+ * already be sitting wherever the real producer (a compressor, a raw
+ * copy, whatever) wrote it, with zero extra copying of that data. */
+static void
+magnus_chunk_header(size_t data_length, char out[MAGNUS_CHUNK_HEADER_SIZE + 1])
+{
+    /* Formats into a generously-sized scratch buffer, not `out` itself,
+     * purely so the compiler's own -Wformat-truncation can statically
+     * see "%05zx\r\n" can never truncate regardless of data_length's
+     * value -- every real caller keeps data_length within
+     * MAGNUS_STREAM_COMPRESS_CHUNK (well under 5 hex digits' worth), so
+     * the meaningful 7 bytes this function actually promises are always
+     * exactly what gets copied into `out`. */
+    char scratch[32];
+    (void) snprintf(scratch, sizeof(scratch), "%05zx\r\n", data_length);
+    memcpy(out, scratch, MAGNUS_CHUNK_HEADER_SIZE);
+}
+
 /* Roadmap 2a-7: the streaming-compression analogue of magnus_prepare_
  * file_response() above, for a static file past MAGNUS_COMPRESSION_
  * MAX_SIZE that would otherwise always relay uncompressed (that
@@ -3638,21 +3687,20 @@ magnus_open_static(const char *target, struct stat *metadata)
  * No Content-Length is ever known ahead of time here -- the whole
  * reason this needs its own response-framing decision, not just a
  * different body-writing loop, unlike every other compression path in
- * this codebase. RFC 9112 6.3 permits a response with neither Content-
- * Length nor Transfer-Encoding: chunked as long as the connection
- * closes once the body ends, which is exactly what `Connection: close`
- * plus close_after_write below declares and honors -- deliberately
- * close-delimited framing rather than a first chunked-encoding writer,
- * the narrower of the two real options and the one that reuses every
- * byte-writing primitive (magnus_socket_write(), the same partial-
- * write/EAGAIN handling every other loop in magnus_handle_write()
- * already has) unchanged. A real Transfer-Encoding: chunked writer
- * (recovering keep-alive for these responses) is a natural follow-up,
- * not a silently missing correctness gap -- see CHANGELOG.md's own
- * 2a-7 entry. HEAD requests are deliberately excluded (falls through
- * to false): an accurate Content-Length is exactly what compressing
- * the whole file would be needed to answer, defeating HEAD's own point
- * of not transferring the body to find that out. */
+ * this codebase. Roadmap 2a-7 originally chose close-delimited framing
+ * (`Connection: close`, RFC 9112 6.3) here rather than building this
+ * codebase's first `Transfer-Encoding: chunked` writer -- the narrower
+ * of the two real options at the time, reusing every existing byte-
+ * writing primitive unchanged. Roadmap 2a-13 is that follow-up:
+ * MAGNUS_CHUNK_HEADER_SIZE/MAGNUS_CHUNK_FRAME_OVERHEAD/magnus_chunk_
+ * header() (this file's own top) frame each produced chunk in place,
+ * so this response keeps the connection alive afterward (per the
+ * client's own stated preference, `close_connection`) exactly like any
+ * other response here does, instead of always closing. HEAD requests
+ * are deliberately excluded (falls through to false): an accurate
+ * Content-Length is exactly what compressing the whole file would be
+ * needed to answer, defeating HEAD's own point of not transferring the
+ * body to find that out. */
 static bool
 magnus_prepare_streaming_compressed_file_response(
     magnus_connection_t *connection, int file_fd, const struct stat *metadata,
@@ -3662,7 +3710,6 @@ magnus_prepare_streaming_compressed_file_response(
     int written;
     const char *content_type = magnus_content_type(request->path);
     magnus_encoding_t encoding;
-    (void) close_connection; /* this path always closes -- see doc comment */
     if (head_only || metadata->st_size <= MAGNUS_COMPRESSION_MAX_SIZE
         || !magnus_content_type_compressible(content_type))
         return false;
@@ -3672,7 +3719,8 @@ magnus_prepare_streaming_compressed_file_response(
     connection->stream_compress = magnus_stream_compress_begin(encoding);
     if (connection->stream_compress == NULL) return false;
     connection->stream_compress_inbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
-    connection->stream_compress_outbuf = malloc(MAGNUS_STREAM_COMPRESS_CHUNK);
+    connection->stream_compress_outbuf
+        = malloc(MAGNUS_STREAM_COMPRESS_CHUNK + MAGNUS_CHUNK_FRAME_OVERHEAD);
     if (connection->stream_compress_inbuf == NULL
         || connection->stream_compress_outbuf == NULL) {
         magnus_stream_compress_end(connection->stream_compress);
@@ -3688,10 +3736,11 @@ magnus_prepare_streaming_compressed_file_response(
     (void) magnus_phase_run(&magnus_phases, MAGNUS_PHASE_RESPONSE, request);
     written = snprintf(connection->output, sizeof(connection->output),
         "HTTP/1.1 200 OK\r\nServer: Magnus/%s\r\nContent-Type: %s\r\n"
-        "Content-Encoding: %s\r\nVary: Accept-Encoding\r\nConnection: close\r\n"
+        "Content-Encoding: %s\r\nVary: Accept-Encoding\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: %s\r\n"
         "X-Magnus-Engine: native-c17/0.1\r\nX-Magnus-Request-Id: %s\r\n\r\n",
         MAGNUS_VERSION, content_type, magnus_encoding_name(encoding),
-        request->request_id);
+        close_connection ? "close" : "keep-alive", request->request_id);
     if (written < 0 || (size_t) written >= sizeof(connection->output)) {
         magnus_stream_compress_end(connection->stream_compress);
         connection->stream_compress = NULL;
@@ -3706,7 +3755,7 @@ magnus_prepare_streaming_compressed_file_response(
     }
     connection->output_length = (size_t) written;
     connection->output_sent = 0;
-    connection->close_after_write = true;
+    connection->close_after_write = close_connection;
     connection->stream_compress_fd = file_fd;
     connection->stream_compress_file_offset = 0;
     connection->stream_compress_done = false;
@@ -9342,7 +9391,21 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
      * the file if the input staging buffer is empty and the file isn't
      * fully read yet; (4) feed whatever input is available (zero bytes,
      * with finish=true, once the file is fully read) into the
-     * compressor for one more step. */
+     * compressor for one more step. Roadmap 2a-13: stream_compress_
+     * outbuf holds RFC 9112 7.1 chunk-*framed* bytes from here on, not
+     * raw compressed output -- magnus_stream_compress_step() is handed
+     * an offset MAGNUS_CHUNK_HEADER_SIZE bytes into it (the reserved
+     * chunk-size-header prefix magnus_chunk_header() fills in right
+     * after, once `produced` is actually known) instead of its own
+     * start, and this file's own trailing CRLF (plus the fixed 5-byte
+     * last-chunk, "0\r\n\r\n", the moment done is also true) get
+     * appended directly after -- see this file's own top comment on
+     * MAGNUS_CHUNK_FRAME_OVERHEAD for why the buffer has room for all
+     * of that beyond MAGNUS_STREAM_COMPRESS_CHUNK's own worth of real
+     * data. Sub-state (1)'s own drain loop below is otherwise
+     * unchanged: it neither knows nor cares that what it is writing is
+     * chunk-framed rather than raw bytes, the same way it already
+     * never needed to know this was compressed output at all. */
     while (connection->stream_compress != NULL) {
         if (connection->stream_compress_outbuf_sent
             < connection->stream_compress_outbuf_length) {
@@ -9400,19 +9463,34 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
             size_t consumed = 0;
             size_t produced = 0;
             bool done = false;
+            unsigned char *outbuf = connection->stream_compress_outbuf;
             bool ok = magnus_stream_compress_step(connection->stream_compress,
                 connection->stream_compress_inbuf
                     + connection->stream_compress_inbuf_sent,
                 connection->stream_compress_inbuf_length
                     - connection->stream_compress_inbuf_sent,
                 connection->stream_compress_input_eof, &consumed,
-                connection->stream_compress_outbuf,
-                MAGNUS_STREAM_COMPRESS_CHUNK, &produced, &done);
+                outbuf + MAGNUS_CHUNK_HEADER_SIZE, MAGNUS_STREAM_COMPRESS_CHUNK,
+                &produced, &done);
             if (!ok) return -1;
             connection->stream_compress_inbuf_sent += consumed;
-            connection->stream_compress_outbuf_length = produced;
-            connection->stream_compress_outbuf_sent = 0;
             connection->stream_compress_done = done;
+            connection->stream_compress_outbuf_sent = 0;
+            connection->stream_compress_outbuf_length = 0;
+            if (produced > 0) {
+                char header[MAGNUS_CHUNK_HEADER_SIZE + 1];
+                magnus_chunk_header(produced, header);
+                memcpy(outbuf, header, MAGNUS_CHUNK_HEADER_SIZE);
+                outbuf[MAGNUS_CHUNK_HEADER_SIZE + produced] = '\r';
+                outbuf[MAGNUS_CHUNK_HEADER_SIZE + produced + 1] = '\n';
+                connection->stream_compress_outbuf_length
+                    = MAGNUS_CHUNK_HEADER_SIZE + produced + 2;
+            }
+            if (done) {
+                memcpy(outbuf + connection->stream_compress_outbuf_length,
+                      "0\r\n\r\n", 5);
+                connection->stream_compress_outbuf_length += 5;
+            }
         }
     }
     if (connection->file_fd >= 0) {
