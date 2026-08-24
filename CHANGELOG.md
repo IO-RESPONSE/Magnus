@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.52.0
+
+### Added
+
+- **FastCGI request-body/POST support (roadmap 5a-2).** Lifts 5a-1's
+  original GET/HEAD-only, no-request-body restriction: any HTTP
+  method matching an `action=fastcgi` route is now dispatched, and
+  whatever body `magnus_begin_body()`/`magnus_continue_body()` already
+  buffered generically ahead of dispatch (the same pre-dispatch
+  buffering every route gets, bounded by the same `MAGNUS_MAX_BODY` 1
+  MiB cap `action=proxy` already relays under) is relayed to the
+  FastCGI application server as one or more `STDIN` records -- split
+  at `MAGNUS_FASTCGI_MAX_CONTENT_LENGTH` (65535 bytes, a single
+  record's own 16-bit content-length ceiling) since a large body can
+  exceed what one record can carry, terminated by the usual empty
+  `STDIN` record. `CONTENT_LENGTH` is now the real buffered body size
+  (previously always the literal string `"0"`), and a new
+  `CONTENT_TYPE` metavariable forwards the client's own `Content-Type`
+  header when present -- essential for a relayed body to mean
+  anything to a real application (PHP's own `$_POST`, in particular,
+  is populated only when this is set to a form encoding it
+  recognizes); every other CGI metavariable is unchanged, and
+  forwarding arbitrary `HTTP_*` headers generically remains a
+  distinct, later increment, same scope boundary the CGI spec itself
+  draws between `CONTENT_TYPE`/`CONTENT_LENGTH` and the rest.
+
+  Unlike the ordinary HTTP/1.x proxy dispatch path's own asynchronous
+  body-relay loop (which keeps `connection->body` alive until fully
+  sent to the upstream, since it references rather than copies it),
+  FastCGI dispatch builds and sends its whole request as one buffer in
+  one shot -- so `magnus_fastcgi_build_request()` copies the body into
+  the outbound `STDIN` record(s) synchronously and frees
+  `connection->body` immediately afterward, rather than deferring that
+  to some later asynchronous point. `magnus_dispatch_request()`'s 405
+  Method Not Allowed check now exempts `action=fastcgi` routes the
+  same way it already exempts `action=proxy` and `action=grpc`.
+
+  Verified against a real PHP-FPM 8.3.31 backend: a form-encoded POST
+  correctly populating `$_POST` and `php://input`, a JSON body with an
+  explicit `Content-Type: application/json`, a 200000-byte body
+  correctly split across and reassembled from 4 `STDIN` records, an
+  empty `Content-Length: 0` POST, a GET-route regression check (5a-1's
+  own scope unaffected), a clean synchronized 502 when PHP-FPM is
+  stopped mid-POST with clean recovery once it restarts, and the
+  pre-existing generic 413 Payload Too Large for a body over
+  `MAGNUS_MAX_BODY` (unchanged -- enforced ahead of dispatch, the same
+  as every other route). `make test` (twice, clean) and direct
+  ASan/UBSan testing of the live server (every case above plus 20
+  concurrent POSTs, zero findings) both clean.
+
 ## 1.51.0
 
 ### Added

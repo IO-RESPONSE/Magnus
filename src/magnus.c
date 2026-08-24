@@ -561,11 +561,15 @@ typedef struct {
      * own binary record protocol -- see src/magnus_fastcgi.h for the
      * wire-framing helpers this uses, and magnus_fastcgi_pick_and_
      * start()'s own doc comment for the full request/response shape
-     * and this first slice's own deliberate scope (HTTP/1.1 GET only,
-     * no request body, one connection per request -- no pooling/
-     * retry/affinity/caching yet, the same narrow starting point every
-     * other upstream-protocol dispatch in this codebase began from
-     * before later increments layered those on). Kept entirely
+     * and this codebase's own deliberate scope (HTTP/1.1 only, one
+     * connection per request -- no pooling/retry/affinity/caching yet,
+     * the same narrow starting point every other upstream-protocol
+     * dispatch in this codebase began from before later increments
+     * layered those on; roadmap 5a-2 lifted the original 5a-1 GET-only,
+     * no-request-body restriction -- any method/body magnus_begin_
+     * body()/magnus_continue_body() already buffered generically ahead
+     * of dispatch is relayed the same way proxy dispatch's own body
+     * relay is). Kept entirely
      * separate from the proxy_* / is_proxy fields above (a categorically
      * different upstream protocol, the same reasoning gRPC's own
      * dedicated field set already established) rather than shared. */
@@ -8720,18 +8724,35 @@ magnus_fastcgi_fail(int epoll_fd, magnus_connection_t *connection,
     return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
 }
 
-/* Roadmap 5a-1: builds the whole outbound FastCGI byte stream --
- * BEGIN_REQUEST, one PARAMS record (this first slice's own CGI
+/* Roadmap 5a-1/5a-2: builds the whole outbound FastCGI byte stream --
+ * BEGIN_REQUEST, one PARAMS record (this codebase's own CGI
  * metavariable set never comes close to needing more than one, see
  * MAGNUS_FASTCGI_MAX_CONTENT_LENGTH's own 64 KiB ceiling), the empty
- * PARAMS record terminating the params stream, and an empty STDIN
- * record (no request body forwarded yet -- GET only, this first
- * slice's own deliberate scope) -- into connection->fastcgi_out, ready
- * to send whole once the upstream connects. Returns false on any
+ * PARAMS record terminating the params stream, zero or more STDIN
+ * records carrying whatever request body magnus_begin_body()/
+ * magnus_continue_body() already fully buffered into connection->body
+ * ahead of dispatch (roadmap 5a-2 -- split across multiple records
+ * only because a single record's own content field is 16 bits wide;
+ * connection->body itself is already bounded by MAGNUS_MAX_BODY, the
+ * same cap every other body-relaying dispatch path in this codebase
+ * already enforces, so this is never more than a handful of records
+ * even at the cap), and the final empty STDIN record terminating the
+ * stdin stream -- into connection->fastcgi_out, ready to send whole
+ * once the upstream connects. The body is copied here, synchronously,
+ * rather than referenced -- unlike the ordinary HTTP/1.x proxy path's
+ * own async body-relay loop, this whole request is one buffer sent in
+ * one shot, so there is no later asynchronous point that would still
+ * need connection->body to survive; it is freed here immediately
+ * after copying; the caller's own `dispatch_result == 1` return still
+ * signals "response completes asynchronously" for logging purposes,
+ * not "body ownership transferred", which is why magnus_dispatch_
+ * request()'s usual magnus_free_body_if_unowned() safety net finding
+ * it already NULL here is expected, not a bug. Returns false on any
  * encoding or allocation failure, in which case connection is left
- * untouched (fastcgi_out stays NULL) and the caller answers 502, same
- * graceful-failure contract every other dispatch path in this codebase
- * already has for its own pre-connect failures. */
+ * untouched (fastcgi_out stays NULL, connection->body untouched) and
+ * the caller answers 502, same graceful-failure contract every other
+ * dispatch path in this codebase already has for its own pre-connect
+ * failures. */
 static bool
 magnus_fastcgi_build_request(magnus_connection_t *connection,
                              const magnus_http_request_t *parsed,
@@ -8744,6 +8765,8 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
     char query_string[256];
     char server_port[8];
     char remote_addr[INET_ADDRSTRLEN];
+    char content_length_text[24];
+    const char *content_type;
     const char *query_mark = strchr(forward_path, '?');
     size_t script_name_length = query_mark != NULL
         ? (size_t) (query_mark - forward_path) : strlen(forward_path);
@@ -8751,6 +8774,7 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
     unsigned char *out;
     size_t offset = 0;
     size_t total;
+    size_t stdin_record_count;
 
     if (script_name_length >= sizeof(script_name)) return false;
     memcpy(script_name, forward_path, script_name_length);
@@ -8767,6 +8791,9 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
     if (inet_ntop(AF_INET, &connection->client_address, remote_addr,
                  sizeof(remote_addr)) == NULL)
         strcpy(remote_addr, "0.0.0.0");
+    snprintf(content_length_text, sizeof(content_length_text), "%zu",
+             connection->body_length);
+    content_type = magnus_http_header_find(parsed, "content-type");
 
 #define MAGNUS_FASTCGI_ADD_NV(nv_name, nv_value) \
     do { \
@@ -8787,7 +8814,17 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
                           parsed->host[0] != '\0' ? parsed->host : "localhost");
     MAGNUS_FASTCGI_ADD_NV("SERVER_PORT", server_port);
     MAGNUS_FASTCGI_ADD_NV("REMOTE_ADDR", remote_addr);
-    MAGNUS_FASTCGI_ADD_NV("CONTENT_LENGTH", "0");
+    MAGNUS_FASTCGI_ADD_NV("CONTENT_LENGTH", content_length_text);
+    /* CONTENT_TYPE is the one HTTP request header this first extension
+     * of the metavariable set forwards -- essential for a body to mean
+     * anything to a real application (PHP's own $_POST, in
+     * particular, is populated only when this is set to a form
+     * encoding it recognizes), and unlike forwarding every HTTP_*
+     * header generically (a distinct, later increment, same scope
+     * boundary the CGI spec itself draws between CONTENT_TYPE/
+     * CONTENT_LENGTH and the rest), tied directly to this increment's
+     * own "make a relayed body actually useful" purpose. */
+    if (content_type != NULL) MAGNUS_FASTCGI_ADD_NV("CONTENT_TYPE", content_type);
     MAGNUS_FASTCGI_ADD_NV("GATEWAY_INTERFACE", "CGI/1.1");
     if (connection->tls != NULL) MAGNUS_FASTCGI_ADD_NV("HTTPS", "on");
 
@@ -8795,7 +8832,12 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
 
     if (params_length > MAGNUS_FASTCGI_MAX_CONTENT_LENGTH) return false;
 
-    total = MAGNUS_FASTCGI_HEADER_LEN * 4 + 8 + params_length;
+    stdin_record_count = connection->body_length == 0 ? 0
+        : (connection->body_length + MAGNUS_FASTCGI_MAX_CONTENT_LENGTH - 1)
+              / MAGNUS_FASTCGI_MAX_CONTENT_LENGTH;
+
+    total = MAGNUS_FASTCGI_HEADER_LEN * (4 + stdin_record_count) + 8
+        + params_length + connection->body_length;
     out = malloc(total);
     if (out == NULL) return false;
 
@@ -8814,20 +8856,49 @@ magnus_fastcgi_build_request(magnus_connection_t *connection,
     magnus_fastcgi_write_header(out + offset, MAGNUS_FASTCGI_PARAMS, 1, 0);
     offset += MAGNUS_FASTCGI_HEADER_LEN;
 
+    {
+        size_t body_sent = 0;
+        while (body_sent < connection->body_length) {
+            size_t chunk = connection->body_length - body_sent
+                < MAGNUS_FASTCGI_MAX_CONTENT_LENGTH
+                ? connection->body_length - body_sent
+                : MAGNUS_FASTCGI_MAX_CONTENT_LENGTH;
+            magnus_fastcgi_write_header(out + offset, MAGNUS_FASTCGI_STDIN, 1,
+                                        chunk);
+            offset += MAGNUS_FASTCGI_HEADER_LEN;
+            memcpy(out + offset, connection->body + body_sent, chunk);
+            offset += chunk;
+            body_sent += chunk;
+        }
+    }
+
     magnus_fastcgi_write_header(out + offset, MAGNUS_FASTCGI_STDIN, 1, 0);
     offset += MAGNUS_FASTCGI_HEADER_LEN;
 
     connection->fastcgi_out = out;
     connection->fastcgi_out_length = offset;
     connection->fastcgi_out_sent = 0;
+
+    /* The body is now fully copied into fastcgi_out above -- see this
+     * function's own doc comment on why it is safe, and expected, to
+     * free it here rather than leaving it for magnus_dispatch_
+     * request()'s usual post-dispatch ownership check. */
+    free(connection->body);
+    connection->body = NULL;
+    connection->body_capacity = 0;
+    connection->body_length = 0;
+    connection->body_needed = 0;
     return true;
 }
 
-/* Roadmap 5a-1 (Phase 5's own first slice): dispatches a matched
- * action=fastcgi route. Builds the whole FastCGI request up front
- * (magnus_fastcgi_build_request() -- there is no body to stream for
- * this first slice's own GET-only scope) and opens a non-blocking,
- * non-pooled connection to the cluster's own next endpoint
+/* Roadmap 5a-1/5a-2: dispatches a matched action=fastcgi route.
+ * Builds the whole FastCGI request up front
+ * (magnus_fastcgi_build_request() -- any request body was already
+ * fully buffered into connection->body ahead of dispatch, the same
+ * generic pre-dispatch buffering every route gets, and is copied
+ * into the request buffer there rather than streamed separately) and
+ * opens a non-blocking, non-pooled connection to the cluster's own
+ * next endpoint
  * (round_robin only, see magnus_fastcgi_cluster's own comment).
  * Returns 0 once that connect attempt (and the request buffer to send
  * once it completes) is in flight -- magnus_fastcgi_handle_upstream()
@@ -9305,11 +9376,13 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "forbidden\n", head_only, close_connection,
                                 &request);
     } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route
-               && !is_grpc_route) {
+               && !is_grpc_route && !is_fastcgi_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
-         * the reverse proxy is the one route that has always been meant
-         * to relay whatever method (and body) the client sent -- see the
-         * is_proxy_route branch below, which is why it is excluded here. */
+         * the reverse proxy and FastCGI dispatch (roadmap 5a-2) are the
+         * routes that have always been meant to relay whatever method
+         * (and body) the client sent -- see the is_proxy_route/
+         * is_fastcgi_route branches below, which is why both are
+         * excluded here. */
         magnus_prepare_response(connection, 405, "Method Not Allowed",
                                 "text/plain", "method not allowed\n", false,
                                 close_connection, &request);
@@ -9348,12 +9421,9 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "h2c)\n", head_only, close_connection,
                                 &request);
     } else if (is_fastcgi_route) {
-        /* GET/HEAD only for this first slice (roadmap 5a-1) -- any other
-         * method matching this route already fell into the 405 branch
-         * above, is_fastcgi_route deliberately not exempted from it the
-         * way is_proxy_route/is_grpc_route are, since this dispatch path
-         * has no request-body support yet to relay a mutating method's
-         * own body with. */
+        /* Any method, with or without a body (roadmap 5a-2) -- see
+         * magnus_fastcgi_build_request()'s own doc comment for how a
+         * buffered request body is relayed as STDIN. */
         int start_result = magnus_fastcgi_pick_and_start(epoll_fd, connection,
                                                           &request, parsed,
                                                           fastcgi_forward_path,

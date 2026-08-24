@@ -61,14 +61,15 @@ typedef enum {
      * silently falling through to proxy/static (see
      * magnus_dispatch_request()). */
     MAGNUS_ROUTE_ACTION_GRPC,
-    /* FastCGI dispatch (roadmap 5a-1, Phase 5's own first slice):
-     * relays to a FastCGI application server (PHP-FPM et al.) over its
-     * own binary record protocol -- a categorically different upstream
-     * protocol from the ordinary action=proxy path's raw HTTP/1.x
-     * relay, the same reasoning action=grpc already established its
-     * own dedicated cluster/dispatch machinery for. HTTP/1.1 only for
-     * this first slice (see magnus_route_parse()'s own comment on the
-     * exact GET-only, no-request-body scope). */
+    /* FastCGI dispatch (roadmap 5a-1/5a-2): relays to a FastCGI
+     * application server (PHP-FPM et al.) over its own binary record
+     * protocol -- a categorically different upstream protocol from the
+     * ordinary action=proxy path's raw HTTP/1.x relay, the same
+     * reasoning action=grpc already established its own dedicated
+     * cluster/dispatch machinery for. HTTP/1.1 only; any method, with
+     * or without a request body (5a-2 lifted 5a-1's original GET-only,
+     * no-body restriction -- see magnus_fastcgi_build_request()'s own
+     * doc comment in magnus.c). */
     MAGNUS_ROUTE_ACTION_FASTCGI
 } magnus_route_action_t;
 

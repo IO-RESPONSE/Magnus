@@ -125,14 +125,18 @@ independently by IORESPONSE.
   IPv4-literal only; `fastcgi_root=`/`--fastcgi-root` for computing
   `SCRIPT_FILENAME`, the FastCGI equivalent of nginx's own
   `fastcgi_param SCRIPT_FILENAME
-  $document_root$fastcgi_script_name;`). Deliberately narrow first
-  slice: HTTP/1.1 GET/HEAD only, no request body relayed, one fresh,
-  non-pooled connection per request. `Content-Length`/`Connection` on
-  the translated response are always real (recomputed from the actual
-  body, decided from the client's own preference), never whatever the
-  application itself sent; an application `Status: NNN [reason]` line
-  sets the real status/reason, defaulting to 200 OK when absent, per
-  CGI convention
+  $document_root$fastcgi_script_name;`). One fresh, non-pooled
+  connection per request (no pooling/retry/affinity yet). Any HTTP
+  method is relayed, with whatever request body was already buffered
+  ahead of dispatch (the same generic pre-dispatch buffering
+  `action=proxy` uses, up to the same 1 MiB cap) sent as one or more
+  `STDIN` records; `CONTENT_LENGTH` is always the real buffered size
+  and `CONTENT_TYPE` forwards the client's own header when present.
+  `Content-Length`/`Connection` on the translated response are always
+  real (recomputed from the actual body, decided from the client's own
+  preference), never whatever the application itself sent; an
+  application `Status: NNN [reason]` line sets the real status/reason,
+  defaulting to 200 OK when absent, per CGI convention
 - Reverse-proxy response cache: a bounded, in-memory, LRU-evicted cache
   shared by both the HTTP/1.1 and HTTP/2 proxy dispatch paths (one cache;
   a response stored via one protocol is servable to the other), opt-in

@@ -1467,10 +1467,22 @@ connection-pool and common-request-model decisions).
   `CHANGELOG.md` 1.51.0 for the one real bug this increment found and
   fixed along the way (the access-log line originally hardcoded
   `status=200` regardless of the application's real response status).
-  Still ahead for Phase 5: FastCGI request-body/POST support, connection
-  pooling/retry/affinity for FastCGI (parity with what proxy/gRPC
-  dispatch already have), SCGI, uWSGI, Runtime API expansion, and the
-  zero-downtime binary upgrade mechanism itself.
+  **5a-2 (FastCGI request-body/POST support) shipped in 1.52.0** --
+  lifts 5a-1's GET/HEAD-only restriction: any method with a body
+  already buffered by the same generic pre-dispatch buffering
+  `action=proxy` uses is now relayed as one or more `STDIN` records
+  (split at the 16-bit per-record content-length ceiling), with a real
+  `CONTENT_LENGTH` and a new `CONTENT_TYPE` metavariable (the one
+  header essential to a relayed body meaning anything to a real
+  application, e.g. PHP's own `$_POST`). Verified against real
+  PHP-FPM: form-encoded POST, JSON body, a 200000-byte body split
+  across 4 records, empty-body POST, and the pre-existing generic 413
+  cap unaffected — see `CHANGELOG.md` 1.52.0.
+
+  Still ahead for Phase 5: connection pooling/retry/affinity for
+  FastCGI (parity with what proxy/gRPC dispatch already have), SCGI,
+  uWSGI, Runtime API expansion, and the zero-downtime binary upgrade
+  mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously
