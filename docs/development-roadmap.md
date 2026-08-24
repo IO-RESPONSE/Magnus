@@ -755,6 +755,59 @@ connection-pool and common-request-model decisions).
       HTTP/3 proxy dispatch streaming compression is now the one
       remaining item on this whole roadmap thread. See `CHANGELOG.md`
       1.47.0 for the full detail.
+    - **2a-12 — streaming proxy dispatch response compression, HTTP/3.
+      Shipped in 1.48.0.** The third and final protocol slice, closing
+      out the whole "streaming/chunked compression above 8 MiB" thread
+      this roadmap has carried since 2a itself. Like HTTP/2, no
+      close-delimited-framing workaround was needed. `struct magnus_
+      quic_stream_t`'s own `body_chunk`/`body_chunk_length`/
+      `body_chunk_offered`/`body_chunk_end_offset`/`body_offered_total`/
+      `body_acked_total`/`nghttp3_wants_resume` fields are reused
+      directly for the compressed output -- the same ACK-gated,
+      one-fresh-allocation-per-chunk discipline every other h3 body
+      source already established (the plain proxy relay, and 2a-9's
+      own static-file streaming) -- with a new dedicated
+      `proxy_stream_compress_inbuf` staging buffer for the not-yet-
+      compressed raw bytes `recv()` delivers, and a new push-driven
+      producer function (`magnus_quic_proxy_stream_compress_response()`)
+      instead of 2a-9's own *pull*-based `read_data` callback shape,
+      since h3's own proxy-dispatch input arrives pushed off the
+      upstream socket rather than pulled on demand from a local file --
+      exactly like 2a-10/2a-11's own HTTP/1.1 and HTTP/2 slices.
+
+      Found and fixed a fourth real bug along this whole thread's way,
+      the most subtle of the four: the new producer function called
+      `magnus_quic_proxy_maybe_complete()` unconditionally whenever it
+      produced *any* compressed chunk, but that shared helper
+      independently re-derives "is this response complete" from raw
+      upstream byte counts alone -- true the instant every raw byte has
+      been *read*, not once the compressor has actually *flushed* (the
+      still-pending `finish=true` call that would truly finish it can
+      remain outstanding at that exact moment, since the producer's own
+      finish flag is computed once per loop iteration and so
+      necessarily lags by one). Calling the helper early marked the
+      response complete while the compressor was still open, so the
+      very next pull reported end-of-stream on a chunk that silently
+      dropped gzip's own trailer and the last still-buffered bytes --
+      every byte actually offered still reached the client correctly,
+      and the byte counts even matched exactly, which is exactly why a
+      live trace (adding temporary instrumentation and reproducing
+      directly), not code review alone, was what actually found it.
+      Fixed by gating the completion call on the compressor itself
+      being done, not merely on a chunk having been produced. Verified:
+      a 9 MB (well past the 8 MiB bound) upstream response now
+      decompresses byte-exact via gzip/zstd/Brotli through a real live
+      HTTP/3 proxy fetch (previously silently truncated for all three);
+      `make test` (twice) and a full `make sanitize` run (ASan/UBSan,
+      the whole suite including this increment's own new test) both
+      clean.
+
+      With 2a-10/2a-11/2a-12 all shipped, this closes out the entire
+      "streaming/chunked compression above 8 MiB" item roadmap 2a
+      itself first deferred -- every combination of static-file/proxy-
+      dispatch response, across HTTP/1.1/HTTP/2/HTTP/3, and gzip/zstd/
+      Brotli, now streams past the 8 MiB buffer-then-compress bound.
+      See `CHANGELOG.md` 1.48.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route

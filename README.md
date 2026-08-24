@@ -420,9 +420,38 @@ independently by IORESPONSE.
   again inside the shared upstream-teardown helper that already owned
   that cleanup -- a genuine double-free, caught by a real heap-
   corruption abort under this increment's own new test, not a
-  sanitizer run. HTTP/3 proxy dispatch streaming compression remains
-  the one item left on this whole roadmap thread
-- Container image: 10,725,558 bytes (~10.23 MiB), non-root, read-only rootfs
+  sanitizer run.
+- Streaming proxy dispatch response compression, HTTP/3 (roadmap 2a-12)
+  -- the third and final protocol slice, closing out the whole
+  "streaming/chunked compression above 8 MiB" thread this project has
+  carried since 2a itself. Like HTTP/2, no close-delimited-framing
+  workaround was needed. `struct magnus_quic_stream_t`'s own
+  `body_chunk`/`body_chunk_length`/`body_chunk_offered`/
+  `body_chunk_end_offset`/`body_offered_total`/`body_acked_total`/
+  `nghttp3_wants_resume` fields are reused directly for the compressed
+  output -- the same ACK-gated, one-fresh-allocation-per-chunk
+  discipline every other h3 body source already established, with a
+  new dedicated staging buffer for not-yet-compressed raw bytes, and a
+  new push-driven producer function (unlike 2a-9's own *pull*-based
+  `read_data` callback, since h3's proxy-dispatch input arrives pushed
+  off the upstream socket, exactly like the HTTP/1.1 and HTTP/2 slices
+  before it).
+
+  Found and fixed a fourth real bug along this whole thread's way, the
+  most subtle of them: the new producer function finalized the
+  response the moment it produced *any* compressed chunk, but the
+  shared completion helper it called independently re-derives "is this
+  response complete" from raw upstream byte counts alone -- true the
+  instant every raw byte has been *read*, not once the compressor has
+  actually *flushed*. Calling it early marked the response complete
+  while the compressor was still open, so the very next pull reported
+  end-of-stream on a chunk that silently dropped gzip's own trailer and
+  the last still-buffered bytes -- every byte actually offered still
+  reached the client correctly and the byte counts even matched, which
+  is exactly why this one needed a live trace (not just review) to
+  catch. Fixed by gating that call on the compressor itself being done,
+  not merely on a chunk having been produced.
+- Container image: 10,726,359 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

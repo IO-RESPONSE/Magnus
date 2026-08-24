@@ -1,5 +1,106 @@
 # Changelog
 
+## 1.48.0
+
+### Fixed
+
+- **A subtle bug found while building this release's own streaming-
+  compression feature: an HTTP/3 proxy-dispatched response could
+  silently truncate its own compressed tail, despite every byte
+  actually sent reaching the client correctly.** The new async
+  producer function (`magnus_quic_proxy_stream_compress_response()`)
+  called `magnus_quic_proxy_maybe_complete()` unconditionally whenever
+  it produced *any* compressed chunk. That shared completion helper
+  independently re-derives "is this response complete" from raw
+  upstream byte counts alone -- true the instant every raw byte has
+  been *read* from the upstream, which is well before the compressor
+  has necessarily *flushed* its own trailing output (a still-pending
+  `finish=true` call that would truly finish it can remain outstanding
+  at that exact moment, since the producer's own finish flag is
+  computed once per loop iteration and so necessarily lags by one
+  iteration behind `response_received` catching up to
+  `response_length`). Calling the helper on that premature signal
+  marked the response complete while `stream->proxy_stream_compress`
+  was still open, which let `magnus_quic_proxy_read_body()` report
+  `NGHTTP3_DATA_FLAG_EOF` on that very chunk -- silently dropping
+  gzip's own trailer (and whatever else the compressor still had
+  buffered) even though every chunk actually offered so far had
+  reached the client byte-exact, and the reported byte counts even
+  matched what was sent. That "everything received matches, yet the
+  gzip stream itself is corrupt" shape made this the most subtle of
+  the four real bugs the whole 2a-10/2a-11/2a-12 streaming-proxy-
+  compression thread turned up -- code review alone did not surface
+  it; adding temporary trace instrumentation and reproducing the exact
+  byte counts directly did. Fixed by gating the completion call on the
+  compressor itself being done (`stream->proxy_stream_compress ==
+  NULL` after `magnus_stream_compress_end()`), not merely on a chunk
+  having been produced. Verified: a 9 MB (well past the 8 MiB bound)
+  upstream response, previously truncated (missing its gzip trailer
+  and roughly the last 2 KB of decompressed content) for all three
+  encodings, now decompresses byte-exact via gzip/zstd/Brotli through
+  a real live HTTP/3 proxy fetch, repeated trials; `make test` (twice)
+  and a full `make sanitize` run (ASan/UBSan, the whole suite including
+  this increment's own new test) both clean.
+
+### Added
+
+- **Streaming proxy dispatch response compression, HTTP/3 (roadmap
+  2a-12) -- the third and final protocol slice, closing out the whole
+  "streaming/chunked compression above 8 MiB" thread this codebase has
+  carried since roadmap 2a itself first deferred it.** Like HTTP/2
+  (2a-11), no close-delimited-framing workaround was needed: HTTP/3
+  never requires a Content-Length ahead of a DATA-frame response
+  either.
+
+  `struct magnus_quic_stream_t`'s own `body_chunk`/`body_chunk_length`/
+  `body_chunk_offered`/`body_chunk_end_offset`/`body_offered_total`/
+  `body_acked_total`/`nghttp3_wants_resume` fields are reused directly
+  for the compressed output here -- the exact same ACK-gated, one-
+  fresh-allocation-per-chunk discipline both the plain proxy relay and
+  2a-9's own static-file streaming already established (nghttp3's own
+  `read_data` contract is the strictest of the three protocols: each
+  offered chunk must be its own independent allocation, kept alive
+  until the *peer has acknowledged* it, not merely handed off). A new
+  dedicated `proxy_stream_compress_inbuf` staging buffer holds the
+  not-yet-compressed raw bytes `recv()` delivers, since they can no
+  longer share `body_chunk` with the compressed output.
+
+  Structurally different from 2a-9's own static-file streaming
+  callback (`magnus_quic_http_read_stream_compressed()`, a *pull*-based
+  `nghttp3_data_reader` that produces a chunk synchronously, on demand,
+  via `pread()`, since a local file read has no "not ready yet" state):
+  this increment's own input only ever arrives *pushed*, asynchronously,
+  off the upstream socket -- exactly like 2a-10/2a-11's own HTTP/1.1 and
+  HTTP/2 slices. So, like those two, this adds a new push-driven
+  producer function instead
+  (`magnus_quic_proxy_stream_compress_response()`), called from every
+  site that would otherwise call the plain relay's own
+  `magnus_quic_proxy_stream_response()` -- the upstream-readable event
+  dispatcher, the acked-stream-data retry callback, and (synchronously,
+  once, for the very first already-known chunk of leftover body bytes)
+  `magnus_quic_proxy_receive_headers()` itself, right after submitting
+  this stream's response headers immediately via the same `(size_t) -2`
+  sentinel 2a-10 added to `magnus_proxy_sanitize_response_headers()`.
+  `magnus_quic_http_acked_stream_data()` was extended to route a
+  streaming-compress proxy stream's own retry to this new function
+  instead of the plain relay's, via a new `proxy_stream_compressing`
+  flag that (unlike `proxy_stream_compress` itself) persists for the
+  rest of the stream's life even after compression finishes, since the
+  final chunk can still be draining/un-acked at that point.
+
+  Verified: a 9 MB (well past the 8 MiB bound) upstream response
+  compresses correctly via gzip/zstd/Brotli through a real live HTTP/3
+  proxy fetch, byte-exact after decoding, with no `Content-Length`
+  header present, and the server keeps answering normally right
+  afterward; `make test` (twice, including the pre-existing buffer-
+  then-compress proxy dispatch regression block, unaffected) and a
+  full `make sanitize` run (ASan/UBSan, the entire suite) both clean.
+
+  With this, every combination of static-file/proxy-dispatch response,
+  across HTTP/1.1/HTTP/2/HTTP/3, and gzip/zstd/Brotli, now streams past
+  the 8 MiB buffer-then-compress bound -- see `src/magnus_quic.h`'s own
+  "deliberately still not here" list, now down to just 0-RTT.
+
 ## 1.47.0
 
 ### Fixed

@@ -5283,6 +5283,52 @@ grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-brotli-out"
 tail -n +6 "$web_root/quic-compress-proxy-brotli-out" | brotli -dc \
   | diff - "$compress_proxy_root/page.html"
 
+# Streaming proxy dispatch response compression, HTTP/3 (roadmap 2a-12):
+# the third and final protocol slice, closing out the whole "streaming/
+# chunked compression above 8 MiB" thread that began with 2a-7's own
+# static-file HTTP/1.1 increment. Like h2 (2a-11), no close-delimited-
+# framing workaround was needed -- h3 never requires a Content-Length
+# ahead of a DATA-frame response either. Reuses stream.html (already
+# created past the 8 MiB bound by the HTTP/1.1 streaming-compress block
+# above) from this same compress_proxy_root the upstream above serves.
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/stream.html gzip \
+  > "$web_root/quic-compress-proxy-stream-gzip-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-stream-gzip-out"
+grep -qE '^content-encoding: gzip$' "$web_root/quic-compress-proxy-stream-gzip-out"
+grep -qiE '^vary: Accept-Encoding$' "$web_root/quic-compress-proxy-stream-gzip-out"
+! grep -q '^content-length:' "$web_root/quic-compress-proxy-stream-gzip-out"
+tail -n +6 "$web_root/quic-compress-proxy-stream-gzip-out" | gunzip \
+  | diff - "$compress_proxy_root/stream.html"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/stream.html zstd \
+  > "$web_root/quic-compress-proxy-stream-zstd-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-stream-zstd-out"
+grep -qE '^content-encoding: zstd$' "$web_root/quic-compress-proxy-stream-zstd-out"
+! grep -q '^content-length:' "$web_root/quic-compress-proxy-stream-zstd-out"
+tail -n +6 "$web_root/quic-compress-proxy-stream-zstd-out" | zstd -dc \
+  | diff - "$compress_proxy_root/stream.html"
+
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /proxy/stream.html br \
+  > "$web_root/quic-compress-proxy-stream-brotli-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-stream-brotli-out"
+grep -qE '^content-encoding: br$' "$web_root/quic-compress-proxy-stream-brotli-out"
+! grep -q '^content-length:' "$web_root/quic-compress-proxy-stream-brotli-out"
+tail -n +6 "$web_root/quic-compress-proxy-stream-brotli-out" | brotli -dc \
+  | diff - "$compress_proxy_root/stream.html"
+
+# A follow-up plain request confirms the server keeps answering normally
+# right after a streamed proxy response, the same stability check every
+# earlier streaming-compression block in this file already runs (see
+# 2a-9's own h3 static-file block for the caveat on what this does and
+# does not prove about connection reuse over QUIC).
+"$project_dir/build/quic-handshake-check" 127.0.0.1 \
+  "$port_quic_compress_proxy_udp" /healthz - \
+  > "$web_root/quic-compress-proxy-stream-healthz-out"
+grep -qE '^status: 200$' "$web_root/quic-compress-proxy-stream-healthz-out"
+
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
