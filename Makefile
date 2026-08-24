@@ -95,7 +95,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/quic-handshake-check \
 		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2 \
 		build/fuzz-base64 build/fuzz-compression build/fuzz-realip \
-		build/fuzz-sni
+		build/fuzz-sni build/fuzz-fastcgi build/fuzz-scgi build/fuzz-uwsgi
 	./build/test-http
 	./build/test-policy
 	./build/test-proxy
@@ -120,6 +120,9 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/fuzz-compression
 	./build/fuzz-realip
 	./build/fuzz-sni
+	./build/fuzz-fastcgi
+	./build/fuzz-scgi
+	./build/fuzz-uwsgi
 	./tests/test-core.sh
 	./tests/test-control-plane.sh
 
@@ -236,6 +239,18 @@ build/test-sni: tests/test-sni.c src/magnus_sni.c src/magnus_sni.h
 build/fuzz-sni: tests/fuzz-sni.c src/magnus_sni.c src/magnus_sni.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-sni.c src/magnus_sni.c -o $@
+
+build/fuzz-fastcgi: tests/fuzz-fastcgi.c src/magnus_fastcgi.c src/magnus_fastcgi.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-fastcgi.c src/magnus_fastcgi.c -o $@
+
+build/fuzz-scgi: tests/fuzz-scgi.c src/magnus_scgi.c src/magnus_scgi.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-scgi.c src/magnus_scgi.c -o $@
+
+build/fuzz-uwsgi: tests/fuzz-uwsgi.c src/magnus_uwsgi.c src/magnus_uwsgi.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/fuzz-uwsgi.c src/magnus_uwsgi.c -o $@
 
 # Standalone QUIC/HTTP-3 client (Phase 4 regression coverage,
 # tests/test-core.sh drives it against a running magnus) -- not a unit

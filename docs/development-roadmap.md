@@ -1614,6 +1614,27 @@ connection-pool and common-request-model decisions).
   to the end. What's left genuinely for a dedicated Phase 6 is the
   cross-cutting audit once all protocol surfaces exist.
 
+  **6a-1 (fuzz coverage for Phase 5's own three new parsers) shipped in
+  1.60.0** -- the first concrete gap this cross-cutting audit found:
+  FastCGI/SCGI/uwsgi dispatch (5a/5b/5c) shipped without the fuzz
+  target every other parser in this codebase got the moment it was
+  written. New `tests/fuzz-fastcgi.c` (record header decode + the CGI-
+  response translator shared by both FastCGI and SCGI dispatch),
+  `tests/fuzz-uwsgi.c` (uwsgi's own genuinely distinct HTTP-status-line
+  response parser), `tests/fuzz-scgi.c` (SCGI's own request-encoding
+  primitives). 200k iterations in `make test`, 4M+ and a direct ASan/
+  UBSan run separately for each -- zero findings, closing the gap
+  itself rather than finding a bug this time -- see `CHANGELOG.md`
+  1.60.0.
+
+  Still ahead for Phase 6: the rest of the cross-cutting audit (the
+  original master prompt's own Section 8.1 attack-list/Section 10
+  benchmark-ladder text is not preserved in this repo, only referenced
+  by section number from `development-roadmap.md` itself, so later
+  Phase 6 increments reconstruct that scope directly against standard
+  web-gateway attack classes and this codebase's own accumulated real-
+  bug history rather than a literal external checklist).
+
 ## 4. Module structure
 
 `magnus.c` at 2,467 lines is still one file handling the reactor, HTTP/1

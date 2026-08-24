@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.60.0
+
+### Added
+
+- **Fuzz coverage for Phase 5's three new protocol parsers (roadmap
+  6a-1) -- Phase 6's first increment.** Every parser this codebase has
+  ever added, from Phase 1 onward, got its own fuzz target the moment
+  it was written -- except FastCGI/SCGI/uwsgi dispatch (5a/5b/5c),
+  which shipped without one. Closed now that Phase 5 itself is done
+  and Phase 6's own cross-cutting audit is the natural next pass:
+
+  - New `tests/fuzz-fastcgi.c`: `magnus_fastcgi_read_header()` (the
+    8-byte binary record header) and `magnus_fastcgi_find_body()`/
+    `magnus_fastcgi_translate_headers()` together (the CGI-shaped
+    response body) -- the highest-value target of the three, since
+    this exact translation function is shared by *both* FastCGI
+    dispatch and SCGI dispatch (SCGI reuses it directly rather than
+    duplicating the parsing logic), and parses genuinely untrusted-
+    adjacent input: whatever a compromised or simply buggy upstream
+    application server sends back. Also fuzzes the output buffer
+    capacity itself, not just the input, exercising the "too small,
+    must fail cleanly" path across many more shapes than the existing
+    single dedicated unit test case in `tests/test-fastcgi.c` covers.
+  - New `tests/fuzz-uwsgi.c`: `magnus_uwsgi_translate_headers()` -- a
+    genuinely new, hand-written parser (unlike SCGI, uwsgi dispatch's
+    own response side does *not* reuse the FastCGI translator, since a
+    real uWSGI server's response starts with an actual HTTP status
+    line rather than a CGI `Status:` one -- see `CHANGELOG.md` 1.57.0)
+    that manually scans a "HTTP/&lt;version&gt; &lt;status&gt;
+    [reason]" first line byte by byte, exactly the kind of hand-rolled
+    logic most worth fuzzing. `magnus_uwsgi_encode_var()` (the
+    request-building direction) is also covered.
+  - New `tests/fuzz-scgi.c`: `magnus_scgi_encode_nv()`/`magnus_scgi_
+    write_netstring_prefix()` -- SCGI dispatch's own response side has
+    no separate parser to fuzz (it reuses `magnus_fastcgi_find_body()`/
+    `translate_headers()`, already covered above), so this covers its
+    own two request-building primitives instead, for completeness.
+
+  200000 iterations clean in `make test` (matching every sibling
+  target's own bar) for all three, plus 4,000,000+ iterations and a
+  direct ASan/UBSan run verified separately for each -- zero findings
+  across the board (a clean pass here is still real signal: it means
+  this codebase's own long-standing "every parser gets fuzzed" bar is
+  now actually met for Phase 5's own additions, not that a bug was
+  found and fixed this time). `make test` twice clean.
+
 ## 1.59.0
 
 ### Added
