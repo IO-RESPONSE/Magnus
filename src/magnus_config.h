@@ -24,6 +24,10 @@
  * a small handful of distinct pools, not a general reverse-proxy
  * fleet's worth. */
 #define MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS 8
+/* SCGI dispatch (roadmap 5b-1): same reasoning as MAGNUS_CONFIG_MAX_
+ * FASTCGI_UPSTREAMS's own -- an SCGI application-server tier is
+ * typically one or a small handful of distinct pools. */
+#define MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS 8
 /* TLS passthrough / SNI routing (roadmap 3b): a modest cap on the number
  * of *distinct patterns*, matching MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own
  * "a real deployment has far fewer of these than the main upstream list"
@@ -120,6 +124,17 @@ typedef struct {
     magnus_config_upstream_t fastcgi_upstreams[MAGNUS_CONFIG_MAX_FASTCGI_UPSTREAMS];
     bool has_fastcgi_root;
     char fastcgi_root[MAGNUS_CONFIG_PATH_MAX];
+    /* SCGI dispatch (roadmap 5b-1, Phase 5's second upstream protocol):
+     * same ipv4:port[:weight] shape/validation, and the identical
+     * "requires X" root pairing, as fastcgi_upstreams/fastcgi_root just
+     * above -- targeted only by a route with action=scgi. scgi_root
+     * plays the same DOCUMENT_ROOT role fastcgi_root does (see magnus_
+     * scgi.h's own top comment for why SCGI's own response translation
+     * is not duplicated a second time under this name). */
+    size_t scgi_upstream_count;
+    magnus_config_upstream_t scgi_upstreams[MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS];
+    bool has_scgi_root;
+    char scgi_root[MAGNUS_CONFIG_PATH_MAX];
     /* L4 TCP passthrough (roadmap 3a): a second, independent listener that
      * never goes through magnus_http_parse() at all -- raw bytes relayed
      * bidirectionally to whichever endpoint stream_lb_policy picks, with

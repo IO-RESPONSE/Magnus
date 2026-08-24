@@ -119,18 +119,26 @@ const char *magnus_fastcgi_find_body(const char *data, size_t length,
  * identical format to magnus_proxy_sanitize_response_headers()'s own,
  * so a client that bounces between action=proxy and action=fastcgi
  * routes on the same origin still gets one consistent cookie shape.
- * Returns the number of bytes written to `out` (excluding the NUL
- * terminator), or -1 if a Status: line's own numeric code is
- * malformed, or `out` is too small. `*out_status` is set to the real
- * status code decided (200 when no Status: line was present) whenever
- * a non-negative value is returned -- the caller's own access-log line
- * needs the real code, not just the bytes written, and re-deriving it
- * a second time from `out` would mean re-parsing what this function
- * already parsed once. */
+ * `via` is written verbatim as the X-Magnus-Via header's value --
+ * despite the function's own name, this same CGI-response-shaped
+ * translation is reused as-is for action=scgi (roadmap 5b-1, see
+ * magnus_scgi.h's own top comment on why), and the two protocols are
+ * not interchangeable enough for a client-visible diagnostic header to
+ * hardcode one of their names regardless of which actually served the
+ * request -- the caller passes its own ("magnus-fastcgi/0.1" or
+ * "magnus-scgi/0.1"). Returns the number of bytes written to `out`
+ * (excluding the NUL terminator), or -1 if a Status: line's own
+ * numeric code is malformed, or `out` is too small. `*out_status` is
+ * set to the real status code decided (200 when no Status: line was
+ * present) whenever a non-negative value is returned -- the caller's
+ * own access-log line needs the real code, not just the bytes written,
+ * and re-deriving it a second time from `out` would mean re-parsing
+ * what this function already parsed once. */
 int magnus_fastcgi_translate_headers(const char *header_text,
                                      size_t header_text_length,
                                      size_t body_length, bool close_connection,
                                      const char *affinity_cookie_value,
+                                     const char *via,
                                      char *out, size_t out_capacity,
                                      unsigned *out_status);
 

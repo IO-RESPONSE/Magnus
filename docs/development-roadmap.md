@@ -1521,7 +1521,31 @@ connection-pool and common-request-model decisions).
   connection, not just the same endpoint, gets reused) -- see
   `CHANGELOG.md` 1.55.0.
 
-  Still ahead for Phase 5: SCGI, uWSGI, Runtime API expansion, and the
+  **5b-1 (SCGI dispatch) shipped in 1.56.0** -- Phase 5's second
+  upstream protocol, a wider first cut than 5a-1's own original scope:
+  any method with or without a request body, and connect/read timeout
+  enforcement, both included from the start rather than deferred (SCGI
+  mandates `CONTENT_LENGTH` as its very first header regardless, so
+  GET-only would have been an artificial restriction, not a natural
+  one; timeout enforcement's own absence was already a real bug 5a-4
+  found and fixed once, not worth knowingly reintroducing into a second
+  protocol path). Retry and connection pooling (5a-3/5a-4's own
+  equivalents) are still genuinely deferred. New `src/magnus_scgi.h`/
+  `.c` covers only what SCGI needs of its own (netstring header-block
+  framing) -- its response translation reuses `magnus_fastcgi_find_
+  body()`/`magnus_fastcgi_translate_headers()` directly rather than
+  duplicating that already-generic CGI-response parsing under a second
+  name. Found and fixed a real bug along the way: `magnus_fastcgi_
+  translate_headers()` hardcoded `X-Magnus-Via: magnus-fastcgi/0.1`
+  regardless of caller, so every SCGI response was misidentifying
+  itself as FastCGI's until a `via` parameter was added. Verified
+  against a real SCGI backend: `Status:` overrides, 404-equivalents,
+  GET/HEAD/POST with bodies up to 200000 bytes, a clean `502` against a
+  down endpoint, a clean `504` at exactly the 10-second read timeout
+  against a deliberately hanging one (not a hang), 50 concurrent
+  requests, zero ASan/UBSan findings -- see `CHANGELOG.md` 1.56.0.
+
+  Still ahead for Phase 5: uWSGI, Runtime API expansion, and the
   zero-downtime binary upgrade mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and

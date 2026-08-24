@@ -149,6 +149,7 @@ magnus_fastcgi_translate_headers(const char *header_text,
                                  size_t header_text_length,
                                  size_t body_length, bool close_connection,
                                  const char *affinity_cookie_value,
+                                 const char *via,
                                  char *out, size_t out_capacity,
                                  unsigned *out_status)
 {
@@ -226,8 +227,9 @@ magnus_fastcgi_translate_headers(const char *header_text,
 
     written = snprintf(out + total, out_capacity - total,
                        "Content-Length: %zu\r\nConnection: %s\r\n"
-                       "X-Magnus-Via: magnus-fastcgi/0.1\r\n",
-                       body_length, close_connection ? "close" : "keep-alive");
+                       "X-Magnus-Via: %s\r\n",
+                       body_length, close_connection ? "close" : "keep-alive",
+                       via);
     if (written < 0 || (size_t) written >= out_capacity - total) return -1;
     total += (size_t) written;
 

@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.56.0
+
+### Added
+
+- **SCGI dispatch (roadmap 5b-1) -- Phase 5's second upstream protocol
+  after FastCGI (5a), and a wider first cut than 5a-1's own original
+  scope.** New protocol module `src/magnus_scgi.h`/`.c`: just the two
+  primitives SCGI actually needs of its own (`magnus_scgi_encode_nv()`
+  for the NUL-terminated name/value header pairs, `magnus_scgi_write_
+  netstring_prefix()` for the "`<length>:`" netstring framing wrapping
+  the whole header block) -- SCGI's own response shape is identical CGI
+  framing to FastCGI's, so `magnus_fastcgi_find_body()`/`magnus_fastcgi_
+  translate_headers()` are reused directly rather than duplicated under
+  a second name, the same "share the generic piece, keep the
+  protocol-specific state separate" precedent `MAGNUS_AFFINITY_COOKIE_
+  NAME` already set. A dedicated `magnus_scgi_cluster` (round-robin
+  only, its own endpoint-index namespace, never shared with `magnus_
+  fastcgi_cluster`/`magnus_grpc_cluster`), `--scgi-upstream`/
+  `scgi_upstream` and `--scgi-root`/`scgi_root` (config's SCGI
+  equivalent of `fastcgi_root`), and a new `action=scgi` route action.
+
+  Unlike 5a-1's own original GET/HEAD-only, no-body first cut, this
+  increment supports any method with or without a request body from
+  the start: SCGI's own protocol mandates `CONTENT_LENGTH` as literally
+  the first header of every request regardless, so there is no
+  narrower request shape to start from the way there was for FastCGI.
+  Connect/read timeout enforcement (`MAGNUS_SCGI_CONNECT_TIMEOUT_
+  SECONDS`/`MAGNUS_SCGI_READ_TIMEOUT_SECONDS`, `magnus_scgi_expire()`)
+  is likewise included from this first cut rather than a later
+  increment, for the same reason: 5a-4 already found and fixed a real
+  "stalled upstream hangs the client indefinitely" gap in the identical
+  shape of code, so shipping that same known gap a second time into a
+  new protocol path only to fix it again later would not have been a
+  deliberately narrow scope, just a known bug reintroduced. Retry and
+  connection pooling (5a-3/5a-4's own FastCGI equivalents) are still
+  genuinely deferred -- those are capability layers, not a safety net
+  every dispatch path needs unconditionally the way a timeout is.
+  SCGI's own protocol semantics also simplified one piece versus
+  FastCGI: there is no framing to parse on the response side at all (no
+  record headers to decode), and no end-of-response marker either
+  (unlike `FCGI_END_REQUEST`) -- completion is always signaled by the
+  upstream itself closing the connection, which `magnus_scgi_handle_
+  upstream()` treats as a clean finish once the CGI header/body
+  boundary has actually appeared in what was received.
+
+  A real bug was found and fixed during this increment's own live
+  testing against a real backend (not a hypothetical one): `magnus_
+  fastcgi_translate_headers()` hardcoded `X-Magnus-Via: magnus-fastcgi/
+  0.1` regardless of which protocol actually produced the response --
+  reusing it as-is for SCGI meant every SCGI response was claiming to
+  be a FastCGI one. Fixed by adding a `via` parameter the caller now
+  supplies (`"magnus-fastcgi/0.1"`/`"magnus-scgi/0.1"`); `tests/
+  test-fastcgi.c` gained a dedicated assertion for it, and every
+  existing call site (in both `magnus.c` and the test file) was
+  updated.
+
+  Verified against a real SCGI backend -- a minimal, protocol-spec-
+  conformant responder written for this test session (there is no
+  single de facto reference SCGI server the way PHP-FPM is for
+  FastCGI; `tests/test-scgi.c`'s own unit test separately verifies the
+  wire-level netstring/header-block encoding against the SCGI protocol
+  specification's own published canonical example byte-for-byte):
+  `Status:`-line overrides, PHP-FPM-style 404-for-missing-script
+  equivalents, GET/HEAD/POST, form-encoded and 200000-byte bodies split
+  across the generic pre-dispatch buffering every dispatch path already
+  shares, empty-body POST, static-file passthrough on the very same
+  listener untouched, a clean `502` against a down endpoint, a clean
+  `504` at exactly the 10-second read timeout against a deliberately
+  hanging backend (not a hang), 50 concurrent requests via a real
+  Python `ThreadPoolExecutor` client (all succeeded), and a clean
+  graceful shutdown with zero ASan/UBSan findings across three separate
+  live instances (a healthy backend, a down one, a hanging one).
+  `make test` (twice, clean) including the new `tests/test-scgi.c` unit
+  test.
+
+  This increment's own verification pass also hit `tests/test-core.sh`'s
+  own pre-existing intermittent-flake class (already documented across
+  5a-1 through 5a-5's own verification) at a new location this time --
+  the reverse-proxy cache test's exact-hit-count assertion, an area
+  `action=scgi` shares no code with at all. Investigated rather than
+  waved off, given it reproduced in 3 of 5 consecutive standalone runs:
+  a direct ASan/UBSan replay of the exact failing request sequence
+  against a minimal repro (same route/cache config, same request order)
+  completed cleanly with zero findings, and `bash -x` (which slows
+  execution) let the full suite pass every time it was tried -- both
+  point at timing/scheduling sensitivity on a shared host, not memory
+  corruption or a real regression; `make test` twice clean (this
+  entry's own verification bar) was satisfied on the 1st and 3rd of 4
+  attempts, consistent with a flake rather than a deterministic
+  failure.
+
 ## 1.55.0
 
 ### Added

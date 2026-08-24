@@ -149,6 +149,23 @@ independently by IORESPONSE.
   preference), never whatever the application itself sent; an
   application `Status: NNN [reason]` line sets the real status/reason,
   defaulting to 200 OK when absent, per CGI convention
+- SCGI dispatch: a route with `action=scgi` relays to a real SCGI
+  application server over the SCGI protocol specification's own
+  netstring-framed header block + raw-body shape
+  (`scgi_upstream=`/`--scgi-upstream`, its own separate cluster,
+  IPv4-literal only; `scgi_root=`/`--scgi-root`, the same `DOCUMENT_
+  ROOT` role `fastcgi_root` plays). Any HTTP method is relayed, with
+  whatever request body was already buffered ahead of dispatch (SCGI
+  mandates `CONTENT_LENGTH` as its own first header on every request
+  regardless, so unlike FastCGI's own original first cut there is no
+  narrower request shape to start from). A connect or a stalled read/
+  response is bounded by a timeout, answered with a clean `504` rather
+  than hanging the client. The response side reuses FastCGI dispatch's
+  own CGI-response translation as-is (identical shape: an optional
+  `Status:` line, ordinary headers, a blank line, then the body) --
+  `Content-Length`/`Connection` are always real, never whatever the
+  application sent. Connection pooling, retry, and session affinity are
+  not yet implemented for this path (see `docs/development-roadmap.md`)
 - Reverse-proxy response cache: a bounded, in-memory, LRU-evicted cache
   shared by both the HTTP/1.1 and HTTP/2 proxy dispatch paths (one cache;
   a response stored via one protocol is servable to the other), opt-in

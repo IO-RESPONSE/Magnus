@@ -338,6 +338,52 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
             }
             strcpy(config->fastcgi_root, value);
             config->has_fastcgi_root = true;
+        } else if (strcmp(key, "scgi_upstream") == 0) {
+            magnus_config_upstream_t upstream;
+            if (config->scgi_upstream_count
+                == MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "too many 'scgi_upstream' entries "
+                                        "(max %d)",
+                                        MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_parse_upstream(value, &upstream)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'scgi_upstream' must be "
+                                        "ipv4:port[:weight], got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (upstream.is_hostname) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'scgi_upstream' must be a literal "
+                                        "IPv4 address, not a hostname (got "
+                                        "'%s') -- DNS resolution is not yet "
+                                        "supported for SCGI upstreams",
+                                        upstream.address);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->scgi_upstreams[config->scgi_upstream_count++] = upstream;
+        } else if (strcmp(key, "scgi_root") == 0) {
+            struct stat metadata;
+            if (*value == '\0' || strlen(value) >= sizeof(config->scgi_root)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'scgi_root' path too long or empty");
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (stat(value, &metadata) != 0 || !S_ISDIR(metadata.st_mode)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'scgi_root' is not a directory: "
+                                        "'%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(config->scgi_root, value);
+            config->has_scgi_root = true;
         } else if (strcmp(key, "stream_listen") == 0) {
             unsigned long stream_port;
             if (!magnus_config_parse_uint(value, 1, 65535, &stream_port)) {
@@ -820,6 +866,21 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     if (config->fastcgi_upstream_count > 0 && !config->has_fastcgi_root) {
         magnus_config_set_error(error, error_capacity, 0,
                                 "'fastcgi_upstream' requires 'fastcgi_root'");
+        return MAGNUS_CONFIG_ERROR;
+    }
+    if (config->scgi_upstream_count == 0) {
+        for (size_t index = 0; index < config->route_count; index++) {
+            if (config->routes[index].action == MAGNUS_ROUTE_ACTION_SCGI) {
+                magnus_config_set_error(error, error_capacity, 0,
+                                        "a 'route' with action=scgi needs "
+                                        "at least one 'scgi_upstream'");
+                return MAGNUS_CONFIG_ERROR;
+            }
+        }
+    }
+    if (config->scgi_upstream_count > 0 && !config->has_scgi_root) {
+        magnus_config_set_error(error, error_capacity, 0,
+                                "'scgi_upstream' requires 'scgi_root'");
         return MAGNUS_CONFIG_ERROR;
     }
     if (config->has_stream_listen && config->stream_upstream_count == 0) {

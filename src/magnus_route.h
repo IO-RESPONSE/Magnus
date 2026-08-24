@@ -70,7 +70,19 @@ typedef enum {
      * or without a request body (5a-2 lifted 5a-1's original GET-only,
      * no-body restriction -- see magnus_fastcgi_build_request()'s own
      * doc comment in magnus.c). */
-    MAGNUS_ROUTE_ACTION_FASTCGI
+    MAGNUS_ROUTE_ACTION_FASTCGI,
+    /* SCGI dispatch (roadmap 5b-1): relays to an SCGI application
+     * server over its own netstring-framed header block + raw-body
+     * protocol -- a categorically different upstream protocol from
+     * both action=proxy's raw HTTP/1.x relay and action=fastcgi's own
+     * binary record framing, the same reasoning each of those already
+     * established its own dedicated cluster/dispatch machinery for.
+     * HTTP/1.1 only; any method, with or without a request body (SCGI
+     * requires a CONTENT_LENGTH header on every request regardless, so
+     * unlike action=fastcgi's own original 5a-1 GET-only first cut,
+     * there is no natural narrower restriction to start from here --
+     * see magnus_scgi_build_request()'s own doc comment in magnus.c). */
+    MAGNUS_ROUTE_ACTION_SCGI
 } magnus_route_action_t;
 
 typedef struct {
@@ -93,7 +105,7 @@ typedef struct {
 /* Parses one `route = ...` config value into `out`: semicolon-separated
  * conditions (each `key=value`, or `key:subkey=value` for header/
  * header_prefix/cookie/query, which need a field name as well as an
- * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi`, plus
+ * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi|scgi`, plus
  * an optional `cache=on|off` modifier (roadmap 2d-1; only valid alongside
  * `action=proxy` -- see magnus_route_t's own `cache_enabled` field), in
  * any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with
