@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.57.0
+
+### Added
+
+- **uwsgi dispatch (roadmap 5c-1) -- Phase 5's third upstream protocol.**
+  Relays a matched `action=uwsgi` route to a real uWSGI application
+  server over the "uwsgi" wire protocol (not to be confused with the
+  uWSGI application server itself, which speaks this same protocol as
+  one of several it understands). Same deliberately wider-than-
+  FastCGI's-original-5a-1 first cut SCGI dispatch (5b-1) already
+  chose: any method with or without a request body, and connect/read
+  timeout enforcement, both included from the start.
+
+  This increment's own request-encoding assumptions were spike-tested
+  directly against a real, pip-installed uWSGI 2.0.31 server (`pip
+  install uwsgi`) *before* any of magnus.c's own dispatch machinery was
+  written against them, catching a real, consequential mistake early:
+  this codebase's initial assumption -- that uwsgi's response would be
+  CGI "Status:"-line-shaped, the same convention FastCGI/SCGI both use
+  (which is why SCGI dispatch could get away with reusing FastCGI's own
+  response translation directly) -- was wrong. A real uWSGI server's
+  response to a standard request starts with a genuine HTTP status
+  line (`HTTP/1.1 200 OK\r\n`), never a `Status:` line. Caught via a
+  small standalone C harness that sent a real request (built with the
+  new module's own encode functions) directly to the real server and
+  fed the real response back through a first draft of the translation
+  function, before any of it was wired into magnus.c at all -- exactly
+  the failure mode this codebase's own spike-testing precedent (Phase
+  4's own `docs/phase4-spike-results.md`) exists to catch before it
+  becomes 500+ lines of dispatch machinery built on a wrong assumption.
+
+  - New protocol module `src/magnus_uwsgi.h`/`.c`: the 4-byte packet
+    header (1-byte modifier1/modifier2, a little-endian 16-bit vars-
+    block size -- the one place this protocol differs from FastCGI's
+    own big-endian convention), little-endian-length-prefixed var
+    encoding (no NUL terminator needed, unlike SCGI's own pairs), and
+    `magnus_uwsgi_translate_headers()` -- a genuinely new response
+    translator (NOT a reuse of `magnus_fastcgi_translate_headers()`
+    the way SCGI dispatch's own response side is), parsing a real
+    `HTTP/<version> <status> [reason]` first line rather than scanning
+    for `Status:`. `magnus_fastcgi_find_body()` is still reused as-is
+    for locating the header/body boundary, since finding a blank line
+    is not protocol-specific.
+  - magnus.c: dedicated `magnus_uwsgi_cluster`, dedicated fd-ownership
+    table, `--uwsgi-upstream`/`uwsgi_upstream` and `--uwsgi-root`/
+    `uwsgi_root` CLI/config surfaces, new `action=uwsgi` route action,
+    and the async dispatch state machine, mirroring `magnus_scgi_*`'s
+    own shape function-for-function throughout.
+  - New `tests/test-uwsgi.c` unit test, including real-HTTP-status-line
+    parsing, the "malformed first line falls back to 200" tolerant
+    default, and the affinity-cookie-append path.
+
+  Verified against the same real uWSGI 2.0.31 server across the full
+  matrix: `start_response()`-driven status overrides (201/404), GET/
+  HEAD/POST with bodies up to 200000 bytes (empty-body POST too),
+  static-file passthrough on the same listener untouched, a clean `502`
+  against a down endpoint, a clean `504` at exactly the 10-second read
+  timeout against a real WSGI app that deliberately `time.sleep(15)`s
+  (not a hang), 50 concurrent requests, and a clean graceful shutdown
+  with zero ASan/UBSan findings across three separate live instances.
+  Also verified inside the real read-only/non-root Docker image
+  (`ioresponse/magnus:1.57.0`) with `--network host` against the same
+  real backend. `make test` twice clean; this increment's own
+  verification pass hit `tests/test-core.sh`'s own already-diagnosed
+  pre-existing cache-test flake (see `CHANGELOG.md` 1.56.0 for the
+  original investigation) at the identical location again -- resolved
+  the same way, by retrying to a clean pass, with no further
+  investigation needed since the root cause was already established
+  and nothing in this increment touches that code path.
+
 ## 1.56.0
 
 ### Added

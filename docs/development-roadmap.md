@@ -1545,8 +1545,27 @@ connection-pool and common-request-model decisions).
   against a deliberately hanging one (not a hang), 50 concurrent
   requests, zero ASan/UBSan findings -- see `CHANGELOG.md` 1.56.0.
 
-  Still ahead for Phase 5: uWSGI, Runtime API expansion, and the
-  zero-downtime binary upgrade mechanism itself.
+  **5c-1 (uwsgi dispatch) shipped in 1.57.0** -- Phase 5's third
+  upstream protocol, same wider-than-FastCGI's-original-5a-1 first cut
+  as SCGI dispatch (5b-1). New `src/magnus_uwsgi.h`/`.c`: the uwsgi
+  wire protocol's own 4-byte packet header (little-endian, unlike
+  FastCGI's big-endian) and length-prefixed var encoding, plus a
+  genuinely new `magnus_uwsgi_translate_headers()` -- unlike SCGI
+  dispatch, this does NOT reuse `magnus_fastcgi_translate_headers()`,
+  because a real uWSGI server's response starts with an actual HTTP
+  status line, not a CGI `Status:` one. This was caught by spike-
+  testing the protocol directly against a real, pip-installed uWSGI
+  2.0.31 server *before* writing magnus.c's own dispatch machinery --
+  the initial assumption (reuse the FastCGI/SCGI convention) was wrong,
+  and finding that out via a 40-line standalone harness instead of a
+  wrong 500-line implementation is exactly what this codebase's own
+  Phase-4 spike-testing precedent is for. Verified against the same
+  real uWSGI server: status overrides, GET/HEAD/POST with bodies up to
+  200000 bytes, a clean 502/504, 50 concurrent requests, zero ASan/
+  UBSan findings -- see `CHANGELOG.md` 1.57.0.
+
+  Still ahead for Phase 5: Runtime API expansion, and the zero-downtime
+  binary upgrade mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously

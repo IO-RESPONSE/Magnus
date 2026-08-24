@@ -28,6 +28,8 @@
  * FASTCGI_UPSTREAMS's own -- an SCGI application-server tier is
  * typically one or a small handful of distinct pools. */
 #define MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS 8
+/* uwsgi dispatch (roadmap 5c-1): same reasoning. */
+#define MAGNUS_CONFIG_MAX_UWSGI_UPSTREAMS 8
 /* TLS passthrough / SNI routing (roadmap 3b): a modest cap on the number
  * of *distinct patterns*, matching MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS's own
  * "a real deployment has far fewer of these than the main upstream list"
@@ -135,6 +137,13 @@ typedef struct {
     magnus_config_upstream_t scgi_upstreams[MAGNUS_CONFIG_MAX_SCGI_UPSTREAMS];
     bool has_scgi_root;
     char scgi_root[MAGNUS_CONFIG_PATH_MAX];
+    /* uwsgi dispatch (roadmap 5c-1, Phase 5's third upstream protocol):
+     * same shape/validation as scgi_upstreams/scgi_root just above,
+     * targeted only by a route with action=uwsgi. */
+    size_t uwsgi_upstream_count;
+    magnus_config_upstream_t uwsgi_upstreams[MAGNUS_CONFIG_MAX_UWSGI_UPSTREAMS];
+    bool has_uwsgi_root;
+    char uwsgi_root[MAGNUS_CONFIG_PATH_MAX];
     /* L4 TCP passthrough (roadmap 3a): a second, independent listener that
      * never goes through magnus_http_parse() at all -- raw bytes relayed
      * bidirectionally to whichever endpoint stream_lb_policy picks, with

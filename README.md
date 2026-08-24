@@ -166,6 +166,22 @@ independently by IORESPONSE.
   `Content-Length`/`Connection` are always real, never whatever the
   application sent. Connection pooling, retry, and session affinity are
   not yet implemented for this path (see `docs/development-roadmap.md`)
+- uwsgi dispatch: a route with `action=uwsgi` relays to a real uWSGI
+  application server over the "uwsgi" wire protocol
+  (`uwsgi_upstream=`/`--uwsgi-upstream`, its own separate cluster,
+  IPv4-literal only; `uwsgi_root=`/`--uwsgi-root`, the same
+  `DOCUMENT_ROOT` role `scgi_root` plays). Any HTTP method is relayed,
+  with whatever request body was already buffered ahead of dispatch. A
+  connect or a stalled read/response is bounded by a timeout, answered
+  with a clean `504` rather than hanging the client. Unlike SCGI
+  dispatch's own response translation, this protocol's response side is
+  genuinely distinct (a real uWSGI server's response starts with an
+  actual HTTP status line, not a CGI `Status:` one -- confirmed by
+  direct testing against a real uWSGI 2.0.31 server before this was
+  built) and gets its own dedicated translator; `Content-Length`/
+  `Connection` are always real, never whatever the application sent.
+  Connection pooling, retry, and session affinity are not yet
+  implemented for this path either (see `docs/development-roadmap.md`)
 - Reverse-proxy response cache: a bounded, in-memory, LRU-evicted cache
   shared by both the HTTP/1.1 and HTTP/2 proxy dispatch paths (one cache;
   a response stored via one protocol is servable to the other), opt-in

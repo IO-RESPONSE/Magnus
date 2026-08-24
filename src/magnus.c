@@ -8,6 +8,7 @@
 #include "magnus_dns.h"
 #include "magnus_fastcgi.h"
 #include "magnus_scgi.h"
+#include "magnus_uwsgi.h"
 #include "magnus_h2.h"
 #include "magnus_proxy.h"
 #include "magnus_quic.h"
@@ -121,6 +122,11 @@
  * timeout is. */
 #define MAGNUS_SCGI_CONNECT_TIMEOUT_SECONDS MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS
 #define MAGNUS_SCGI_READ_TIMEOUT_SECONDS MAGNUS_PROXY_READ_TIMEOUT_SECONDS
+/* Roadmap 5c-1 (uwsgi dispatch): same reasoning as MAGNUS_SCGI_CONNECT_
+ * TIMEOUT_SECONDS's own doc comment -- included from this protocol's
+ * own first cut too, not deferred. */
+#define MAGNUS_UWSGI_CONNECT_TIMEOUT_SECONDS MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS
+#define MAGNUS_UWSGI_READ_TIMEOUT_SECONDS MAGNUS_PROXY_READ_TIMEOUT_SECONDS
 /* HTTP/1.1 chunked response writer (RFC 9112 7.1), roadmap 2a-13 --
  * this codebase's first: each real chunk is framed as a zero-padded
  * 5-hex-digit chunk-size (MAGNUS_CHUNK_HEADER_SIZE bytes, "%05zx\r\n" --
@@ -770,6 +776,52 @@ typedef struct {
     size_t scgi_response_headers_sent;
     size_t scgi_body_offset;
     size_t scgi_body_sent;
+    /* uwsgi dispatch (roadmap 5c-1, Phase 5's third upstream protocol):
+     * relays to a real uWSGI application server over the "uwsgi" wire
+     * protocol -- see src/magnus_uwsgi.h for the packet-framing
+     * helpers this uses, and magnus_uwsgi_pick_and_start()'s own doc
+     * comment for the full request/response shape. Kept entirely
+     * separate from the scgi_* / fastcgi_* / proxy_* fields above, the
+     * same "categorically different upstream protocol" reasoning each
+     * of those already established for the last one. Same deliberately
+     * wider-than-FastCGI's-original-5a-1 first-cut scope SCGI dispatch
+     * (5b-1) already chose, for the identical reasons documented on
+     * MAGNUS_ROUTE_ACTION_UWSGI (magnus_route.h): any method/body, and
+     * timeout enforcement, from the start; no retry/pooling/affinity
+     * yet. Response translation is genuinely protocol-specific here
+     * (magnus_uwsgi_translate_headers(), NOT the reused magnus_
+     * fastcgi_translate_headers() SCGI dispatch shares -- a real uWSGI
+     * server's response starts with a real HTTP status line, not a CGI
+     * "Status:" one, confirmed by direct testing against uWSGI 2.0.31
+     * before this was written, see magnus_uwsgi.h's own top comment). */
+    bool uwsgi_active;
+    int uwsgi_upstream_fd;
+    bool uwsgi_upstream_connected;
+    size_t uwsgi_endpoint_index;
+    bool uwsgi_endpoint_counted;
+    time_t uwsgi_connect_started;
+    time_t uwsgi_last_activity;
+    char uwsgi_request_id[33];
+    char uwsgi_log_method[8];
+    char uwsgi_log_target[256];
+    bool uwsgi_client_wants_close;
+    unsigned char *uwsgi_out;
+    size_t uwsgi_out_length;
+    size_t uwsgi_out_sent;
+    /* Raw response bytes accumulate here, verbatim -- uwsgi's own
+     * response, like SCGI's, has no framing of its own to unwrap
+     * (unlike FastCGI's STDOUT records), so recv()'d bytes land here
+     * directly. Completion is signaled the same way SCGI's is: the
+     * upstream itself closing the connection (the uwsgi protocol has
+     * no FCGI_END_REQUEST equivalent either). */
+    char *uwsgi_stdout;
+    size_t uwsgi_stdout_length;
+    size_t uwsgi_stdout_capacity;
+    char *uwsgi_response_headers;
+    size_t uwsgi_response_headers_length;
+    size_t uwsgi_response_headers_sent;
+    size_t uwsgi_body_offset;
+    size_t uwsgi_body_sent;
     struct in_addr client_address;
     struct in_addr raw_peer_address;
     bool proxy_proto_done;
@@ -844,6 +896,11 @@ static char magnus_fastcgi_root[MAGNUS_CONFIG_PATH_MAX];
 static magnus_cluster_t magnus_scgi_cluster;
 static bool magnus_scgi_upstream_enabled;
 static char magnus_scgi_root[MAGNUS_CONFIG_PATH_MAX];
+/* uwsgi dispatch (roadmap 5c-1) -- same reasoning as magnus_scgi_
+ * cluster's own comment just above. */
+static magnus_cluster_t magnus_uwsgi_cluster;
+static bool magnus_uwsgi_upstream_enabled;
+static char magnus_uwsgi_root[MAGNUS_CONFIG_PATH_MAX];
 
 /* L4 TCP passthrough (roadmap 3a): a third, independent cluster/listener,
  * architecturally distinct from the two above -- a stream connection never
@@ -1092,6 +1149,8 @@ static magnus_connection_t *magnus_fastcgi_owner[MAGNUS_MAX_FDS];
 /* SCGI dispatch (roadmap 5b-1) -- same shape/rationale as magnus_
  * fastcgi_owner[] just above. */
 static magnus_connection_t *magnus_scgi_owner[MAGNUS_MAX_FDS];
+/* uwsgi dispatch (roadmap 5c-1) -- same shape/rationale. */
+static magnus_connection_t *magnus_uwsgi_owner[MAGNUS_MAX_FDS];
 /* Parallel to magnus_upstream_owner[] above, for an upstream fd opened on
  * behalf of one HTTP/2 stream's proxy dispatch (1e-2) rather than a whole
  * client connection: unlike HTTP/1.1, one h2 connection can have many
@@ -1879,6 +1938,14 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
         magnus_cluster_endpoint_end(&magnus_scgi_cluster,
                                     connection->scgi_endpoint_index);
     }
+    /* uwsgi dispatch (roadmap 5c-1): same tolerance. */
+    free(connection->uwsgi_out);
+    free(connection->uwsgi_stdout);
+    free(connection->uwsgi_response_headers);
+    if (connection->uwsgi_endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_uwsgi_cluster,
+                                    connection->uwsgi_endpoint_index);
+    }
     free(connection->ws_buffer);
     magnus_h2_close(connection);
     /* Safety net: normally already freed by magnus_free_body_if_unowned()
@@ -1903,6 +1970,12 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
                  NULL);
         magnus_scgi_owner[connection->scgi_upstream_fd] = NULL;
         close(connection->scgi_upstream_fd);
+    }
+    if (connection->uwsgi_upstream_fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->uwsgi_upstream_fd,
+                 NULL);
+        magnus_uwsgi_owner[connection->uwsgi_upstream_fd] = NULL;
+        close(connection->uwsgi_upstream_fd);
     }
     magnus_connections[fd] = NULL;
     free(connection);
@@ -10337,6 +10410,456 @@ magnus_scgi_expire(int epoll_fd, time_t now)
     }
 }
 
+/* Roadmap 5c-1 (uwsgi dispatch): tears down just the current connect/
+ * upstream attempt -- mirrors magnus_scgi_teardown_upstream()'s own
+ * shape exactly. */
+static void
+magnus_uwsgi_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
+{
+    if (connection->uwsgi_upstream_fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->uwsgi_upstream_fd,
+                 NULL);
+        magnus_uwsgi_owner[connection->uwsgi_upstream_fd] = NULL;
+        close(connection->uwsgi_upstream_fd);
+        connection->uwsgi_upstream_fd = -1;
+    }
+    connection->uwsgi_active = false;
+    if (connection->uwsgi_endpoint_counted) {
+        magnus_cluster_endpoint_end(&magnus_uwsgi_cluster,
+                                    connection->uwsgi_endpoint_index);
+        connection->uwsgi_endpoint_counted = false;
+    }
+}
+
+/* Roadmap 5c-1: ends a uwsgi attempt before any response bytes have
+ * reached the client -- mirrors magnus_scgi_fail()'s own shape
+ * exactly, same "buffer everything" property, same "no retry yet"
+ * simplification. */
+static int
+magnus_uwsgi_fail(int epoll_fd, magnus_connection_t *connection,
+                  unsigned status, const char *reason)
+{
+    magnus_request_t request = {0};
+    magnus_uwsgi_teardown_upstream(epoll_fd, connection);
+    free(connection->uwsgi_out);
+    connection->uwsgi_out = NULL;
+    connection->uwsgi_out_length = 0;
+    connection->uwsgi_out_sent = 0;
+    memcpy(request.request_id, connection->uwsgi_request_id,
+          sizeof(request.request_id));
+    magnus_prepare_response(connection, status, reason, "text/plain",
+                            status == 504 ? "gateway timeout\n"
+                                          : "bad gateway\n",
+                            false, true, &request);
+    {
+        double latency_ms = (double) (magnus_now_ms()
+                                      - connection->request_started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(request.request_id, connection->client_address,
+                          connection->uwsgi_log_method,
+                          connection->uwsgi_log_target, status, latency_ms,
+                          -1);
+    }
+    return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
+}
+
+/* Roadmap 5c-1: builds the whole outbound uwsgi byte stream -- the
+ * 4-byte packet header, the vars block, then the raw request body
+ * immediately after -- into connection->uwsgi_out. Mirrors magnus_
+ * scgi_build_request()'s own shape; PATH_INFO/SCRIPT_NAME follow the
+ * conventional WSGI split (SCRIPT_NAME empty -- every route mounts at
+ * the application's own root -- PATH_INFO carries the full matched
+ * path), confirmed against a real uWSGI 2.0.31 server via this
+ * increment's own spike test (see magnus_uwsgi.h's own top comment).
+ * DOCUMENT_ROOT plays the same role magnus_scgi_build_request()'s own
+ * identical field does. Returns false on any allocation/encoding
+ * failure, leaving connection untouched. */
+static bool
+magnus_uwsgi_build_request(magnus_connection_t *connection,
+                           const magnus_http_request_t *parsed,
+                           const char *forward_path)
+{
+    unsigned char vars[4096];
+    size_t vars_length = 0;
+    char path_info[256];
+    char query_string[256];
+    char server_port[8];
+    char remote_addr[INET_ADDRSTRLEN];
+    char content_length_text[24];
+    const char *content_type;
+    const char *query_mark = strchr(forward_path, '?');
+    size_t path_info_length = query_mark != NULL
+        ? (size_t) (query_mark - forward_path) : strlen(forward_path);
+    unsigned char *out;
+    size_t total;
+
+    if (path_info_length >= sizeof(path_info)) return false;
+    memcpy(path_info, forward_path, path_info_length);
+    path_info[path_info_length] = '\0';
+    strncpy(query_string, query_mark != NULL ? query_mark + 1 : "",
+           sizeof(query_string) - 1);
+    query_string[sizeof(query_string) - 1] = '\0';
+
+    snprintf(server_port, sizeof(server_port), "%u", magnus_listen_port);
+    if (inet_ntop(AF_INET, &connection->client_address, remote_addr,
+                 sizeof(remote_addr)) == NULL)
+        strcpy(remote_addr, "0.0.0.0");
+    snprintf(content_length_text, sizeof(content_length_text), "%zu",
+             connection->body_length);
+    content_type = magnus_http_header_find(parsed, "content-type");
+
+#define MAGNUS_UWSGI_ADD_VAR(nv_name, nv_value) \
+    do { \
+        size_t nv_len = magnus_uwsgi_encode_var((nv_name), (nv_value), \
+            vars + vars_length, sizeof(vars) - vars_length); \
+        if (nv_len == 0) return false; \
+        vars_length += nv_len; \
+    } while (0)
+
+    MAGNUS_UWSGI_ADD_VAR("REQUEST_METHOD", parsed->method);
+    MAGNUS_UWSGI_ADD_VAR("REQUEST_URI", forward_path);
+    MAGNUS_UWSGI_ADD_VAR("QUERY_STRING", query_string);
+    MAGNUS_UWSGI_ADD_VAR("PATH_INFO", path_info);
+    MAGNUS_UWSGI_ADD_VAR("SCRIPT_NAME", "");
+    MAGNUS_UWSGI_ADD_VAR("DOCUMENT_ROOT", magnus_uwsgi_root);
+    MAGNUS_UWSGI_ADD_VAR("SERVER_PROTOCOL", "HTTP/1.1");
+    MAGNUS_UWSGI_ADD_VAR("SERVER_SOFTWARE", "Magnus/" MAGNUS_VERSION);
+    MAGNUS_UWSGI_ADD_VAR("SERVER_NAME",
+                        parsed->host[0] != '\0' ? parsed->host : "localhost");
+    MAGNUS_UWSGI_ADD_VAR("SERVER_PORT", server_port);
+    MAGNUS_UWSGI_ADD_VAR("REMOTE_ADDR", remote_addr);
+    MAGNUS_UWSGI_ADD_VAR("CONTENT_LENGTH", content_length_text);
+    if (content_type != NULL) MAGNUS_UWSGI_ADD_VAR("CONTENT_TYPE", content_type);
+    if (connection->tls != NULL) MAGNUS_UWSGI_ADD_VAR("HTTPS", "on");
+
+#undef MAGNUS_UWSGI_ADD_VAR
+
+    if (vars_length > 0xffff) return false;
+
+    total = MAGNUS_UWSGI_HEADER_LEN + vars_length + connection->body_length;
+    out = malloc(total);
+    if (out == NULL) return false;
+
+    magnus_uwsgi_write_header(out, MAGNUS_UWSGI_MODIFIER1_DEFAULT, vars_length,
+                              MAGNUS_UWSGI_MODIFIER2_DEFAULT);
+    memcpy(out + MAGNUS_UWSGI_HEADER_LEN, vars, vars_length);
+    if (connection->body_length > 0)
+        memcpy(out + MAGNUS_UWSGI_HEADER_LEN + vars_length, connection->body,
+              connection->body_length);
+
+    connection->uwsgi_out = out;
+    connection->uwsgi_out_length = total;
+    connection->uwsgi_out_sent = 0;
+
+    free(connection->body);
+    connection->body = NULL;
+    connection->body_capacity = 0;
+    connection->body_length = 0;
+    connection->body_needed = 0;
+    return true;
+}
+
+/* Roadmap 5c-1: mirrors magnus_scgi_attach_upstream()'s own shape
+ * exactly. */
+static int
+magnus_uwsgi_attach_upstream(int epoll_fd, magnus_connection_t *connection,
+                             size_t endpoint_index, int fd, bool connected)
+{
+    struct epoll_event event;
+
+    connection->uwsgi_upstream_fd = fd;
+    connection->uwsgi_upstream_connected = connected;
+    connection->uwsgi_active = true;
+    connection->uwsgi_endpoint_index = endpoint_index;
+    magnus_cluster_endpoint_begin(&magnus_uwsgi_cluster, endpoint_index);
+    connection->uwsgi_endpoint_counted = true;
+    connection->uwsgi_connect_started = time(NULL);
+    connection->uwsgi_last_activity = connection->uwsgi_connect_started;
+    connection->uwsgi_out_sent = 0;
+    magnus_uwsgi_owner[fd] = connection;
+    event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
+                                   .data.fd = fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        magnus_uwsgi_owner[fd] = NULL;
+        close(fd);
+        connection->uwsgi_upstream_fd = -1;
+        connection->uwsgi_active = false;
+        return -1;
+    }
+    return 0;
+}
+
+/* Roadmap 5c-1: mirrors magnus_scgi_connect_endpoint()'s own shape
+ * exactly -- no pooled-connection fast path yet. */
+static int
+magnus_uwsgi_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
+                              size_t endpoint_index)
+{
+    struct sockaddr_in address;
+    int fd;
+    int result;
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(
+        (uint16_t) magnus_uwsgi_cluster.endpoints[endpoint_index].port);
+    if (inet_pton(AF_INET, magnus_uwsgi_cluster.endpoints[endpoint_index].address,
+                 &address.sin_addr) != 1)
+        return -1;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    result = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (result < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return magnus_uwsgi_attach_upstream(epoll_fd, connection, endpoint_index,
+                                       fd, result == 0);
+}
+
+/* Roadmap 5c-1: dispatches a matched action=uwsgi route -- mirrors
+ * magnus_scgi_pick_and_start()'s own shape exactly (plain round-robin,
+ * single attempt, no retry/affinity yet). */
+static int
+magnus_uwsgi_pick_and_start(int epoll_fd, magnus_connection_t *connection,
+                            magnus_request_t *request,
+                            const magnus_http_request_t *parsed,
+                            const char *forward_path, bool client_wants_close)
+{
+    int endpoint = magnus_cluster_select(&magnus_uwsgi_cluster, magnus_now_ms(),
+                                         NULL, connection->client_address);
+    if (endpoint < 0) return -1;
+    if (!magnus_uwsgi_build_request(connection, parsed, forward_path))
+        return -1;
+
+    connection->uwsgi_client_wants_close = client_wants_close;
+    memcpy(connection->uwsgi_request_id, request->request_id,
+          sizeof(connection->uwsgi_request_id));
+
+    if (magnus_uwsgi_connect_endpoint(epoll_fd, connection,
+                                      (size_t) endpoint) == 0)
+        return 0;
+    magnus_cluster_result(&magnus_uwsgi_cluster, (size_t) endpoint, false,
+                          magnus_now_ms());
+    free(connection->uwsgi_out);
+    connection->uwsgi_out = NULL;
+    return -1;
+}
+
+/* Roadmap 5c-1: mirrors magnus_scgi_append_stdout()'s own shape
+ * exactly. */
+static bool
+magnus_uwsgi_append_stdout(magnus_connection_t *connection, const void *data,
+                           size_t len)
+{
+    char *grown;
+    if (connection->uwsgi_stdout_length + len > MAGNUS_MAX_BODY) return false;
+    if (connection->uwsgi_stdout_length + len
+        > connection->uwsgi_stdout_capacity) {
+        size_t new_capacity = connection->uwsgi_stdout_capacity == 0
+            ? MAGNUS_PROXY_BUFFER : connection->uwsgi_stdout_capacity * 2;
+        while (new_capacity < connection->uwsgi_stdout_length + len)
+            new_capacity *= 2;
+        grown = realloc(connection->uwsgi_stdout, new_capacity);
+        if (grown == NULL) return false;
+        connection->uwsgi_stdout = grown;
+        connection->uwsgi_stdout_capacity = new_capacity;
+    }
+    memcpy(connection->uwsgi_stdout + connection->uwsgi_stdout_length, data,
+          len);
+    connection->uwsgi_stdout_length += len;
+    return true;
+}
+
+/* Roadmap 5c-1: translates the response now fully accumulated in
+ * connection->uwsgi_stdout into a real HTTP/1.1 response -- unlike
+ * magnus_scgi_finish(), uses magnus_uwsgi_translate_headers() (this
+ * protocol's own genuinely distinct response shape, see magnus_
+ * uwsgi.h's own top comment), not the reused FastCGI one. Otherwise
+ * mirrors magnus_scgi_finish()'s own shape exactly. */
+static int
+magnus_uwsgi_finish(int epoll_fd, magnus_connection_t *connection)
+{
+    const char *body;
+    size_t header_text_length;
+    size_t body_length;
+    char *headers;
+    int headers_length;
+    unsigned status = 200;
+    magnus_request_t request = {0};
+
+    magnus_uwsgi_teardown_upstream(epoll_fd, connection);
+    free(connection->uwsgi_out);
+    connection->uwsgi_out = NULL;
+    connection->uwsgi_out_length = 0;
+    connection->uwsgi_out_sent = 0;
+
+    body = magnus_fastcgi_find_body(connection->uwsgi_stdout,
+                                    connection->uwsgi_stdout_length,
+                                    &header_text_length);
+    if (body == NULL)
+        return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+    body_length = connection->uwsgi_stdout_length
+        - (size_t) (body - connection->uwsgi_stdout);
+
+    headers = malloc(MAGNUS_PROXY_SANITIZED_LIMIT);
+    if (headers == NULL)
+        return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+    headers_length = magnus_uwsgi_translate_headers(
+        connection->uwsgi_stdout, header_text_length, body_length,
+        connection->uwsgi_client_wants_close, NULL,
+        headers, MAGNUS_PROXY_SANITIZED_LIMIT, &status);
+    if (headers_length < 0) {
+        free(headers);
+        return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
+
+    connection->uwsgi_response_headers = headers;
+    connection->uwsgi_response_headers_length = (size_t) headers_length;
+    connection->uwsgi_response_headers_sent = 0;
+    connection->uwsgi_body_offset = (size_t) (body - connection->uwsgi_stdout);
+    connection->uwsgi_body_sent = 0;
+    connection->close_after_write = connection->uwsgi_client_wants_close;
+
+    memcpy(request.request_id, connection->uwsgi_request_id,
+          sizeof(request.request_id));
+    request.status = status;
+    magnus_requests_total++;
+    {
+        double latency_ms = (double) (magnus_now_ms()
+                                      - connection->request_started_ms);
+        magnus_record_latency(latency_ms);
+        magnus_access_log(request.request_id, connection->client_address,
+                          connection->uwsgi_log_method,
+                          connection->uwsgi_log_target, status, latency_ms,
+                          -1);
+    }
+    return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
+}
+
+/* Roadmap 5c-1: entry point from the main epoll loop for any event on
+ * connection->uwsgi_upstream_fd -- mirrors magnus_scgi_handle_
+ * upstream()'s own shape exactly, including the same EPOLLOUT->EPOLLIN
+ * demotion (applied here from the start, same reasoning) and the same
+ * "upstream close = clean finish" completion signal (the uwsgi
+ * protocol has no end-of-response marker either). */
+static int
+magnus_uwsgi_handle_upstream(int epoll_fd, magnus_connection_t *connection,
+                             uint32_t flags)
+{
+    if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+        magnus_cluster_result(&magnus_uwsgi_cluster,
+                              connection->uwsgi_endpoint_index, false,
+                              magnus_now_ms());
+        return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
+    if (!connection->uwsgi_upstream_connected) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (getsockopt(connection->uwsgi_upstream_fd, SOL_SOCKET, SO_ERROR,
+                       &error, &length) < 0 || error != 0) {
+            magnus_cluster_result(&magnus_uwsgi_cluster,
+                                  connection->uwsgi_endpoint_index, false,
+                                  magnus_now_ms());
+            return magnus_uwsgi_fail(epoll_fd, connection, 504,
+                                     "Gateway Timeout");
+        }
+        connection->uwsgi_upstream_connected = true;
+        connection->uwsgi_last_activity = time(NULL);
+    }
+    while (connection->uwsgi_out_sent < connection->uwsgi_out_length) {
+        ssize_t sent = send(connection->uwsgi_upstream_fd,
+            connection->uwsgi_out + connection->uwsgi_out_sent,
+            connection->uwsgi_out_length - connection->uwsgi_out_sent,
+            MSG_NOSIGNAL);
+        if (sent > 0) {
+            connection->uwsgi_out_sent += (size_t) sent;
+            connection->uwsgi_last_activity = time(NULL);
+        } else if (sent < 0 && errno == EINTR) {
+            continue;
+        } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        } else {
+            magnus_cluster_result(&magnus_uwsgi_cluster,
+                                  connection->uwsgi_endpoint_index, false,
+                                  magnus_now_ms());
+            return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+        }
+    }
+    if ((flags & (EPOLLIN | EPOLLRDHUP)) == 0) {
+        struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP,
+                                     .data.fd = connection->uwsgi_upstream_fd };
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->uwsgi_upstream_fd,
+                 &event);
+        return 0;
+    }
+    for (;;) {
+        char buffer[MAGNUS_PROXY_BUFFER];
+        ssize_t received = recv(connection->uwsgi_upstream_fd, buffer,
+                                sizeof(buffer), 0);
+        if (received > 0) {
+            connection->uwsgi_last_activity = time(NULL);
+            if (!magnus_uwsgi_append_stdout(connection, buffer,
+                                            (size_t) received)) {
+                magnus_cluster_result(&magnus_uwsgi_cluster,
+                                      connection->uwsgi_endpoint_index, false,
+                                      magnus_now_ms());
+                return magnus_uwsgi_fail(epoll_fd, connection, 502,
+                                         "Bad Gateway");
+            }
+            continue;
+        }
+        if (received == 0) {
+            magnus_cluster_result(&magnus_uwsgi_cluster,
+                                  connection->uwsgi_endpoint_index, true,
+                                  magnus_now_ms());
+            return magnus_uwsgi_finish(epoll_fd, connection);
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        magnus_cluster_result(&magnus_uwsgi_cluster,
+                              connection->uwsgi_endpoint_index, false,
+                              magnus_now_ms());
+        return magnus_uwsgi_fail(epoll_fd, connection, 502, "Bad Gateway");
+    }
+}
+
+/* Roadmap 5c-1: mirrors magnus_scgi_expire()'s own shape exactly. */
+static void
+magnus_uwsgi_expire(int epoll_fd, time_t now)
+{
+    int fd;
+    for (fd = 0; fd < MAGNUS_MAX_FDS; fd++) {
+        magnus_connection_t *connection = magnus_connections[fd];
+        int result;
+        if (connection == NULL || !connection->uwsgi_active) continue;
+        if (!connection->uwsgi_upstream_connected) {
+            if (now - connection->uwsgi_connect_started
+                < MAGNUS_UWSGI_CONNECT_TIMEOUT_SECONDS) continue;
+            magnus_cluster_result(&magnus_uwsgi_cluster,
+                                  connection->uwsgi_endpoint_index, false,
+                                  magnus_now_ms());
+            result = magnus_uwsgi_fail(epoll_fd, connection, 504,
+                                       "Gateway Timeout");
+        } else if (now - connection->uwsgi_last_activity
+                   >= MAGNUS_UWSGI_READ_TIMEOUT_SECONDS) {
+            magnus_cluster_result(&magnus_uwsgi_cluster,
+                                  connection->uwsgi_endpoint_index, false,
+                                  magnus_now_ms());
+            result = magnus_uwsgi_fail(epoll_fd, connection, 504,
+                                       "Gateway Timeout");
+        } else {
+            continue;
+        }
+        if (result < 0 && magnus_connections[connection->fd] != NULL) {
+            magnus_close_connection(epoll_fd, connection);
+        }
+    }
+}
+
 /* Runs the already-parsed request through ingress/route, rate limiting,
  * and the final route dispatch (static file, proxy, healthz/metrics,
  * admin). connection->body/body_length carry whatever request body was
@@ -10358,12 +10881,14 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     bool is_grpc_route = false;
     bool is_fastcgi_route = false;
     bool is_scgi_route = false;
+    bool is_uwsgi_route = false;
     bool literal_proxy_prefix;
     bool route_denied = false;
     bool cache_route_enabled = false;
     const char *proxy_forward_path;
     const char *fastcgi_forward_path = NULL;
     const char *scgi_forward_path = NULL;
+    const char *uwsgi_forward_path = NULL;
 
     memcpy(request.method, parsed->method, sizeof(request.method));
     memcpy(request.path, parsed->target, sizeof(request.path));
@@ -10421,6 +10946,9 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
             } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_SCGI) {
                 is_scgi_route = true;
                 scgi_forward_path = request.path;
+            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_UWSGI) {
+                is_uwsgi_route = true;
+                uwsgi_forward_path = request.path;
             }
             break;
         }
@@ -10455,13 +10983,14 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "forbidden\n", head_only, close_connection,
                                 &request);
     } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route
-               && !is_grpc_route && !is_fastcgi_route && !is_scgi_route) {
+               && !is_grpc_route && !is_fastcgi_route && !is_scgi_route
+               && !is_uwsgi_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
-         * the reverse proxy, FastCGI dispatch (roadmap 5a-2), and SCGI
-         * dispatch (roadmap 5b-1) are the routes that have always been
-         * meant to relay whatever method (and body) the client sent --
-         * see the is_proxy_route/is_fastcgi_route/is_scgi_route branches
-         * below, which is why all three are excluded here. */
+         * the reverse proxy and the FastCGI/SCGI/uwsgi dispatch paths
+         * are the routes that have always been meant to relay whatever
+         * method (and body) the client sent -- see the is_proxy_route/
+         * is_fastcgi_route/is_scgi_route/is_uwsgi_route branches below,
+         * which is why all four are excluded here. */
         magnus_prepare_response(connection, 405, "Method Not Allowed",
                                 "text/plain", "method not allowed\n", false,
                                 close_connection, &request);
@@ -10544,6 +11073,27 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                    sizeof(connection->scgi_log_target) - 1);
             connection->scgi_log_target[
                 sizeof(connection->scgi_log_target) - 1] = '\0';
+            return 1;
+        }
+        magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
+                                "bad gateway\n", head_only, true, &request);
+    } else if (is_uwsgi_route) {
+        /* Any method, with or without a body -- see MAGNUS_ROUTE_
+         * ACTION_UWSGI's own doc comment for why this is not deferred
+         * to a later increment. */
+        int start_result = magnus_uwsgi_pick_and_start(epoll_fd, connection,
+                                                        &request, parsed,
+                                                        uwsgi_forward_path,
+                                                        close_connection);
+        if (start_result == 0) {
+            strncpy(connection->uwsgi_log_method, request.method,
+                   sizeof(connection->uwsgi_log_method) - 1);
+            connection->uwsgi_log_method[
+                sizeof(connection->uwsgi_log_method) - 1] = '\0';
+            strncpy(connection->uwsgi_log_target, request.path,
+                   sizeof(connection->uwsgi_log_target) - 1);
+            connection->uwsgi_log_target[
+                sizeof(connection->uwsgi_log_target) - 1] = '\0';
             return 1;
         }
         magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
@@ -11310,6 +11860,44 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         return -1;
     }
+    /* uwsgi dispatch (roadmap 5c-1): same shape as the SCGI drain loops
+     * just above. */
+    while (connection->uwsgi_response_headers != NULL
+           && connection->uwsgi_response_headers_sent
+              < connection->uwsgi_response_headers_length) {
+        sent = magnus_socket_write(connection,
+            connection->uwsgi_response_headers
+                + connection->uwsgi_response_headers_sent,
+            connection->uwsgi_response_headers_length
+                - connection->uwsgi_response_headers_sent);
+        if (sent > 0) {
+            connection->uwsgi_response_headers_sent += (size_t) sent;
+            magnus_bytes_sent += (uint64_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    while (connection->uwsgi_response_headers != NULL
+           && connection->uwsgi_body_sent
+              < connection->uwsgi_stdout_length - connection->uwsgi_body_offset) {
+        sent = magnus_socket_write(connection,
+            connection->uwsgi_stdout + connection->uwsgi_body_offset
+                + connection->uwsgi_body_sent,
+            connection->uwsgi_stdout_length - connection->uwsgi_body_offset
+                - connection->uwsgi_body_sent);
+        if (sent > 0) {
+            connection->uwsgi_body_sent += (size_t) sent;
+            magnus_bytes_sent += (uint64_t) sent;
+            connection->last_active = time(NULL);
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
     while (connection->tls == NULL && connection->file_fd >= 0
            && connection->file_offset < connection->file_length) {
         sent = sendfile(connection->fd, connection->file_fd,
@@ -11504,6 +12092,16 @@ magnus_handle_write(int epoll_fd, magnus_connection_t *connection)
     connection->scgi_stdout_capacity = 0;
     connection->scgi_body_offset = 0;
     connection->scgi_body_sent = 0;
+    free(connection->uwsgi_response_headers);
+    connection->uwsgi_response_headers = NULL;
+    connection->uwsgi_response_headers_length = 0;
+    connection->uwsgi_response_headers_sent = 0;
+    free(connection->uwsgi_stdout);
+    connection->uwsgi_stdout = NULL;
+    connection->uwsgi_stdout_length = 0;
+    connection->uwsgi_stdout_capacity = 0;
+    connection->uwsgi_body_offset = 0;
+    connection->uwsgi_body_sent = 0;
     if (connection->close_after_write) {
         return -1;
     }
@@ -11601,6 +12199,8 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
         connection->fastcgi_upstream_fd = -1;
         /* SCGI dispatch (roadmap 5b-1): same lesson. */
         connection->scgi_upstream_fd = -1;
+        /* uwsgi dispatch (roadmap 5c-1): same lesson. */
+        connection->uwsgi_upstream_fd = -1;
         connection->client_address = peer_address.sin_addr;
         connection->raw_peer_address = peer_address.sin_addr;
         connection->admin_only = admin;
@@ -13005,6 +13605,7 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_cluster_t new_grpc_cluster;
     magnus_cluster_t new_fastcgi_cluster;
     magnus_cluster_t new_scgi_cluster;
+    magnus_cluster_t new_uwsgi_cluster;
     magnus_cluster_t new_stream_cluster;
     magnus_sni_cluster_t new_sni_clusters[MAGNUS_CONFIG_MAX_SNI_ROUTES];
     magnus_cluster_t new_udp_cluster;
@@ -13100,6 +13701,22 @@ magnus_apply_config(const magnus_config_t *config)
                                config->scgi_upstreams[index].address,
                                config->scgi_upstreams[index].port,
                                config->scgi_upstreams[index].weight) != 0) {
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+    }
+    /* uwsgi dispatch (roadmap 5c-1): same round_robin-only,
+     * no-configurable-policy scope. */
+    magnus_cluster_init(&new_uwsgi_cluster,
+                        config->health_check_failure_threshold,
+                        (uint64_t) config->health_check_cooldown_seconds
+                        * 1000, MAGNUS_LB_ROUND_ROBIN);
+    for (index = 0; index < config->uwsgi_upstream_count; index++) {
+        if (magnus_cluster_add(&new_uwsgi_cluster,
+                               config->uwsgi_upstreams[index].address,
+                               config->uwsgi_upstreams[index].port,
+                               config->uwsgi_upstreams[index].weight) != 0) {
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -13210,6 +13827,10 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_scgi_cluster = new_scgi_cluster;
     magnus_scgi_upstream_enabled = new_scgi_cluster.count > 0;
     if (config->has_scgi_root) strcpy(magnus_scgi_root, config->scgi_root);
+    /* uwsgi dispatch (roadmap 5c-1): same straight swap-in. */
+    magnus_uwsgi_cluster = new_uwsgi_cluster;
+    magnus_uwsgi_upstream_enabled = new_uwsgi_cluster.count > 0;
+    if (config->has_uwsgi_root) strcpy(magnus_uwsgi_root, config->uwsgi_root);
     /* No connection pool to flush for the stream cluster -- unlike the L7
      * proxy's upstream connections, a stream connection's upstream_fd is
      * captured once at accept time and never reused across connections,
@@ -13424,6 +14045,9 @@ magnus_parse_options(int argc, char **argv)
     /* SCGI dispatch (roadmap 5b-1): same round_robin-only scope. */
     magnus_cluster_init(&magnus_scgi_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
+    /* uwsgi dispatch (roadmap 5c-1): same round_robin-only scope. */
+    magnus_cluster_init(&magnus_uwsgi_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
+                        MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     magnus_cluster_init(&magnus_stream_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
                         MAGNUS_CLUSTER_COOLDOWN_MS, MAGNUS_LB_ROUND_ROBIN);
     magnus_cluster_init(&magnus_udp_cluster, MAGNUS_CLUSTER_FAILURE_THRESHOLD,
@@ -13601,6 +14225,46 @@ magnus_parse_options(int argc, char **argv)
             if (stat(argv[index + 1], &metadata) != 0
                 || !S_ISDIR(metadata.st_mode)) break;
             strcpy(magnus_scgi_root, argv[index + 1]);
+        } else if (strcmp(argv[index], "--uwsgi-upstream") == 0) {
+            /* ipv4:port or ipv4:port:weight; repeatable to build the
+             * uwsgi cluster. Literal IPv4 only, same restriction and
+             * reasoning as --scgi-upstream's own identical comment. */
+            char spec[80];
+            char *saveptr = NULL;
+            char *address;
+            char *port_text;
+            char *weight_text;
+            char *end;
+            unsigned long upstream_port;
+            unsigned long weight = 1;
+            struct in_addr probe;
+            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
+            strcpy(spec, argv[index + 1]);
+            address = strtok_r(spec, ":", &saveptr);
+            port_text = strtok_r(NULL, ":", &saveptr);
+            weight_text = strtok_r(NULL, ":", &saveptr);
+            if (address == NULL || port_text == NULL) break;
+            if (inet_pton(AF_INET, address, &probe) != 1) break;
+            errno = 0;
+            upstream_port = strtoul(port_text, &end, 10);
+            if (errno != 0 || *end != '\0' || upstream_port == 0
+                || upstream_port > 65535) break;
+            if (weight_text != NULL) {
+                errno = 0;
+                weight = strtoul(weight_text, &end, 10);
+                if (errno != 0 || *end != '\0' || weight == 0
+                    || weight > 1000) break;
+            }
+            if (magnus_cluster_add(&magnus_uwsgi_cluster, address,
+                                   (unsigned) upstream_port,
+                                   (unsigned) weight) != 0) break;
+            magnus_uwsgi_upstream_enabled = true;
+        } else if (strcmp(argv[index], "--uwsgi-root") == 0) {
+            struct stat metadata;
+            if (strlen(argv[index + 1]) >= sizeof(magnus_uwsgi_root)) break;
+            if (stat(argv[index + 1], &metadata) != 0
+                || !S_ISDIR(metadata.st_mode)) break;
+            strcpy(magnus_uwsgi_root, argv[index + 1]);
         } else if (strcmp(argv[index], "--stream-listen") == 0) {
             char *end;
             unsigned long stream_port;
@@ -13985,6 +14649,12 @@ magnus_parse_options(int argc, char **argv)
                             "needs at least one --scgi-upstream\n");
             exit(2);
         }
+        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_UWSGI
+            && !magnus_uwsgi_upstream_enabled) {
+            fprintf(stderr, "magnus: --route: a route with action=uwsgi "
+                            "needs at least one --uwsgi-upstream\n");
+            exit(2);
+        }
     }
     if (magnus_fastcgi_upstream_enabled && magnus_fastcgi_root[0] == '\0') {
         fprintf(stderr, "magnus: --fastcgi-upstream needs --fastcgi-root\n");
@@ -13992,6 +14662,10 @@ magnus_parse_options(int argc, char **argv)
     }
     if (magnus_scgi_upstream_enabled && magnus_scgi_root[0] == '\0') {
         fprintf(stderr, "magnus: --scgi-upstream needs --scgi-root\n");
+        exit(2);
+    }
+    if (magnus_uwsgi_upstream_enabled && magnus_uwsgi_root[0] == '\0') {
+        fprintf(stderr, "magnus: --uwsgi-upstream needs --uwsgi-root\n");
         exit(2);
     }
     if (magnus_stream_enabled && magnus_stream_cluster.count == 0) {
@@ -14371,6 +15045,17 @@ main(int argc, char **argv)
                 continue;
             }
             if (fd >= 0 && fd < MAGNUS_MAX_FDS
+                && magnus_uwsgi_owner[fd] != NULL) {
+                /* Same shape as the SCGI branch just above. */
+                connection = magnus_uwsgi_owner[fd];
+                result = magnus_uwsgi_handle_upstream(epoll_fd, connection,
+                                                      flags);
+                if (result < 0
+                    && magnus_connections[connection->fd] != NULL)
+                    magnus_close_connection(epoll_fd, connection);
+                continue;
+            }
+            if (fd >= 0 && fd < MAGNUS_MAX_FDS
                 && magnus_h2_upstream_owner[fd] != NULL) {
                 /* Unlike the HTTP/1.1 branch above, a stream-local
                  * failure here (magnus_h2_handle_upstream() already
@@ -14505,6 +15190,7 @@ main(int argc, char **argv)
             magnus_expire_proxies(epoll_fd, now);
             magnus_fastcgi_expire(epoll_fd, now);
             magnus_scgi_expire(epoll_fd, now);
+            magnus_uwsgi_expire(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
             magnus_stream_expire_idle(epoll_fd, now);
             magnus_udp_expire_idle(epoll_fd, now);

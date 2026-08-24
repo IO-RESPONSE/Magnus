@@ -82,7 +82,17 @@ typedef enum {
      * unlike action=fastcgi's own original 5a-1 GET-only first cut,
      * there is no natural narrower restriction to start from here --
      * see magnus_scgi_build_request()'s own doc comment in magnus.c). */
-    MAGNUS_ROUTE_ACTION_SCGI
+    MAGNUS_ROUTE_ACTION_SCGI,
+    /* uwsgi dispatch (roadmap 5c-1): relays to a real uWSGI application
+     * server over the "uwsgi" wire protocol -- a third categorically
+     * different upstream protocol, same reasoning action=fastcgi/
+     * action=scgi already established their own dedicated dispatch
+     * machinery for. HTTP/1.1 only; any method, with or without a
+     * request body, and connect/read timeout enforcement, both
+     * included from this protocol's own first cut -- the same
+     * deliberately wider-than-FastCGI's-original-5a-1 scope
+     * action=scgi already chose, for the identical reasons. */
+    MAGNUS_ROUTE_ACTION_UWSGI
 } magnus_route_action_t;
 
 typedef struct {
@@ -105,7 +115,7 @@ typedef struct {
 /* Parses one `route = ...` config value into `out`: semicolon-separated
  * conditions (each `key=value`, or `key:subkey=value` for header/
  * header_prefix/cookie/query, which need a field name as well as an
- * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi|scgi`, plus
+ * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi|scgi|uwsgi`, plus
  * an optional `cache=on|off` modifier (roadmap 2d-1; only valid alongside
  * `action=proxy` -- see magnus_route_t's own `cache_enabled` field), in
  * any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with

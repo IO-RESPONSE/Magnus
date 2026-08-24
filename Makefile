@@ -33,7 +33,8 @@ SOURCES := src/magnus.c src/magnus_base64.c src/magnus_cache.c \
            src/magnus_h2.c \
            src/magnus_http.c src/magnus_phase.c src/magnus_policy.c \
            src/magnus_proxy.c src/magnus_quic.c src/magnus_realip.c \
-           src/magnus_route.c src/magnus_scgi.c src/magnus_sni.c src/magnus_ws.c
+           src/magnus_route.c src/magnus_scgi.c src/magnus_sni.c \
+           src/magnus_uwsgi.c src/magnus_ws.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 
 .PHONY: all clean test sanitize tsan
@@ -90,6 +91,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 		build/test-route build/test-dns build/test-ws build/test-h2 \
 		build/test-base64 build/test-compression build/test-realip \
 		build/test-cache build/test-sni build/test-fastcgi build/test-scgi \
+		build/test-uwsgi \
 		build/quic-handshake-check \
 		build/fuzz-http build/fuzz-route build/fuzz-ws build/fuzz-h2 \
 		build/fuzz-base64 build/fuzz-compression build/fuzz-realip \
@@ -109,6 +111,7 @@ test: all build/test-http build/test-policy build/test-proxy build/test-config \
 	./build/test-sni
 	./build/test-fastcgi
 	./build/test-scgi
+	./build/test-uwsgi
 	./build/fuzz-http
 	./build/fuzz-route
 	./build/fuzz-ws
@@ -155,6 +158,10 @@ build/test-fastcgi: tests/test-fastcgi.c src/magnus_fastcgi.c src/magnus_fastcgi
 build/test-scgi: tests/test-scgi.c src/magnus_scgi.c src/magnus_scgi.h
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-scgi.c src/magnus_scgi.c -o $@
+
+build/test-uwsgi: tests/test-uwsgi.c src/magnus_uwsgi.c src/magnus_uwsgi.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc tests/test-uwsgi.c src/magnus_uwsgi.c -o $@
 
 build/test-dns: tests/test-dns.c src/magnus_dns.c src/magnus_dns.h
 	mkdir -p build
