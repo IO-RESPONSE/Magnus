@@ -3959,6 +3959,26 @@ struct magnus_h2_stream {
     size_t compress_capture_capacity;
     char compress_raw_headers[MAGNUS_PROXY_HEADER_LIMIT + 1];
     size_t compress_raw_headers_length;
+    /* Streaming proxy dispatch response compression, HTTP/2 (roadmap
+     * 2a-11) -- the h2 analogue of magnus_connection_t's own 2a-10
+     * fields, distinct from both compress_pending/compress_capture just
+     * above (the buffer-then-compress path) and stream_compress/
+     * stream_compress_inbuf below (2a-8's own static-file streaming --
+     * different feature, different lifecycle, deliberately not shared
+     * field names even though at most one of the three is ever active
+     * for a given stream). Unlike HTTP/1.1's connection->proxy_buffer
+     * (reused directly as the compressor's pending-input queue),
+     * stream->io_buffer here is repurposed as the compressed *output*
+     * queue instead -- magnus_h2_read_io_buffer() already knows how to
+     * pull from it and report DEFERRED/EOF correctly, so reusing it
+     * avoids a second read_callback entirely, but that means raw,
+     * not-yet-compressed bytes recv()'d from upstream need a *different*
+     * home: proxy_stream_compress_inbuf/_length/_sent, a dedicated
+     * MAGNUS_PROXY_BUFFER-sized staging buffer, fills that role. */
+    magnus_stream_compressor_t *proxy_stream_compress;
+    unsigned char *proxy_stream_compress_inbuf;
+    size_t proxy_stream_compress_inbuf_length;
+    size_t proxy_stream_compress_inbuf_sent;
     /* Streaming compression, HTTP/2 static files past
      * MAGNUS_COMPRESSION_MAX_SIZE (roadmap 2a-8) -- the h2 analogue of
      * magnus_connection_t's own 2a-7 fields, distinct from proxy
@@ -4212,6 +4232,20 @@ magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
     stream->compress_capture = NULL;
     stream->compress_capture_length = 0;
     stream->compress_capture_capacity = 0;
+    /* Roadmap 2a-11: same "a retry/abnormal ending must not carry a
+     * failed/finished attempt's partial state forward" reasoning as
+     * compress_capture just above -- a successful, streamed completion
+     * has already finished and freed this compressor from within
+     * magnus_h2_proxy_stream_compress_response() before ever reaching
+     * here (magnus_stream_compress_end()/free() below are therefore
+     * already-NULL no-ops on that path, same tolerance every other
+     * teardown call in this codebase relies on). */
+    magnus_stream_compress_end(stream->proxy_stream_compress);
+    stream->proxy_stream_compress = NULL;
+    free(stream->proxy_stream_compress_inbuf);
+    stream->proxy_stream_compress_inbuf = NULL;
+    stream->proxy_stream_compress_inbuf_length = 0;
+    stream->proxy_stream_compress_inbuf_sent = 0;
     /* gRPC (2c-1, pooled/multiplexed since 2c-5): the fd/session this
      * stream's RPC was relayed through belong to the *pool*, not this
      * stream, and must never be closed/deleted just because this one RPC
@@ -4270,6 +4304,16 @@ magnus_h2_stream_free(struct magnus_h2_stream *stream)
      * buffers this whole function already handles. */
     magnus_stream_compress_end(stream->stream_compress);
     free(stream->stream_compress_inbuf);
+    /* Roadmap 2a-11: proxy_stream_compress/proxy_stream_compress_inbuf
+     * are NOT freed here directly (unlike stream_compress/
+     * stream_compress_inbuf just above, an unrelated static-file-only
+     * feature teardown_upstream() never touches) -- they are upstream-
+     * attempt-scoped, exactly like cache_capture/compress_capture below,
+     * so magnus_h2_stream_teardown_upstream() already frees and NULLs
+     * them; freeing here too, before that call runs, would double-free
+     * the still-live pointer instead of the harmless free(NULL) a
+     * *post*-teardown_upstream() redundant free (like cache_capture's/
+     * compress_capture's own below) would be. */
     magnus_h2_stream_teardown_upstream(stream);
     free(stream->body);
     free(stream->io_buffer);
@@ -6208,7 +6252,17 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
             && info.content_length >= MAGNUS_COMPRESSION_MIN_SIZE
             && info.content_length <= MAGNUS_COMPRESSION_MAX_SIZE
             && magnus_content_type_compressible(info.content_type);
+        /* Roadmap 2a-11: the streaming analogue of try_compress, for
+         * exactly the one case its own MAGNUS_COMPRESSION_MAX_SIZE
+         * bound excludes -- see magnus_proxy_receive_headers()'s own
+         * identical HTTP/1.1 comment. */
+        bool try_stream_compress = encoding != MAGNUS_ENCODING_NONE
+            && info.status == 200 && !info.has_content_encoding
+            && info.has_content_length
+            && info.content_length > MAGNUS_COMPRESSION_MAX_SIZE
+            && magnus_content_type_compressible(info.content_type);
         stream->compress_pending = try_compress;
+        stream->proxy_stream_compress = NULL;
         if (try_compress) {
             /* Defer submit_response2() until the whole body is captured
              * and compressed (see magnus_h2_proxy_maybe_complete()'s
@@ -6233,10 +6287,47 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
                 return true;
             }
             stream->io_length = 0;
-        } else {
+        } else if (try_stream_compress) {
+            /* Unlike try_compress, nothing here is deferred -- see
+             * magnus_proxy_receive_headers()'s own identical HTTP/1.1
+             * comment. A genuine allocation failure (the compressor
+             * itself, or its input staging buffer) simply declines
+             * streaming, exactly like the HTTP/1.1 path's own identical
+             * fallback: proxy_stream_compress stays NULL, and the plain
+             * uncompressed relay below runs as if try_stream_compress
+             * had been false. */
+            stream->proxy_stream_compress
+                = magnus_stream_compress_begin(encoding);
+            if (stream->proxy_stream_compress != NULL) {
+                stream->proxy_stream_compress_inbuf
+                    = malloc(MAGNUS_PROXY_BUFFER);
+                if (stream->proxy_stream_compress_inbuf == NULL) {
+                    magnus_stream_compress_end(stream->proxy_stream_compress);
+                    stream->proxy_stream_compress = NULL;
+                }
+            }
+        }
+        if (stream->proxy_stream_compress != NULL) {
+            /* io_buffer becomes the compressed *output* queue from here
+             * on (magnus_h2_read_io_buffer() already pulls from it
+             * correctly) -- this initial leftover chunk, still raw, goes
+             * into the new input staging buffer instead, exactly like
+             * every later magnus_h2_proxy_stream_compress_response() fill
+             * does. */
+            memcpy(stream->proxy_stream_compress_inbuf, body_start, leftover);
+            stream->proxy_stream_compress_inbuf_length = leftover;
+            stream->proxy_stream_compress_inbuf_sent = 0;
+            stream->io_length = 0;
+        } else if (!try_compress) {
             memmove(stream->io_buffer, body_start, leftover);
             stream->io_length = leftover;
         }
+        stream->compress_encoding = encoding; /* also read by the
+            * streaming-submit block below, past this block's own scope
+            * for `encoding` itself -- harmless to set even when neither
+            * try_compress nor try_stream_compress fired, since
+            * compress_pending/proxy_stream_compress being false/NULL
+            * means nothing else ever reads it in that case. */
     }
     stream->io_sent = 0;
     stream->headers_received = true;
@@ -6247,9 +6338,38 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
 
     magnus_cluster_result(&magnus_cluster, stream->endpoint_index, true,
                           magnus_now_ms());
-    if (!stream->compress_pending)
+    if (stream->proxy_stream_compress != NULL) {
+        /* Streaming (2a-11): the real compressed length can never be
+         * known ahead of time, so headers go out now, via a second
+         * sanitize call using the (size_t) -2 sentinel (Content-
+         * Encoding/Vary, no Content-Length -- magnus_h2_proxy_submit_
+         * response() already drops the Connection header sanitize
+         * would otherwise append regardless, since h2 forbids it, so
+         * unlike HTTP/1.1 there is no separate "force Connection:
+         * close" step needed here at all). header_copy is safe to
+         * reuse (not pristine any more, but re-tokenizing it a second
+         * time with the same delimiter set reproduces the identical
+         * partition -- the exact same reuse magnus_h2_proxy_finish_
+         * compression() already relies on for compress_raw_headers). */
+        char stream_sanitized[MAGNUS_PROXY_SANITIZED_LIMIT];
+        magnus_proxy_response_info_t stream_info;
+        int stream_sanitized_length = magnus_proxy_sanitize_response_headers(
+            header_copy, header_length, stream_sanitized,
+            sizeof(stream_sanitized),
+            stream->issue_affinity_cookie ? stream->affinity_key : NULL,
+            true, (size_t) -2,
+            magnus_encoding_name(stream->compress_encoding), &stream_info,
+            NULL);
+        if (stream_sanitized_length < 0) {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return true;
+        }
+        magnus_h2_proxy_submit_response(connection, stream, stream_info.status,
+                                        stream_sanitized);
+    } else if (!stream->compress_pending) {
         magnus_h2_proxy_submit_response(connection, stream, info.status,
                                         sanitized);
+    }
     magnus_requests_total++;
     if (info.status >= 500) magnus_responses_5xx++;
     else if (info.status >= 400) magnus_responses_4xx++;
@@ -6325,6 +6445,98 @@ magnus_h2_proxy_stream_response(struct magnus_h2_stream *stream)
     }
     if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
     magnus_h2_proxy_abort(stream);
+}
+
+/* The streaming-compress analogue of magnus_h2_proxy_stream_response()
+ * (roadmap 2a-11) -- called instead of it whenever stream->
+ * proxy_stream_compress is non-NULL. Structurally different from every
+ * static-file streaming path this codebase has (2a-8's own
+ * magnus_h2_read_stream_compressed(), a *pull*-based read_callback that
+ * fetches more input itself on demand via pread()): here input only
+ * ever arrives *pushed*, asynchronously, exactly like the plain h1-proxy
+ * relay's own upstream recv() above, so this is a push-driven fill
+ * function instead of a pull callback, mirroring magnus_proxy_flush()'s
+ * own HTTP/1.1 streaming-compress block. Backpressure is on io_buffer
+ * (the compressed *output* queue magnus_h2_read_io_buffer() drains, not
+ * the raw upstream bytes) -- never touches anything while nghttp2 has
+ * not yet pulled the previous chunk out. Loops internally exactly like
+ * every other streaming-compression call site in this codebase already
+ * does (roadmap 2a-9's own "zstd/Brotli don't guarantee output on every
+ * call" lesson): a step() call that consumes input but produces nothing
+ * simply retries -- fetching more raw input first if the staging buffer
+ * is empty and more is expected, or immediately if it is not -- until
+ * real progress (output produced, or done) happens or there is
+ * genuinely nothing left to do right now. */
+static void
+magnus_h2_proxy_stream_compress_response(struct magnus_h2_stream *stream)
+{
+    if (stream->io_length > stream->io_sent) return; /* backpressure */
+    for (;;) {
+        bool complete_by_length = stream->has_response_length
+            && stream->response_received >= stream->response_length;
+
+        if (stream->proxy_stream_compress_inbuf_sent
+            == stream->proxy_stream_compress_inbuf_length
+            && !complete_by_length && !stream->upstream_eof) {
+            ssize_t received = recv(stream->upstream_fd,
+                stream->proxy_stream_compress_inbuf, MAGNUS_PROXY_BUFFER, 0);
+            if (received > 0) {
+                stream->proxy_stream_compress_inbuf_length = (size_t) received;
+                stream->proxy_stream_compress_inbuf_sent = 0;
+                stream->response_received += (size_t) received;
+                stream->last_activity = time(NULL);
+                if (stream->cache_this_response_cacheable)
+                    magnus_h2_proxy_cache_capture(stream,
+                        (const char *) stream->proxy_stream_compress_inbuf,
+                        (size_t) received);
+            } else if (received == 0) {
+                stream->upstream_eof = true;
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            } else {
+                magnus_h2_proxy_abort(stream);
+                return;
+            }
+        }
+
+        {
+            size_t consumed = 0, produced = 0;
+            bool done = false;
+            bool ok = magnus_stream_compress_step(stream->proxy_stream_compress,
+                stream->proxy_stream_compress_inbuf
+                    + stream->proxy_stream_compress_inbuf_sent,
+                stream->proxy_stream_compress_inbuf_length
+                    - stream->proxy_stream_compress_inbuf_sent,
+                complete_by_length || stream->upstream_eof, &consumed,
+                (unsigned char *) stream->io_buffer, MAGNUS_PROXY_BUFFER,
+                &produced, &done);
+            if (!ok) {
+                magnus_h2_proxy_abort(stream);
+                return;
+            }
+            stream->proxy_stream_compress_inbuf_sent += consumed;
+            if (stream->proxy_stream_compress_inbuf_sent
+                == stream->proxy_stream_compress_inbuf_length) {
+                stream->proxy_stream_compress_inbuf_length = 0;
+                stream->proxy_stream_compress_inbuf_sent = 0;
+            }
+            stream->io_length = produced;
+            stream->io_sent = 0;
+            if (done) {
+                magnus_stream_compress_end(stream->proxy_stream_compress);
+                stream->proxy_stream_compress = NULL;
+                magnus_h2_proxy_maybe_complete(stream);
+                return;
+            }
+            if (produced > 0) return; /* let nghttp2 pull this chunk first */
+            /* produced == 0, !done: zero-progress guard -- loop back
+             * around, either to fetch more input (if the staging buffer
+             * is now empty and more is expected) or to retry step()
+             * immediately against whatever is still unconsumed. */
+        }
+    }
 }
 
 /* Entry point for any epoll event on a proxy-dispatched stream's
@@ -6421,7 +6633,10 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
             return 0;
         }
     } else if ((flags & (EPOLLIN | EPOLLRDHUP)) != 0) {
-        magnus_h2_proxy_stream_response(stream);
+        if (stream->proxy_stream_compress != NULL)
+            magnus_h2_proxy_stream_compress_response(stream);
+        else
+            magnus_h2_proxy_stream_response(stream);
     }
 
     /* Whatever just happened above may have added bytes to io_buffer (or

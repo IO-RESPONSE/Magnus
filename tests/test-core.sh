@@ -2204,6 +2204,44 @@ cmp "$compress_proxy_root/stream.html" "$web_root/compress-proxy-stream.dec"
 curl --http1.1 --insecure --fail --silent \
   "https://127.0.0.1:$port_compress_proxy/healthz" >/dev/null
 
+# Streaming proxy dispatch response compression, HTTP/2 (roadmap 2a-11):
+# the second protocol slice, confirming the same prediction 2a-8's own
+# static-file streaming compression already did -- h2 needs none of
+# HTTP/1.1's close-delimited-framing workaround, since no protocol
+# requires a Content-Length ahead of a DATA-frame response, so this
+# reuses stream.html/$stream_headers from the HTTP/1.1 block above.
+# --next proves the connection survives a streamed proxy response and
+# stays multiplexed afterward, exactly like 2a-8's own h2 static-file
+# streaming test already proved for that case.
+curl --http2 --insecure --fail --silent -H 'Accept-Encoding: gzip' \
+  --dump-header "$stream_headers" \
+  --output "$web_root/compress-proxy-h2-stream.gz" \
+  "https://127.0.0.1:$port_compress_proxy/proxy/stream.html" \
+  --next --insecure --fail --silent \
+  "https://127.0.0.1:$port_compress_proxy/healthz" --output /dev/null
+grep -qi '^content-encoding: gzip' "$stream_headers"
+grep -qi '^vary: Accept-Encoding' "$stream_headers"
+! grep -qi '^content-length:' "$stream_headers"
+gzip -dc "$web_root/compress-proxy-h2-stream.gz" \
+  | cmp "$compress_proxy_root/stream.html" -
+
+curl --http2 --insecure --fail --silent -H 'Accept-Encoding: zstd' \
+  --dump-header "$stream_headers" \
+  --output "$web_root/compress-proxy-h2-stream.zst" \
+  "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
+grep -qi '^content-encoding: zstd' "$stream_headers"
+! grep -qi '^content-length:' "$stream_headers"
+zstd -dc "$web_root/compress-proxy-h2-stream.zst" \
+  | cmp "$compress_proxy_root/stream.html" -
+
+curl --http2 --insecure --fail --silent --compressed \
+  --dump-header "$stream_headers" \
+  --output "$web_root/compress-proxy-h2-stream.dec" \
+  "https://127.0.0.1:$port_compress_proxy/proxy/stream.html"
+grep -qi '^content-encoding: br' "$stream_headers"
+! grep -qi '^content-length:' "$stream_headers"
+cmp "$compress_proxy_root/stream.html" "$web_root/compress-proxy-h2-stream.dec"
+
 kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=

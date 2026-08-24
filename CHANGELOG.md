@@ -1,5 +1,82 @@
 # Changelog
 
+## 1.47.0
+
+### Fixed
+
+- **A self-inflicted bug found while building this release's own
+  streaming-compression feature: an HTTP/2 stream teardown could
+  double-free, aborting the whole process with a heap-corruption
+  error.** `magnus_h2_stream_free()`'s first draft freed the new
+  `proxy_stream_compress_inbuf` staging buffer directly, then
+  unconditionally freed it *again* a few lines later inside
+  `magnus_h2_stream_teardown_upstream()` (which it always calls, and
+  which already owns that field's cleanup -- the same way it already
+  owns `compress_capture`/`cache_capture`'s own, both of which are
+  correctly freed exactly once because that helper NULLs them
+  afterward). Caught immediately: the very first live run of this
+  release's own new HTTP/2 streaming-compression test block aborted
+  with `corrupted size vs. prev_size while consolidating` -- a real
+  glibc malloc heap-corruption check, not a sanitizer finding. Fixed
+  by removing the redundant free from `magnus_h2_stream_free()`,
+  relying entirely on `magnus_h2_stream_teardown_upstream()` to free
+  and NULL the field exactly once. Verified: `make test` clean
+  (twice), and direct ASan/UBSan testing of the live server (9+ HTTP/2
+  requests across all three encodings, a `--next` connection-reuse
+  check, and a plain-large-file regression check, zero findings).
+
+### Added
+
+- **Streaming proxy dispatch response compression, HTTP/2 (roadmap
+  2a-11) -- the second protocol slice, following 2a-10's own HTTP/1.1
+  one.** Confirms the same prediction 2a-8's own HTTP/2 static-file
+  streaming compression already made: no close-delimited-framing
+  workaround needed at all, since HTTP/2 never requires a
+  Content-Length ahead of a DATA-frame response.
+
+  Structurally different from 2a-8's own *pull*-based
+  `nghttp2_data_provider2` `read_callback` (which fetches more input
+  itself, on demand, via `pread()`, the moment nghttp2 wants to emit
+  the next DATA frame): 2a-11's own input only ever arrives *pushed*,
+  asynchronously, off the upstream socket -- exactly like 2a-10's own
+  HTTP/1.1 relay, and unlike every other streaming path this codebase
+  has so far. Rather than force a pull-based shape onto a push-driven
+  data source, this adds a new push-driven fill function instead
+  (`magnus_h2_proxy_stream_compress_response()`), called from
+  `magnus_h2_handle_upstream()` on every upstream-readable event, in
+  place of the plain relay's own `magnus_h2_proxy_stream_response()`.
+
+  `struct magnus_h2_stream`'s own `io_buffer` -- already the pull
+  buffer `magnus_h2_read_io_buffer()` drains for every other h2
+  response this codebase produces, including the plain, uncompressed
+  proxy relay -- is repurposed as the compressed *output* queue here
+  too, so no new read callback was needed at all: the existing one
+  already knows how to drain it, report `NGHTTP2_ERR_DEFERRED` while
+  more is expected, and report EOF once `response_complete` is set.
+  Raw, not-yet-compressed bytes `recv()` delivers get a new home
+  instead, a dedicated `proxy_stream_compress_inbuf` staging buffer,
+  since they can no longer share `io_buffer` with the compressed
+  output. Response headers go out immediately (`Content-Encoding`/
+  `Vary`, no `Content-Length`) the moment the upstream's own headers
+  are known, via the same `(size_t) -2` sentinel 2a-10 added to
+  `magnus_proxy_sanitize_response_headers()` -- `magnus_h2_proxy_
+  submit_response()` already drops the `Connection` header that call
+  would otherwise append regardless (forbidden in h2, RFC 9113 8.2.2),
+  so unlike HTTP/1.1 there was no separate "force `Connection: close`"
+  step needed here either.
+
+  Verified: a 9 MB (well past the 8 MiB bound) upstream response
+  compresses correctly via gzip/zstd/Brotli through a real live HTTP/2
+  proxy fetch, byte-exact after decoding, with no `Content-Length`
+  header present; a `--next` connection-reuse check confirms the
+  connection survives a streamed proxy response and stays multiplexed
+  afterward, exactly like 2a-8's own HTTP/2 static-file streaming test
+  already proved for that case; `make test` (twice, including the
+  pre-existing buffer-then-compress proxy dispatch regression block,
+  unaffected) clean; a full Docker image rebuild plus live container
+  verification (all three encodings, byte-exact, over real HTTP/2)
+  clean.
+
 ## 1.46.0
 
 ### Added

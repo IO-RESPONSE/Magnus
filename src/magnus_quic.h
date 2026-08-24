@@ -16,15 +16,15 @@
  * joining as a third, both across static-file and proxy-dispatch
  * compression alike, on all three protocols; 2a-7/2a-8/2a-9 streaming
  * compression for static files past 2a's own 8 MiB bound, on HTTP/1.1,
- * HTTP/2, and HTTP/3; 2a-10 the same for HTTP/1.1 proxy dispatch
- * responses -- narrowing the item this list itself used to carry down
- * to just HTTP/2/HTTP/3 proxy dispatch, see that item's own scope
- * below. 2a-8 fixed a real, previously-latent bug it found along the
- * way: magnus_h2_drain_send() (magnus.c) retried a failed/partial
- * SSL_write() against a *different* buffer address than the original
- * attempt saw, violating OpenSSL's own same-address retry contract --
- * silently truncated any h2-over-TLS response large enough to hit a
- * partial write mid-transfer. 2a-9 found a second: zstd's own
+ * HTTP/2, and HTTP/3; 2a-10/2a-11 the same for proxy dispatch
+ * responses, HTTP/1.1 then HTTP/2 -- narrowing the item this list
+ * itself used to carry down to just HTTP/3 proxy dispatch, see that
+ * item's own scope below. 2a-8 fixed a real, previously-latent bug it
+ * found along the way: magnus_h2_drain_send() (magnus.c) retried a
+ * failed/partial SSL_write() against a *different* buffer address than
+ * the original attempt saw, violating OpenSSL's own same-address retry
+ * contract -- silently truncated any h2-over-TLS response large enough
+ * to hit a partial write mid-transfer. 2a-9 found a second: zstd's own
  * ZSTD_compressStream2() (and Brotli's BrotliEncoderCompressStream())
  * do not guarantee output on every call, only forward input
  * consumption -- a single-call-per-invocation h3 read_data callback
@@ -34,15 +34,27 @@
  * offered; fixed by looping internally until real progress happens
  * (and applied to HTTP/2's own equivalent callback too, which never
  * reproduced a hang in testing but relied on nghttp2's own eager retry
- * timing rather than on any real guarantee to avoid it)). Unlike every
- * static-file streaming path, 2a-10's own proxy-dispatch input only
- * ever arrives pushed, asynchronously, by the ordinary uncompressed
+ * timing rather than on any real guarantee to avoid it). 2a-11 found a
+ * third, real but self-inflicted this time: its own first draft of
+ * struct magnus_h2_stream's teardown freed proxy_stream_compress_inbuf
+ * directly, then unconditionally again inside magnus_h2_stream_
+ * teardown_upstream() (which already owns that cleanup, same as
+ * compress_capture/cache_capture) -- a genuine double-free, caught by
+ * a real heap-corruption abort under this increment's own new h2
+ * streaming test, not a sanitizer run. Unlike every static-file
+ * streaming path, 2a-10/2a-11's own proxy-dispatch input only ever
+ * arrives *pushed*, asynchronously, by the ordinary uncompressed
  * relay's own recv() off the upstream socket, not pulled on demand --
- * so magnus_proxy_flush()'s own new streaming-compress block reuses
- * proxy_buffer/_length/_sent directly as the compressor's pending-
- * input queue and simply waits for the next upstream read when it
- * runs out, rather than fetching more itself the way a pread()-backed
- * loop safely could.
+ * HTTP/1.1's own magnus_proxy_flush() reuses proxy_buffer/_length/
+ * _sent directly as the compressor's pending-input queue; HTTP/2's own
+ * new magnus_h2_proxy_stream_compress_response() is a push-driven fill
+ * function (unlike 2a-8's own *pull*-based read_callback) that reuses
+ * stream->io_buffer as the compressed *output* queue magnus_h2_read_
+ * io_buffer() already knows how to drain, with a dedicated new
+ * proxy_stream_compress_inbuf staging buffer for the not-yet-
+ * compressed raw bytes recv() delivers -- both simply wait for the
+ * next upstream read when they run out of input, rather than fetching
+ * more themselves the way a pread()-backed loop safely could.
  * -- a UDP listener wired into Magnus's own epoll reactor that
  * completes a real ngtcp2 handshake using the ngtcp2 +
  * libngtcp2_crypto_ossl + nghttp3 stack chosen in
@@ -55,11 +67,12 @@
  * silently missing (same "narrow the first cut, extend later" pattern
  * every sub-phase below has already used once):
  *   - 0-RTT (4a)
- *   - streaming compression for proxy-dispatch responses, on all three
- *     protocols, past 2a's own 8 MiB bound -- 2a-7/2a-8/2a-9 narrowed
- *     this from "streaming/chunked compression above 8 MiB, cross-
- *     cutting across h1/h2/h3" down to just this one remaining
- *     dimension; static files now stream on every protocol
+ *   - streaming compression for HTTP/3 proxy-dispatch responses past
+ *     2a's own 8 MiB bound -- 2a-7/2a-8/2a-9 narrowed this from
+ *     "streaming/chunked compression above 8 MiB, cross-cutting across
+ *     h1/h2/h3" down to proxy dispatch only (static files now stream on
+ *     every protocol), and 2a-10/2a-11 narrowed proxy dispatch itself
+ *     down to just this one remaining protocol
  *   - a real HTTP/1.1 `Transfer-Encoding: chunked` response writer,
  *     which would let 2a-7's own streaming-compressed responses keep
  *     the connection alive afterward instead of always closing -- 2a-7
@@ -92,7 +105,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "1.46.0"
+#define MAGNUS_VERSION "1.47.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener

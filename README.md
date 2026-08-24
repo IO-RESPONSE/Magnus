@@ -402,7 +402,27 @@ independently by IORESPONSE.
   once the upstream's own headers are known, rather than deferred the
   way the buffer-then-compress path's own headers are. HTTP/2 and
   HTTP/3 proxy dispatch streaming compression remain later increments
-- Container image: 10,724,922 bytes (~10.23 MiB), non-root, read-only rootfs
+- Streaming proxy dispatch response compression, HTTP/2 (roadmap 2a-11):
+  the second protocol slice, confirming the same prediction 2a-8's own
+  HTTP/2 static-file streaming compression already did -- no close-
+  delimited-framing workaround needed, since h2 never requires a
+  Content-Length ahead of a DATA-frame response. Structurally different
+  from 2a-8's own *pull*-based `read_callback` (which fetches more input
+  itself, on demand, via `pread()`): here input only ever arrives
+  *pushed*, exactly like 2a-10's own HTTP/1.1 relay, so this is a new
+  push-driven fill function instead, called on every upstream-readable
+  event. `struct magnus_h2_stream`'s own `io_buffer` is repurposed as
+  the compressed *output* queue (the existing pull callback already
+  knows how to drain it correctly) with a new dedicated staging buffer
+  for not-yet-compressed raw bytes. Found and fixed one real,
+  self-inflicted bug along the way: the first draft's own stream
+  teardown freed the new staging buffer directly, then unconditionally
+  again inside the shared upstream-teardown helper that already owned
+  that cleanup -- a genuine double-free, caught by a real heap-
+  corruption abort under this increment's own new test, not a
+  sanitizer run. HTTP/3 proxy dispatch streaming compression remains
+  the one item left on this whole roadmap thread
+- Container image: 10,725,558 bytes (~10.23 MiB), non-root, read-only rootfs
 
 See `CHANGELOG.md` for what shipped in 1.0.0. Longer-range direction and
 completion criteria for future work live in `docs/ENTERPRISE_ARCHITECTURE.md`

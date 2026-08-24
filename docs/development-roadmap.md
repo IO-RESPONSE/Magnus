@@ -714,6 +714,47 @@ connection-pool and common-request-model decisions).
       are. HTTP/2 and HTTP/3 proxy dispatch streaming compression
       remain later increments. See `CHANGELOG.md` 1.46.0 for the full
       detail.
+    - **2a-11 — streaming proxy dispatch response compression, HTTP/2.
+      Shipped in 1.47.0.** The second protocol slice, confirming the
+      same prediction 2a-8's own HTTP/2 static-file streaming
+      compression already did: no close-delimited-framing workaround
+      needed, since HTTP/2 never requires a Content-Length ahead of a
+      DATA-frame response. Structurally different from 2a-8's own
+      *pull*-based `nghttp2_data_provider2` callback (which fetches
+      more input itself, on demand, via `pread()`): 2a-11's own input
+      only ever arrives *pushed*, asynchronously, exactly like 2a-10's
+      own HTTP/1.1 relay -- so this is a new push-driven fill function
+      (`magnus_h2_proxy_stream_compress_response()`), called on every
+      upstream-readable event, instead of a pull callback. `struct
+      magnus_h2_stream`'s own `io_buffer` is repurposed as the
+      compressed *output* queue (the pre-existing `magnus_h2_read_io_
+      buffer()` pull callback already knows how to drain it correctly
+      and report DEFERRED/EOF, so no new read callback was needed at
+      all), with a new dedicated `proxy_stream_compress_inbuf` staging
+      buffer for the not-yet-compressed raw bytes `recv()` delivers.
+
+      Found and fixed one real bug along the way, this time self-
+      inflicted rather than pre-existing: the first draft's own stream
+      teardown (`magnus_h2_stream_free()`) freed `proxy_stream_compress_
+      inbuf` directly, then unconditionally again inside `magnus_h2_
+      stream_teardown_upstream()` (which already owns that cleanup,
+      exactly the same way it already owns `compress_capture`/
+      `cache_capture`'s own) -- a genuine double-free, caught
+      immediately by a real heap-corruption abort (`corrupted size vs.
+      prev_size while consolidating`) the moment this increment's own
+      new `test-core.sh` block ran, not by a sanitizer pass. Fixed by
+      removing the redundant free from `magnus_h2_stream_free()`,
+      relying on `magnus_h2_stream_teardown_upstream()` (which it
+      always calls) to free-and-NULL both fields exactly once, the
+      same pattern `compress_capture`/`cache_capture` already
+      established. Verified clean afterward: `make test` (twice) and
+      direct ASan/UBSan testing of the live server (9+ h2 requests
+      across all three encodings, plus a `--next` connection-reuse
+      check and a plain-large-file regression check, zero findings).
+
+      HTTP/3 proxy dispatch streaming compression is now the one
+      remaining item on this whole roadmap thread. See `CHANGELOG.md`
+      1.47.0 for the full detail.
   - **Real IP 2b — PROXY protocol v1/v2, Forwarded/X-Forwarded-For.
     Shipped in 1.12.0.** Entirely gated on a `trusted_proxies` CIDR
     allowlist (default off); resolution feeds `source_cidr` route
