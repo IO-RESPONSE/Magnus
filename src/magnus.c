@@ -1744,6 +1744,23 @@ static bool magnus_config_mode;
 static char magnus_config_path[MAGNUS_CONFIG_PATH_MAX];
 static unsigned magnus_listen_port;
 static volatile sig_atomic_t magnus_reload_requested;
+/* Roadmap 5d-1 (Runtime API expansion): set by SIGUSR1 (magnusd_drain()
+ * in src/magnusd.c sends it, driven by magnusctl's own new `drain`
+ * subcommand) and never cleared -- draining is one-directional for the
+ * lifetime of a process, the same way a real "quiesce before shutdown/
+ * upgrade" operation always is in practice (there is no real use case
+ * for "undraining" an instance that is about to be replaced or
+ * rebooted anyway). Gates magnus_accept_connections() on the primary
+ * listener only (see main()'s own `if (fd == listener)` branch) --
+ * the admin channel and the L4 stream/UDP/QUIC listeners are
+ * deliberately still out of scope for this first cut (a distinct
+ * future increment, not silently half-done), the same "narrow first
+ * cut" pattern this codebase's every other Phase 5 increment has
+ * already used. Also flips /healthz to 503 (magnus_dispatch_request())
+ * and a new magnus_draining gauge in /metrics -- so an external load
+ * balancer's own readiness probe, not just this process's own listener
+ * backlog, stops routing new traffic here. */
+static volatile sig_atomic_t magnus_draining;
 
 static int magnus_update_interest(int epoll_fd,
                                   magnus_connection_t *connection,
@@ -1826,6 +1843,15 @@ magnus_reload_signal_handler(int signal_number)
 {
     (void) signal_number;
     magnus_reload_requested = 1;
+}
+
+/* Roadmap 5d-1 (Runtime API expansion): SIGUSR1 requests drain mode --
+ * see magnus_draining's own doc comment for the full mechanism. */
+static void
+magnus_drain_signal_handler(int signal_number)
+{
+    (void) signal_number;
+    magnus_draining = 1;
 }
 
 /* Fills `out[32]` (plus a NUL terminator, so `out` must be at least 33
@@ -5293,8 +5319,15 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         return;
     }
     if (is_healthz_path) {
-        magnus_h2_submit_text(connection, stream, "200", "text/plain",
-                              "magnus: ok\n", head_only);
+        /* Roadmap 5d-1: same drain-aware behavior as the HTTP/1.1 path
+         * (magnus_dispatch_request()'s own identical branch). */
+        if (magnus_draining) {
+            magnus_h2_submit_text(connection, stream, "503", "text/plain",
+                                  "magnus: draining\n", head_only);
+        } else {
+            magnus_h2_submit_text(connection, stream, "200", "text/plain",
+                                  "magnus: ok\n", head_only);
+        }
         return;
     }
     if (is_metrics_path && !magnus_admin_enabled) {
@@ -8768,6 +8801,8 @@ magnus_build_metrics(char *out, size_t out_capacity)
         "magnus_connections_total %llu\n"
         "# TYPE magnus_connections_active gauge\n"
         "magnus_connections_active %llu\n"
+        "# TYPE magnus_draining gauge\n"
+        "magnus_draining %d\n"
         "# TYPE magnus_requests_total counter\n"
         "magnus_requests_total %llu\n"
         "magnus_responses_4xx_total %llu\n"
@@ -8783,6 +8818,7 @@ magnus_build_metrics(char *out, size_t out_capacity)
         "magnus_quic_migration_total %llu\n",
         (unsigned long long) magnus_connections_total,
         (unsigned long long) magnus_connections_active,
+        magnus_draining ? 1 : 0,
         (unsigned long long) magnus_requests_total,
         (unsigned long long) magnus_responses_4xx,
         (unsigned long long) magnus_responses_5xx,
@@ -10995,9 +11031,24 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "text/plain", "method not allowed\n", false,
                                 close_connection, &request);
     } else if (strcmp(request.path, "/healthz") == 0) {
-        magnus_prepare_response(connection, 200, "OK", "text/plain",
-                                "magnus: ok\n", head_only, close_connection,
-                                &request);
+        /* Roadmap 5d-1: while draining, /healthz reports unhealthy --
+         * not because anything is actually wrong with this process
+         * (it is still correctly finishing every in-flight request),
+         * but so an external load balancer's own readiness probe stops
+         * routing *new* traffic here too, not just this process's own
+         * listener backlog (magnus_draining's own doc comment). The
+         * same real-world "flip readiness before/instead of exiting"
+         * pattern Kubernetes' preStop+readinessProbe combination relies
+         * on. */
+        if (magnus_draining) {
+            magnus_prepare_response(connection, 503, "Service Unavailable",
+                                    "text/plain", "magnus: draining\n",
+                                    head_only, close_connection, &request);
+        } else {
+            magnus_prepare_response(connection, 200, "OK", "text/plain",
+                                    "magnus: ok\n", head_only, close_connection,
+                                    &request);
+        }
     } else if (strcmp(request.path, "/metrics") == 0
                && (connection->admin_only || !magnus_admin_enabled)) {
         char metrics[MAGNUS_METRICS_BUFFER];
@@ -14969,6 +15020,7 @@ main(int argc, char **argv)
     signal(SIGINT, magnus_signal_handler);
     signal(SIGTERM, magnus_signal_handler);
     signal(SIGHUP, magnus_reload_signal_handler);
+    signal(SIGUSR1, magnus_drain_signal_handler);
     signal(SIGPIPE, SIG_IGN);
     /* Active-health probe fd slots were already reset to -1 before
      * magnus_parse_options() -- see that call site's own comment. */
@@ -14997,7 +15049,14 @@ main(int argc, char **argv)
             magnus_connection_t *connection;
             int result = 0;
             if (fd == listener) {
-                (void) magnus_accept_connections(epoll_fd, listener, false);
+                /* Roadmap 5d-1: draining stops pulling new connections
+                 * off this listener's own backlog entirely -- the OS
+                 * queues/refuses them per ordinary TCP semantics from
+                 * here, exactly as if this process had already exited,
+                 * while every connection already accepted keeps being
+                 * serviced normally by the rest of this loop. */
+                if (!magnus_draining)
+                    (void) magnus_accept_connections(epoll_fd, listener, false);
                 continue;
             }
             if (magnus_admin_enabled && fd == magnus_admin_listener) {

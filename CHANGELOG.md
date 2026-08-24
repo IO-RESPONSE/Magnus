@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.58.0
+
+### Added
+
+- **Runtime API expansion (roadmap 5d-1): a real graceful-drain
+  operation.** `magnusctl drain --socket <path>` (new `DRAIN` command
+  in the `magnusd`/`magnusctl` control protocol) tells the running
+  `magnus` child to stop accepting *new* client connections while
+  continuing to serve every connection already in flight to
+  completion -- distinct from both `RELOAD` (swaps live config, keeps
+  accepting) and `SHUTDOWN` (unconditional, does not wait for anything).
+  Delivered as a new `SIGUSR1` signal magnusd sends the child
+  (fire-and-forget, mirroring `SIGHUP`'s own reload mechanism); the
+  data plane itself reports its own drained state via two independent,
+  complementary channels rather than magnusd tracking it directly:
+
+  - The primary HTTP(S) listener's own `accept()` simply stops being
+    called once draining -- new connection attempts are refused/queued
+    by the OS exactly as if the process had already exited, while
+    every already-accepted connection keeps being serviced by the rest
+    of the event loop untouched. (The admin channel and the L4 stream/
+    UDP/QUIC listeners are deliberately not gated by this first cut --
+    a distinct future increment, not silently half-done.)
+  - `/healthz` on an *already-open* connection (e.g. a load balancer's
+    own long-lived health-check connection, a common real-world
+    pattern) flips from `200 OK` to `503 Service Unavailable` once
+    draining -- not because anything is actually wrong, but so an
+    external load balancer's own readiness probe stops routing new
+    traffic here too, the same real-world "flip readiness, then let
+    in-flight work finish" pattern a Kubernetes `preStop` hook +
+    readiness probe combination relies on. A brand-new connection
+    during drain cannot reach this response at all (the listener has
+    already stopped accepting) -- both mechanisms are complementary,
+    not redundant, covering the "already-open probe connection" and
+    "no connection yet" cases respectively. A new `magnus_draining`
+    Prometheus gauge in `/metrics` covers programmatic polling.
+
+  Verified: a raw-socket test (not curl, specifically so the same TCP
+  connection could be reused across the before/after check) confirming
+  an already-open `/healthz` connection sees the `200`→`503` flip while
+  a brand-new connection attempt made after draining begins correctly
+  times out/is refused; a new `tests/test-control-plane.sh` block
+  driving the whole path end to end through real `magnusctl drain`
+  (not a raw signal) against a real `magnusd`-supervised child, then
+  confirming `STATUS` reports `last_action=drain` and the audit log
+  records it. Directly verified inside the real read-only/non-root
+  Docker image (`ioresponse/magnus:1.58.0`) too, via `docker kill
+  --signal=USR1 <container>` -- the same mechanism a Kubernetes
+  `preStop` hook would use against a real container's own PID 1, since
+  the shipped image contains only the `magnus` data-plane binary
+  itself, not `magnusd` (control-plane supervision is an orchestrator-
+  level concern in a containerized deployment, not something baked
+  into the image). `make test` twice clean, direct ASan/UBSan testing
+  of the full `magnusd`+`magnus`+`magnusctl` path (drain, then
+  shutdown) with zero findings.
+
 ## 1.57.0
 
 ### Added

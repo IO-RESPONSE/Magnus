@@ -8,7 +8,8 @@
  * did not survive, restarting magnus from it -- whenever a reload fails
  * its post-apply health check. Every start/reload/rollback is appended to
  * an audit log. A tiny line-based protocol over a Unix domain socket
- * (magnusd_protocol.h) is how magnusctl drives check/reload/status.
+ * (magnusd_protocol.h) is how magnusctl drives check/reload/status/
+ * drain (roadmap 5d-1, Runtime API expansion) /shutdown.
  *
  * magnusd and magnusctl are assumed to run on the same host and see the
  * same filesystem as the magnus child they supervise -- this is the
@@ -326,6 +327,37 @@ magnusd_reload(char *response, size_t response_capacity)
             "ROLLED_BACK post-apply health check failed");
 }
 
+/* Roadmap 5d-1 (Runtime API expansion): tells the running magnus child
+ * to stop accepting new client connections (SIGUSR1) while continuing
+ * to serve every connection already in flight -- see magnusd_protocol.h's
+ * own MAGNUSD_CMD_DRAIN doc comment for how this differs from RELOAD/
+ * SHUTDOWN. Fire-and-forget from magnusd's own side: whether/how many
+ * connections are still in flight is the data plane's own concern to
+ * report (via /healthz turning 503 and the new magnus_draining /metrics
+ * gauge, src/magnus.c), not anything magnusd itself tracks -- the same
+ * "magnusd supervises the process, the process reports its own traffic
+ * state" division magnusd_reload()'s own post-apply health check
+ * already has. A no-op (still reports OK) if the child is not alive at
+ * all -- draining a process that is not running is trivially already
+ * true, the same reasoning magnusd_reload()'s own child-not-alive
+ * branch spawns fresh rather than treating as an error. */
+static void
+magnusd_drain(char *response, size_t response_capacity)
+{
+    if (!magnusd_child_alive()) {
+        strcpy(magnusd_last_action, "drain");
+        strcpy(magnusd_last_result, "ok");
+        magnusd_audit("drain", magnusd_current_hash, "ok", "child not running");
+        snprintf(response, response_capacity, "OK not running");
+        return;
+    }
+    kill(magnusd_child_pid, SIGUSR1);
+    strcpy(magnusd_last_action, "drain");
+    strcpy(magnusd_last_result, "ok");
+    magnusd_audit("drain", magnusd_current_hash, "ok", NULL);
+    snprintf(response, response_capacity, "OK draining");
+}
+
 static int
 magnusd_create_socket(const char *path)
 {
@@ -379,6 +411,8 @@ magnusd_handle_client(int client)
                 magnusd_last_result, magnusd_port);
     } else if (strcmp(command, MAGNUSD_CMD_RELOAD) == 0) {
         magnusd_reload(response, sizeof(response));
+    } else if (strcmp(command, MAGNUSD_CMD_DRAIN) == 0) {
+        magnusd_drain(response, sizeof(response));
     } else if (strcmp(command, MAGNUSD_CMD_SHUTDOWN) == 0) {
         strcpy(response, "OK shutting down");
         stop = true;

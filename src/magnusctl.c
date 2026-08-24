@@ -1,9 +1,10 @@
 /* magnusctl -- thin CLI for magnusd.
  *
  * `check` validates a config file standalone (magnus_config.c, no running
- * magnusd needed -- the "nginx -t" pattern). `reload`, `status`, and
- * `shutdown` are one-line commands sent over magnusd's Unix domain
- * control socket; see src/magnusd.c and src/magnusd_protocol.h. */
+ * magnusd needed -- the "nginx -t" pattern). `reload`, `status`, `drain`
+ * (roadmap 5d-1, Runtime API expansion), and `shutdown` are one-line
+ * commands sent over magnusd's Unix domain control socket; see
+ * src/magnusd.c and src/magnusd_protocol.h. */
 
 #include "magnus_config.h"
 #include "magnusd_protocol.h"
@@ -25,8 +26,9 @@ magnusctl_usage(const char *program)
             "       %s reload --socket <path> --config <path> "
             "[<new-content-path>]\n"
             "       %s status --socket <path>\n"
+            "       %s drain --socket <path>\n"
             "       %s shutdown --socket <path>\n",
-            program, program, program, program);
+            program, program, program, program, program);
     exit(2);
 }
 
@@ -218,6 +220,26 @@ magnusctl_status(int argc, char **argv)
     return strncmp(response, "OK", 2) == 0 ? 0 : 1;
 }
 
+/* Roadmap 5d-1 (Runtime API expansion): tells the running magnus child
+ * to stop accepting new connections while finishing every one already
+ * in flight -- see magnusd_protocol.h's own MAGNUSD_CMD_DRAIN doc
+ * comment for the full mechanism. Mirrors magnusctl_shutdown()'s own
+ * shape exactly. */
+static int
+magnusctl_drain(int argc, char **argv)
+{
+    const char *socket_path = magnusctl_find_flag(argc, argv, "--socket");
+    char response[256];
+    if (socket_path == NULL) magnusctl_usage(argv[0]);
+    if (!magnusctl_command(socket_path, MAGNUSD_CMD_DRAIN, response,
+                           sizeof(response))) {
+        fprintf(stderr, "magnusctl: drain: no response from magnusd\n");
+        return 1;
+    }
+    printf("%s\n", response);
+    return strncmp(response, "OK", 2) == 0 ? 0 : 1;
+}
+
 static int
 magnusctl_shutdown(int argc, char **argv)
 {
@@ -240,6 +262,7 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "check") == 0) return magnusctl_check(argc, argv);
     if (strcmp(argv[1], "reload") == 0) return magnusctl_reload(argc, argv);
     if (strcmp(argv[1], "status") == 0) return magnusctl_status(argc, argv);
+    if (strcmp(argv[1], "drain") == 0) return magnusctl_drain(argc, argv);
     if (strcmp(argv[1], "shutdown") == 0) return magnusctl_shutdown(argc, argv);
     magnusctl_usage(argv[0]);
     return 2;

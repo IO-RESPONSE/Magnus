@@ -11,5 +11,13 @@
 #define MAGNUSD_CMD_STATUS "STATUS"
 #define MAGNUSD_CMD_RELOAD "RELOAD"
 #define MAGNUSD_CMD_SHUTDOWN "SHUTDOWN"
+/* Roadmap 5d-1 (Runtime API expansion): tells the running magnus child
+ * to stop accepting new client connections while continuing to serve
+ * every connection already in flight -- distinct from both RELOAD
+ * (swaps live config, keeps accepting) and SHUTDOWN (unconditional,
+ * does not wait for in-flight work). See src/magnusd.c's own
+ * magnusd_drain() and src/magnus.c's own SIGUSR1 handling for the full
+ * mechanism. */
+#define MAGNUSD_CMD_DRAIN "DRAIN"
 
 #endif

@@ -1564,8 +1564,28 @@ connection-pool and common-request-model decisions).
   200000 bytes, a clean 502/504, 50 concurrent requests, zero ASan/
   UBSan findings -- see `CHANGELOG.md` 1.57.0.
 
-  Still ahead for Phase 5: Runtime API expansion, and the zero-downtime
-  binary upgrade mechanism itself.
+  **5d-1 (Runtime API expansion: graceful drain) shipped in 1.58.0** --
+  a new `magnusctl drain` control-protocol command (`DRAIN`, delivered
+  as a new `SIGUSR1` signal to the running child, mirroring `SIGHUP`'s
+  own reload mechanism) that stops the primary listener's own
+  `accept()` while every already-open connection keeps being served to
+  completion, plus `/healthz` flipping to `503` on any already-open
+  connection (e.g. a load balancer's own long-lived health-check
+  connection) and a new `magnus_draining` `/metrics` gauge -- so both
+  an external readiness probe and direct polling can observe the
+  drained state, not just new connection attempts being refused at the
+  TCP level. Verified end to end through real `magnusctl drain` against
+  a real `magnusd`-supervised child (new `tests/test-control-plane.sh`
+  block) and directly inside the real Docker image via `docker kill
+  --signal=USR1` (the same mechanism a Kubernetes `preStop` hook would
+  use). The admin channel and L4 stream/UDP/QUIC listeners are
+  deliberately not gated by this first cut -- see `CHANGELOG.md` 1.58.0.
+
+  Still ahead for Phase 5: the zero-downtime binary upgrade mechanism
+  itself (inherited listener FD hand-off, old-process drain -- 5d-1's
+  own drain mechanism is a natural building block for the "old process
+  stops taking new work" half of that, but the FD hand-off to a new
+  binary is still wholly unbuilt).
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously

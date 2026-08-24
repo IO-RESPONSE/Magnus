@@ -136,6 +136,80 @@ grep -q '^ts=[0-9]* actor=[^ ]* action=start .* result=ok$' "$audit"
 grep -q 'action=reload .* result=ok$' "$audit"
 grep -q 'action=reload .* result=rejected detail="port change' "$audit"
 
+# Drain (roadmap 5d-1, Runtime API expansion): distinct from both
+# reload (config swap, keeps accepting) and shutdown (unconditional) --
+# stops accepting *new* connections while an already-open one keeps
+# being served normally, and /healthz on that already-open connection
+# flips to 503 so an external load balancer's own readiness probe (not
+# just this process's own listener backlog) also stops routing new
+# traffic here. Verified with a raw socket (not curl) specifically so
+# the same TCP connection can be reused across the before/after check --
+# curl's own short-lived-by-default connections cannot observe this.
+python3 -c "
+import socket, subprocess, time, sys
+
+port = $port
+sock_path = '$socket'
+ctl_bin = '$magnusctl_bin'
+
+s = socket.create_connection(('127.0.0.1', port), timeout=5)
+s.sendall(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
+before = s.recv(4096)
+assert before.split(b'\r\n')[0] == b'HTTP/1.1 200 OK', before
+
+out = subprocess.run([ctl_bin, 'drain', '--socket', sock_path],
+                     capture_output=True, text=True, check=True)
+assert out.stdout.startswith('OK'), out.stdout
+time.sleep(1)
+
+# same already-open connection now sees 503
+s.sendall(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
+after = s.recv(4096)
+assert after.split(b'\r\n')[0] == b'HTTP/1.1 503 Service Unavailable', after
+s.close()
+
+# a brand-new connection is refused/times out at the listener itself
+try:
+    s2 = socket.create_connection(('127.0.0.1', port), timeout=2)
+    s2.sendall(b'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+    s2.settimeout(2)
+    data = s2.recv(4096)
+    assert False, 'new connection during drain unexpectedly got: %r' % data
+except (socket.timeout, ConnectionRefusedError, OSError):
+    pass
+
+print('drain: persistent-connection 503 + new-connection refusal ok')
+"
+status4=$(ctl status)
+printf '%s\n' "$status4" | grep -q 'last_action=drain last_result=ok'
+grep -q 'action=drain .* result=ok$' "$audit"
+
+# The drained child is no longer reachable at all (confirmed above) --
+# not itself a useful state to leave running, and it would make the
+# final "magnus no longer answers after shutdown" check below
+# meaningless (it already wouldn't answer, drained or not). Killing it
+# lets magnusd's own crash detection (already proven above) respawn a
+# fresh, non-draining child, so that final check still actually proves
+# something. Capture the currently-live pid via STATUS itself here --
+# not the $child_pid/$restarted_pid captured earlier in this script,
+# either of which may already be stale by this point.
+drained_pid=$(printf '%s' "$status4" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+test -n "$drained_pid"
+kill -9 "$drained_pid" >/dev/null 2>&1 || true
+respawned_pid=""
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  status5=$(ctl status 2>/dev/null || true)
+  candidate=$(printf '%s' "$status5" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+  if [ -n "$candidate" ] && [ "$candidate" != "$drained_pid" ] \
+      && kill -0 "$candidate" 2>/dev/null; then
+    respawned_pid=$candidate
+    break
+  fi
+done
+test -n "$respawned_pid"
+test "$(curl --fail --silent "http://127.0.0.1:$port/hello.txt")" = 'root-v2'
+
 ctl shutdown | grep -q '^OK'
 for attempt in 1 2 3 4 5; do
   kill -0 "$magnusd_pid" 2>/dev/null || break
