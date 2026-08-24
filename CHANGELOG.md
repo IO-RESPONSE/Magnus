@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.53.0
+
+### Added
+
+- **FastCGI retry-on-upstream-failure (roadmap 5a-3).** Any upstream-
+  side failure -- connect, send, receive, or a malformed response --
+  now retries against a different healthy endpoint once, bounded by a
+  new `MAGNUS_FASTCGI_MAX_ATTEMPTS` (2, same value and reasoning as
+  `MAGNUS_PROXY_MAX_ATTEMPTS`), before giving up with a clean
+  synthesized 502/504. This is deliberately broader than `action=proxy`
+  dispatch's own retry (`magnus_proxy_connect_failed()`, limited to
+  connect-stage failures only, since streaming to the client can
+  already be underway by the time a later failure happens): FastCGI
+  dispatch's whole-response-buffering design (5a-1's own key
+  architectural property) means nothing ever reaches the client until
+  `magnus_fastcgi_finish()` runs, so *every* upstream failure short of
+  that point is still safely retryable, not just a connect one.
+
+  `magnus_fastcgi_pick_and_start()` split into a reusable `magnus_
+  fastcgi_connect_endpoint()` (mirrors `magnus_proxy_connect_endpoint()`
+  -- resends the same already-built request buffer from byte 0 on a
+  fresh connection rather than rebuilding it) plus the actual retry
+  loop, both for the initial synchronous attempt and for a later
+  asynchronous failure via the new `magnus_fastcgi_connect_failed()`.
+  `magnus_fastcgi_teardown_upstream()` no longer frees `connection->
+  fastcgi_out` itself (a retry needs it to survive); the two terminal
+  paths (`magnus_fastcgi_fail()` giving up, `magnus_fastcgi_finish()`
+  succeeding) free it explicitly instead, mirroring how `proxy_request`
+  is already handled as a fixed buffer never touched by `magnus_proxy_
+  teardown_upstream()` at all. A pre-existing 5a-1 gap fixed along the
+  way: an `EPOLLERR`/`EPOLLHUP` event on the upstream fd never called
+  `magnus_cluster_result()` before failing, so a connection-reset-style
+  failure was invisible to the cluster's own passive circuit breaker;
+  routing it through the same retry helper (which always records the
+  result first) fixed this for free.
+
+  Verified against a real PHP-FPM 8.3.31 backend with a two-endpoint
+  cluster (one endpoint always down -- nothing listening on its port,
+  the other real PHP-FPM): 20 sequential GETs and a 40-request
+  concurrent GET+POST burst all succeeded (`200`, never `502`) despite
+  round-robin routing roughly half of them at the dead endpoint first;
+  both endpoints down together still answers a clean `502`, with clean
+  recovery once PHP-FPM restarts. `make test` (twice, clean) and direct
+  ASan/UBSan testing of the live server (the same 40-request burst
+  against the always-one-endpoint-down cluster, plus the both-down/
+  recovery cycle) zero findings.
+
 ## 1.52.0
 
 ### Added

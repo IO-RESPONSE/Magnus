@@ -1479,7 +1479,19 @@ connection-pool and common-request-model decisions).
   across 4 records, empty-body POST, and the pre-existing generic 413
   cap unaffected — see `CHANGELOG.md` 1.52.0.
 
-  Still ahead for Phase 5: connection pooling/retry/affinity for
+  **5a-3 (FastCGI retry-on-upstream-failure) shipped in 1.53.0** --
+  retries against a different healthy endpoint on *any* upstream
+  failure (connect/send/receive/malformed response), not just a
+  connect-stage one the way `action=proxy`'s own retry is limited to,
+  since FastCGI's whole-response-buffering design means nothing ever
+  reaches the client before `magnus_fastcgi_finish()` runs. Bounded by
+  `MAGNUS_FASTCGI_MAX_ATTEMPTS` (2). Verified against a real two-
+  endpoint PHP-FPM cluster with one endpoint always down: 20 sequential
+  + 40 concurrent requests all still succeeded — see `CHANGELOG.md`
+  1.53.0 for the pre-existing 5a-1 gap (a missing `magnus_cluster_
+  result()` call on `EPOLLERR`/`EPOLLHUP`) it fixed along the way.
+
+  Still ahead for Phase 5: connection pooling and session affinity for
   FastCGI (parity with what proxy/gRPC dispatch already have), SCGI,
   uWSGI, Runtime API expansion, and the zero-downtime binary upgrade
   mechanism itself.

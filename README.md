@@ -126,7 +126,12 @@ independently by IORESPONSE.
   `SCRIPT_FILENAME`, the FastCGI equivalent of nginx's own
   `fastcgi_param SCRIPT_FILENAME
   $document_root$fastcgi_script_name;`). One fresh, non-pooled
-  connection per request (no pooling/retry/affinity yet). Any HTTP
+  connection per request (no pooling/affinity yet); any upstream-side
+  failure -- connect, send, receive, or a malformed response, not just
+  a connect-stage one -- retries against a different healthy endpoint
+  once before giving up with a clean 502/504, since nothing is ever
+  sent to the client until the whole response is known complete. Any
+  HTTP
   method is relayed, with whatever request body was already buffered
   ahead of dispatch (the same generic pre-dispatch buffering
   `action=proxy` uses, up to the same 1 MiB cap) sent as one or more
