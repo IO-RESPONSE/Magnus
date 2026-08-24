@@ -1,5 +1,93 @@
 # Changelog
 
+## 1.59.0
+
+### Added
+
+- **Zero-downtime binary upgrade (roadmap 5e-1) -- closes out Phase 5.**
+  `magnusctl upgrade [<new-binary-path>]` replaces the running `magnus`
+  child with a fresh process (a new build, or the same binary path
+  re-executed) with zero dropped requests, by handing the live
+  listener fd off to the successor via `SCM_RIGHTS` over a dedicated
+  Unix domain socket rather than the successor binding a fresh one --
+  the new process shares the exact same kernel socket the old one was
+  already accepting on, so there is no window where nothing is bound
+  to the port at all. Built directly on roadmap 5d-1's own drain
+  mechanism: the old process is only ever told to stop accepting new
+  connections (the same `SIGUSR1`/`drain` signal `magnusctl drain`
+  already sends) once the new one is *proven* ready -- until then, the
+  old process keeps serving every bit of live traffic completely
+  unaffected, so a broken new binary (crashes on start, fails its own
+  validation, doesn't even exist) is simply killed and discarded with
+  zero impact. The old process then finishes its own in-flight work and
+  exits **on its own** once idle (a new addition to 5d-1's own drain
+  logic: draining while already at zero active connections now exits
+  cleanly through the same graceful-shutdown path `SIGTERM` already
+  drives, rather than sitting there permanently unhealthy forever --
+  this also means a plain `magnusctl drain` with nothing else now
+  concludes by itself, no second stop command needed).
+
+  - New `src/magnus.c` capability: `--upgrade-socket <path>` (a
+    one-shot Unix domain socket, mode 0700, this process listens on
+    purely to hand its listener fd to a single legitimate successor)
+    and `--inherit-fd <path>` (receive another process's listener fd
+    instead of binding fresh). `magnusd` always passes `--upgrade-
+    socket` to every child it spawns, making the capability always-
+    available under supervision with no separate opt-in.
+  - New `UPGRADE` command in the `magnusd`/`magnusctl` control protocol
+    (`src/magnusd_protocol.h`) -- the only command in that protocol
+    carrying a wire-level argument (an optional new binary path).
+    `src/magnusd.c`'s `magnusd_upgrade()` orchestrates the whole
+    sequence: spawn the successor with `--inherit-fd` pointed at the
+    predecessor's own `--upgrade-socket`, wait for it to prove itself
+    ready, drain the predecessor, hand off supervision. Never commits
+    to anything until success is confirmed -- the same "review of the
+    existing SIGHUP-reload atomicity guarantees" discipline the
+    roadmap's own Phase 5 intro asked for, adapted from "swap the
+    config a running process reads" to "swap the whole process".
+
+  **A real, safety-critical bug was found and fixed during this
+  increment's own live testing** (caught via a stress-test repro, not
+  the first pass): `magnusd_upgrade()`'s first draft reused `magnusd_
+  reload()`'s own health check -- polling `/healthz` on the shared
+  port. That check cannot tell *which* process answered during an
+  upgrade's own handoff window, because the old process is deliberately
+  still alive and still serving the whole time. A broken new binary
+  that crashed immediately (or, in testing, simply did not exist) could
+  still make `magnusd_upgrade()` believe it had succeeded, because the
+  *old* process kept answering `/healthz` regardless -- reproduced
+  reliably (roughly 50% of runs) once a stress-test script iterated the
+  upgrade path back-to-back. Fixed with a dedicated readiness pipe
+  (`--ready-fd <N>`, `src/magnus.c`): `magnusd` creates a pipe unique to
+  each spawn attempt, passes the write end to that one child only, and
+  the child writes a single byte to it right before its own reactor
+  loop starts -- unambiguous about which process is confirmed ready,
+  since only that one specific child ever holds the write end. A second
+  real (much smaller) bug surfaced in the same pass: a successful
+  upgrade's old process, once it exited on its own, was never reaped
+  (`magnusd`'s own `SIGCHLD` handling only ever `waitpid()`d the
+  currently-*tracked* pid) -- a zombie process leaking, unboundedly,
+  across every future upgrade. Fixed by reaping *any* exited child
+  unconditionally on `SIGCHLD`, before the existing tracked-pid crash-
+  detection check runs.
+
+  Verified: continuous traffic (a real Python client, not a single
+  before/after snapshot) spanning the entire handoff window with zero
+  failed requests, both for a successful upgrade and confirming a
+  failed one (`upgrade <nonexistent-path>`) leaves the current process
+  completely untouched and still serving; the old pid genuinely gone
+  (not a zombie) after a successful upgrade; a new `tests/test-control-
+  plane.sh` block driving the whole sequence through real `magnusctl
+  upgrade`, both outcomes. Directly verified across two real, separate
+  Docker containers (`ioresponse/magnus:1.59.0`) sharing only a bind-
+  mounted directory for the handoff socket -- the old container handed
+  its listener fd to the new one, continuous traffic held (156/156)
+  across a manual `docker kill --signal=USR1` drain trigger, and the
+  old container exited **on its own** (`Exited (0)`) once idle, with
+  zero manual cleanup. `make test` twice clean, direct ASan/UBSan
+  testing of the full `magnusd`+`magnus`+`magnusctl` upgrade sequence
+  (success and failure paths) with zero findings.
+
 ## 1.58.0
 
 ### Added

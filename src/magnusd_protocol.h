@@ -19,5 +19,16 @@
  * magnusd_drain() and src/magnus.c's own SIGUSR1 handling for the full
  * mechanism. */
 #define MAGNUSD_CMD_DRAIN "DRAIN"
+/* Roadmap 5e-1 (zero-downtime binary upgrade): replaces the running
+ * magnus child with a fresh process (a new build, or the same binary
+ * path re-executed) that inherits the live listener fd from the old
+ * one via SCM_RIGHTS -- optionally followed by a space and a new
+ * binary path on the same line ("UPGRADE /path/to/new/magnus"); a bare
+ * "UPGRADE" re-executes whatever binary path magnusd was already
+ * configured with. The only command in this protocol that carries an
+ * argument on the wire at all -- every other one is still a bare
+ * keyword. See src/magnusd.c's own magnusd_upgrade() for the full,
+ * health-gated handoff sequence. */
+#define MAGNUSD_CMD_UPGRADE "UPGRADE"
 
 #endif

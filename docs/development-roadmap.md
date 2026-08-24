@@ -1581,11 +1581,30 @@ connection-pool and common-request-model decisions).
   use). The admin channel and L4 stream/UDP/QUIC listeners are
   deliberately not gated by this first cut -- see `CHANGELOG.md` 1.58.0.
 
-  Still ahead for Phase 5: the zero-downtime binary upgrade mechanism
-  itself (inherited listener FD hand-off, old-process drain -- 5d-1's
-  own drain mechanism is a natural building block for the "old process
-  stops taking new work" half of that, but the FD hand-off to a new
-  binary is still wholly unbuilt).
+  **5e-1 (zero-downtime binary upgrade) shipped in 1.59.0 -- closes out
+  Phase 5.** `magnusctl upgrade [<new-binary-path>]` hands the live
+  listener fd off to a fresh successor process via `SCM_RIGHTS` (new
+  `--upgrade-socket`/`--inherit-fd` on `magnus` itself), never commits
+  to anything (draining the predecessor via 5d-1's own `SIGUSR1`) until
+  the successor is *proven* ready, and the predecessor exits on its own
+  once idle (a 5d-1 enhancement: draining now auto-exits at zero active
+  connections, rather than sitting drained forever). Found and fixed a
+  real, safety-critical bug during its own live testing: the first
+  draft's health confirmation (`/healthz` polling on the shared port,
+  reused from `magnusd_reload()`) could not tell *which* process
+  answered during the handoff window, since the old one is deliberately
+  still alive and serving throughout it -- a broken/nonexistent new
+  binary could still be declared successful roughly half the time in
+  stress testing, because the *old* process kept answering regardless.
+  Fixed with a dedicated per-spawn-attempt readiness pipe (`--ready-fd`)
+  instead, unambiguous by construction. A second, smaller bug (the old
+  process leaking as a zombie -- `SIGCHLD` handling only ever reaped
+  the currently-tracked pid) was found and fixed in the same pass.
+  Verified with continuous real traffic across the entire handoff
+  window (zero failures) for both a successful and a failed upgrade
+  attempt, and directly across two real, separate Docker containers
+  sharing only a bind-mounted socket path -- see `CHANGELOG.md` 1.59.0
+  for the full detail, including both bugs' own root-cause writeups.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously

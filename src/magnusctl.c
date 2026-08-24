@@ -2,9 +2,10 @@
  *
  * `check` validates a config file standalone (magnus_config.c, no running
  * magnusd needed -- the "nginx -t" pattern). `reload`, `status`, `drain`
- * (roadmap 5d-1, Runtime API expansion), and `shutdown` are one-line
- * commands sent over magnusd's Unix domain control socket; see
- * src/magnusd.c and src/magnusd_protocol.h. */
+ * (roadmap 5d-1, Runtime API expansion), `upgrade` (roadmap 5e-1,
+ * zero-downtime binary upgrade), and `shutdown` are one-line commands
+ * sent over magnusd's Unix domain control socket; see src/magnusd.c and
+ * src/magnusd_protocol.h. */
 
 #include "magnus_config.h"
 #include "magnusd_protocol.h"
@@ -27,8 +28,9 @@ magnusctl_usage(const char *program)
             "[<new-content-path>]\n"
             "       %s status --socket <path>\n"
             "       %s drain --socket <path>\n"
+            "       %s upgrade --socket <path> [<new-binary-path>]\n"
             "       %s shutdown --socket <path>\n",
-            program, program, program, program, program);
+            program, program, program, program, program, program);
     exit(2);
 }
 
@@ -61,7 +63,11 @@ magnusctl_command(const char *socket_path, const char *command,
                   char *response, size_t response_capacity)
 {
     int fd = magnusctl_connect(socket_path);
-    char line[64];
+    /* Large enough for UPGRADE's own optional "<command> <new-binary-
+     * path>" shape (see magnusd_protocol.h's own MAGNUSD_CMD_UPGRADE
+     * doc comment) -- every other command here is still a bare
+     * keyword, well under the old 64-byte size this replaced. */
+    char line[MAGNUS_CONFIG_PATH_MAX + 16];
     size_t length = 0;
     ssize_t written;
 
@@ -240,6 +246,47 @@ magnusctl_drain(int argc, char **argv)
     return strncmp(response, "OK", 2) == 0 ? 0 : 1;
 }
 
+/* Roadmap 5e-1 (zero-downtime binary upgrade): the trailing positional
+ * argument (if any -- the same "skip every --flag/value pair, whatever
+ * single bare word survives" scan magnusctl_reload()'s own
+ * <new-content-path> argument already uses) is a new binary path;
+ * omitted, magnusd re-executes whatever binary path it was already
+ * configured with. See magnusd_protocol.h's own MAGNUSD_CMD_UPGRADE
+ * doc comment for the wire shape. */
+static int
+magnusctl_upgrade(int argc, char **argv)
+{
+    const char *socket_path = magnusctl_find_flag(argc, argv, "--socket");
+    const char *binary_path = NULL;
+    char command[MAGNUS_CONFIG_PATH_MAX + 16];
+    char response[320];
+    if (socket_path == NULL) magnusctl_usage(argv[0]);
+    for (int index = 2; index < argc; index++) {
+        if (argv[index][0] == '-') {
+            index++; /* skip this flag's own value too */
+            continue;
+        }
+        binary_path = argv[index];
+        break;
+    }
+    if (binary_path != NULL) {
+        if (snprintf(command, sizeof(command), "%s %s", MAGNUSD_CMD_UPGRADE,
+                     binary_path)
+            >= (int) sizeof(command)) {
+            fprintf(stderr, "magnusctl: upgrade: binary path too long\n");
+            return 1;
+        }
+    } else {
+        strcpy(command, MAGNUSD_CMD_UPGRADE);
+    }
+    if (!magnusctl_command(socket_path, command, response, sizeof(response))) {
+        fprintf(stderr, "magnusctl: upgrade: no response from magnusd\n");
+        return 1;
+    }
+    printf("%s\n", response);
+    return strncmp(response, "OK", 2) == 0 ? 0 : 1;
+}
+
 static int
 magnusctl_shutdown(int argc, char **argv)
 {
@@ -263,6 +310,7 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "reload") == 0) return magnusctl_reload(argc, argv);
     if (strcmp(argv[1], "status") == 0) return magnusctl_status(argc, argv);
     if (strcmp(argv[1], "drain") == 0) return magnusctl_drain(argc, argv);
+    if (strcmp(argv[1], "upgrade") == 0) return magnusctl_upgrade(argc, argv);
     if (strcmp(argv[1], "shutdown") == 0) return magnusctl_shutdown(argc, argv);
     magnusctl_usage(argv[0]);
     return 2;

@@ -272,7 +272,9 @@ independently by IORESPONSE.
   rollback on a failed reload or an unexpected crash, an audit log, and
   (roadmap 5d-1) an explicit `drain` command that stops accepting *any*
   new connection at all rather than just moving them to a new config
-  generation -- see the Components section below for the full mechanism
+  generation, and (roadmap 5e-1) a zero-downtime `upgrade` command that
+  swaps the whole running binary via a live listener-fd handoff, not
+  just its config -- see the Components section below for both mechanisms
 - Prometheus `/metrics` (counters, per-endpoint health, and a request
   latency histogram); access log is buffered, 1-in-N sampleable, and can
   be turned off entirely
@@ -568,18 +570,28 @@ and `docs/ROADMAP.md`.
   or a crash. Not bundled into the data-plane image; it is a separate
   control-plane binary per `docs/ENTERPRISE_ARCHITECTURE.md`.
 - `magnusctl`: thin CLI for `magnusd` -- `check` validates a config file
-  standalone (no daemon needed); `reload`, `status`, `drain`, `shutdown`
-  talk to a running `magnusd` over a Unix domain socket. `drain`
-  (roadmap 5d-1) stops the supervised `magnus` child from accepting any
-  *new* connection while it finishes every one already in flight
-  (delivered as `SIGUSR1`, which a container's own entrypoint/PID 1 can
-  also receive directly -- `docker kill --signal=USR1 <container>`, the
-  same mechanism a Kubernetes `preStop` hook would use, works without
+  standalone (no daemon needed); `reload`, `status`, `drain`,
+  `upgrade`, `shutdown` talk to a running `magnusd` over a Unix domain
+  socket. `drain` (roadmap 5d-1) stops the supervised `magnus` child
+  from accepting any *new* connection while it finishes every one
+  already in flight, then exits on its own once idle (delivered as
+  `SIGUSR1`, which a container's own entrypoint/PID 1 can also receive
+  directly -- `docker kill --signal=USR1 <container>`, the same
+  mechanism a Kubernetes `preStop` hook would use, works without
   `magnusd` in the picture at all); `/healthz` on an already-open
   connection flips to `503` and a new `magnus_draining` `/metrics`
   gauge reports the state, so an external load balancer's own
   readiness probe also stops routing new traffic here, not just the
   listener itself refusing new connections at the TCP level.
+  `upgrade [<new-binary-path>]` (roadmap 5e-1) replaces the running
+  `magnus` child with zero dropped requests: the successor receives the
+  live listener fd via `SCM_RIGHTS` (`--upgrade-socket`/`--inherit-fd`
+  on `magnus` itself) rather than binding a fresh one, is only ever
+  committed to (draining the predecessor via the same `drain` signal)
+  once it proves itself ready over a dedicated per-attempt pipe, and a
+  broken new binary leaves the old process completely unaffected --
+  see `CHANGELOG.md` 1.59.0 for the real health-check-ambiguity bug
+  this design was hardened against.
 - `Magnus Module ABI`: native extension interface per phase (early API)
 
 ## Build and verify

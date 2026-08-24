@@ -9,7 +9,8 @@
  * its post-apply health check. Every start/reload/rollback is appended to
  * an audit log. A tiny line-based protocol over a Unix domain socket
  * (magnusd_protocol.h) is how magnusctl drives check/reload/status/
- * drain (roadmap 5d-1, Runtime API expansion) /shutdown.
+ * drain (roadmap 5d-1, Runtime API expansion)/upgrade (roadmap 5e-1,
+ * zero-downtime binary upgrade)/shutdown.
  *
  * magnusd and magnusctl are assumed to run on the same host and see the
  * same filesystem as the magnus child they supervise -- this is the
@@ -45,6 +46,15 @@ static char magnusd_config_path[MAGNUS_CONFIG_PATH_MAX];
 static char magnusd_rollback_path[MAGNUS_CONFIG_PATH_MAX];
 static char magnusd_magnus_binary[MAGNUS_CONFIG_PATH_MAX];
 static char magnusd_socket_path[MAGNUS_CONFIG_PATH_MAX];
+/* Roadmap 5e-1 (zero-downtime binary upgrade): derived once, at
+ * startup, from magnusd_socket_path -- passed to *every* child
+ * magnusd_spawn_child() ever spawns (via --upgrade-socket) so a
+ * running instance is always ready to hand its listener fd off to a
+ * successor, and reused as the --inherit-fd source when
+ * magnusd_upgrade() spawns that successor. See src/magnus.c's own
+ * magnus_upgrade_listener/magnus_upgrade_receive_listener() doc
+ * comments for the actual handoff mechanism this path is used for. */
+static char magnusd_upgrade_socket_path[MAGNUS_CONFIG_PATH_MAX];
 static char magnusd_audit_log_path[MAGNUS_CONFIG_PATH_MAX];
 static pid_t magnusd_child_pid = -1;
 static unsigned magnusd_port;
@@ -214,18 +224,66 @@ magnusd_wait_healthy(int total_timeout_ms)
     }
 }
 
+/* fd the child dup2()s its inherited ready-pipe write end to before
+ * exec -- see magnus_ready_fd's own doc comment (src/magnus.c) for
+ * what it signals and why. dup2()'s own POSIX guarantee that the
+ * *resulting* descriptor never carries FD_CLOEXEC (regardless of
+ * whether the source fd did) is what lets this survive the exec()
+ * call right after it without any extra fcntl() dance. */
+#define MAGNUSD_CHILD_READY_FD 3
+
+/* Roadmap 5e-1: every spawned child always gets --upgrade-socket (see
+ * that global's own doc comment) -- an ordinary reload/restart never
+ * uses it for anything (nothing ever connects to it unless a real
+ * UPGRADE later asks the child to hand its fd off), so this is a pure
+ * capability grant with no behavior change for every other spawn
+ * reason this function already serves. `binary` and `inherit_from`
+ * let magnusd_upgrade() below reuse this same helper for its own,
+ * different kind of spawn (a possibly-different binary path, and a
+ * source to receive the listener fd from instead of binding fresh);
+ * `ready_write_fd` (-1 for every ordinary caller) is the write end of
+ * a pipe only magnusd_upgrade() creates -- see its own doc comment for
+ * why an upgrade's own health confirmation needs this and plain
+ * start/reload do not. */
 static bool
-magnusd_spawn_child(void)
+magnusd_spawn_child_from(const char *binary, const char *inherit_from,
+                         int ready_write_fd)
 {
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
-        execl(magnusd_magnus_binary, magnusd_magnus_binary, "--config",
-             magnusd_config_path, (char *) NULL);
+        if (ready_write_fd >= 0
+            && dup2(ready_write_fd, MAGNUSD_CHILD_READY_FD) < 0)
+            _exit(127);
+        if (inherit_from != NULL) {
+            if (ready_write_fd >= 0) {
+                char ready_fd_text[16];
+                snprintf(ready_fd_text, sizeof(ready_fd_text), "%d",
+                        MAGNUSD_CHILD_READY_FD);
+                execl(binary, binary, "--config", magnusd_config_path,
+                     "--upgrade-socket", magnusd_upgrade_socket_path,
+                     "--inherit-fd", inherit_from, "--ready-fd",
+                     ready_fd_text, (char *) NULL);
+            } else {
+                execl(binary, binary, "--config", magnusd_config_path,
+                     "--upgrade-socket", magnusd_upgrade_socket_path,
+                     "--inherit-fd", inherit_from, (char *) NULL);
+            }
+        } else {
+            execl(binary, binary, "--config", magnusd_config_path,
+                 "--upgrade-socket", magnusd_upgrade_socket_path,
+                 (char *) NULL);
+        }
         _exit(127);
     }
     magnusd_child_pid = pid;
     return true;
+}
+
+static bool
+magnusd_spawn_child(void)
+{
+    return magnusd_spawn_child_from(magnusd_magnus_binary, NULL, -1);
 }
 
 static void
@@ -341,6 +399,153 @@ magnusd_reload(char *response, size_t response_capacity)
  * all -- draining a process that is not running is trivially already
  * true, the same reasoning magnusd_reload()'s own child-not-alive
  * branch spawns fresh rather than treating as an error. */
+/* Roadmap 5e-1: polls the read end of the readiness pipe magnusd_
+ * upgrade() below creates for exactly this one spawn attempt, until
+ * either the new child writes its one ready byte (true), the pipe
+ * hits EOF because the child's own copy of the write end already
+ * closed without ever writing -- crashed, exited, or exec() itself
+ * failed, all indistinguishable here and all equally "not ready"
+ * (false) -- or `timeout_ms` elapses with neither (false). This is
+ * what actually solves the problem magnusd_wait_healthy()'s own
+ * shared-port /healthz poll cannot during an upgrade specifically: a
+ * pipe only one specific child ever holds the write end of is
+ * unambiguous about *which* process answered, where the port is not
+ * (see magnus_ready_fd's own doc comment, src/magnus.c, for the real
+ * bug this codebase found and fixed by adding it). */
+static bool
+magnusd_wait_ready_pipe(int read_fd, int timeout_ms)
+{
+    struct pollfd poll_fd = { .fd = read_fd, .events = POLLIN, .revents = 0 };
+    int ready = poll(&poll_fd, 1, timeout_ms);
+    char byte;
+    ssize_t n;
+    if (ready <= 0) return false;
+    n = read(read_fd, &byte, 1);
+    return n == 1;
+}
+
+/* Roadmap 5e-1 (zero-downtime binary upgrade): replaces the running
+ * magnus child with a fresh process -- `binary_arg` (possibly a new
+ * build at a different path; empty means "the currently configured
+ * binary path, re-executed") inheriting the live listener fd from the
+ * still-running old child via src/magnus.c's own --upgrade-socket/
+ * --inherit-fd handoff, rather than binding a brand-new socket of its
+ * own. Never touches the old child until the new one is *proven*
+ * healthy -- via a dedicated readiness pipe (magnusd_wait_ready_pipe()
+ * above) unique to this one spawn attempt, NOT magnusd_reload()'s own
+ * shared-port magnusd_wait_healthy(), which cannot safely disambiguate
+ * "the new process is up" from "the old process, deliberately still
+ * alive and still serving throughout this whole window, is still
+ * answering" -- the old child keeps serving every bit of live traffic
+ * the entire time regardless, so a broken new binary (crashes on
+ * start, fails its own startup validation, exec() itself failing,
+ * whatever) is simply killed and discarded, leaving the old one
+ * completely unaffected and never having stopped accepting connections
+ * for even a moment. Only once ready does this send the old child the
+ * exact same drain signal (SIGUSR1) `magnusctl drain` already does
+ * (roadmap 5d-1) -- letting it finish its own in-flight work and exit
+ * on its own (magnus.c's own "draining with zero active connections
+ * exits" logic), rather than this function waiting around for that
+ * itself. This is the "review of the existing SIGHUP-reload atomicity
+ * guarantees" the roadmap's own Phase 5 intro asked for, applied here:
+ * the same "never commit to the risky action until success is
+ * confirmed" discipline magnusd_reload()'s own rollback logic already
+ * has, adapted for "swap the whole process" instead of "swap the
+ * config a running process reads" -- and, as it turned out, needing a
+ * strictly *stronger* confirmation mechanism than reload ever did,
+ * for a reason genuinely specific to swapping the whole process while
+ * the old one stays alive throughout. */
+static void
+magnusd_upgrade(const char *binary_arg, char *response,
+                size_t response_capacity)
+{
+    const char *binary = (binary_arg != NULL && binary_arg[0] != '\0')
+        ? binary_arg : magnusd_magnus_binary;
+    pid_t old_pid;
+    int ready_pipe[2];
+    bool ready;
+
+    if (!magnusd_child_alive()) {
+        magnusd_audit("upgrade", magnusd_current_hash, "rejected",
+                      "no running child to upgrade from");
+        snprintf(response, response_capacity,
+                "REJECTED no running child to upgrade from");
+        return;
+    }
+    old_pid = magnusd_child_pid;
+
+    if (pipe(ready_pipe) < 0) {
+        magnusd_audit("upgrade", magnusd_current_hash, "rejected",
+                      "failed to create readiness pipe");
+        snprintf(response, response_capacity,
+                "REJECTED failed to create readiness pipe");
+        return;
+    }
+
+    if (!magnusd_spawn_child_from(binary, magnusd_upgrade_socket_path,
+                                  ready_pipe[1])) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        magnusd_audit("upgrade", magnusd_current_hash, "rejected",
+                      "failed to spawn new binary");
+        snprintf(response, response_capacity,
+                "REJECTED failed to spawn new binary");
+        magnusd_child_pid = old_pid; /* spawn_child_from() only ever
+            * overwrites this on a successful fork(); a failed one
+            * leaves it at whatever fork() itself did not touch, but
+            * setting it back explicitly here is cheap insurance
+            * against ever silently losing track of the still-healthy
+            * old child over a plain fork() failure. */
+        return;
+    }
+    /* The write end now lives on in the child's own fd table (dup2()'d
+     * there before exec, magnusd_spawn_child_from()'s own doc comment)
+     * -- this parent-side copy must close immediately, not just once
+     * ready_pipe reading is done, or magnusd_wait_ready_pipe() below
+     * would never see EOF for a child that dies without ever writing
+     * (this process's own lingering copy would keep the pipe's write
+     * end alive regardless of the child's own fate). */
+    close(ready_pipe[1]);
+
+    ready = magnusd_wait_ready_pipe(ready_pipe[0], MAGNUSD_RELOAD_HEALTH_TIMEOUT_MS);
+    close(ready_pipe[0]);
+
+    if (!ready) {
+        pid_t failed_pid = magnusd_child_pid;
+        if (failed_pid > 0) {
+            kill(failed_pid, SIGKILL);
+            waitpid(failed_pid, NULL, 0);
+        }
+        magnusd_child_pid = old_pid; /* the old child was never asked
+            * to do anything and is still the one actually serving
+            * traffic -- restore supervision to it. */
+        strcpy(magnusd_last_action, "upgrade");
+        strcpy(magnusd_last_result, "rejected");
+        magnusd_audit("upgrade", magnusd_current_hash, "rejected",
+                      "new binary did not become ready");
+        snprintf(response, response_capacity,
+                "REJECTED new binary did not become ready "
+                "(old pid=%d still serving)", (int) old_pid);
+        return;
+    }
+
+    /* The new child is healthy and already sharing the listener fd --
+     * only now is it safe to tell the old one to stop taking new work. */
+    kill(old_pid, SIGUSR1);
+    magnusd_applied_at = time(NULL);
+    strcpy(magnusd_last_action, "upgrade");
+    strcpy(magnusd_last_result, "ok");
+    {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "old_pid=%d new_pid=%d",
+                (int) old_pid, (int) magnusd_child_pid);
+        magnusd_audit("upgrade", magnusd_current_hash, "ok", detail);
+    }
+    snprintf(response, response_capacity,
+            "OK old_pid=%d new_pid=%d draining old",
+            (int) old_pid, (int) magnusd_child_pid);
+}
+
 static void
 magnusd_drain(char *response, size_t response_capacity)
 {
@@ -397,11 +602,23 @@ magnusd_read_line(int fd, char *buffer, size_t capacity)
 static bool
 magnusd_handle_client(int client)
 {
-    char command[64];
-    char response[256];
+    /* Roadmap 5e-1: large enough to also carry UPGRADE's own optional
+     * "<command> <new-binary-path>" argument -- every other command
+     * here is still a bare keyword, this is the first (and, by design,
+     * only) one with a wire-level argument at all. */
+    char line[MAGNUS_CONFIG_PATH_MAX + 16];
+    char *command;
+    char *argument;
+    char response[320];
     bool stop = false;
 
-    magnusd_read_line(client, command, sizeof(command));
+    magnusd_read_line(client, line, sizeof(line));
+    argument = strchr(line, ' ');
+    if (argument != NULL) {
+        *argument = '\0';
+        argument++;
+    }
+    command = line;
     if (strcmp(command, MAGNUSD_CMD_STATUS) == 0) {
         snprintf(response, sizeof(response),
                 "OK pid=%d config_hash=%016llx applied_at=%lld "
@@ -413,6 +630,8 @@ magnusd_handle_client(int client)
         magnusd_reload(response, sizeof(response));
     } else if (strcmp(command, MAGNUSD_CMD_DRAIN) == 0) {
         magnusd_drain(response, sizeof(response));
+    } else if (strcmp(command, MAGNUSD_CMD_UPGRADE) == 0) {
+        magnusd_upgrade(argument, response, sizeof(response));
     } else if (strcmp(command, MAGNUSD_CMD_SHUTDOWN) == 0) {
         strcpy(response, "OK shutting down");
         stop = true;
@@ -511,6 +730,13 @@ main(int argc, char **argv)
         fprintf(stderr, "magnusd: config path too long\n");
         return 2;
     }
+    if (snprintf(magnusd_upgrade_socket_path,
+                sizeof(magnusd_upgrade_socket_path), "%s.upgrade",
+                magnusd_socket_path)
+        >= (int) sizeof(magnusd_upgrade_socket_path)) {
+        fprintf(stderr, "magnusd: socket path too long\n");
+        return 2;
+    }
 
     if (magnus_config_load(magnusd_config_path, &config, error, sizeof(error))
         != MAGNUS_CONFIG_OK) {
@@ -567,6 +793,23 @@ main(int argc, char **argv)
         }
         if (magnusd_child_reaped) {
             magnusd_child_reaped = 0;
+            /* Roadmap 5e-1: SIGCHLD fires for *any* of our children
+             * exiting, not just the one magnusd_child_pid currently
+             * tracks -- a successful UPGRADE leaves exactly one other
+             * child behind (the old, now-fully-drained process, which
+             * exits on its own once idle -- magnus.c's own "draining
+             * with zero active connections exits" logic) that nothing
+             * else here ever waitpid()s for. Reap every already-exited
+             * child unconditionally, first, before the tracked-pid
+             * crash-detection check below even runs -- otherwise the
+             * old process leaks as a zombie forever (harmless to
+             * traffic, but a real, unbounded process-table leak across
+             * repeated upgrades). WNOHANG in a loop: there can
+             * genuinely be more than one exited child coalesced behind
+             * a single SIGCHLD delivery (POSIX signals do not queue),
+             * and this must never block waiting for one that is not
+             * actually done yet. */
+            while (waitpid(-1, NULL, WNOHANG) > 0) { }
             if (!magnusd_child_alive()) {
                 char *last_good = magnusd_read_file(magnusd_rollback_path);
                 magnusd_audit("supervise", magnusd_current_hash, "crashed",

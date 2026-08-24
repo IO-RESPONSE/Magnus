@@ -1707,6 +1707,59 @@ static int magnus_admin_listener = -1;
 bool magnus_admin_enabled;
 static char magnus_admin_socket_path[MAGNUS_CONFIG_PATH_MAX];
 
+/* Roadmap 5e-1 (zero-downtime binary upgrade): `--upgrade-socket <path>`
+ * is a small Unix domain socket (mode 0700, reusing magnus_create_
+ * admin_listener()'s own bind shape -- an "owner-only" access model is
+ * exactly right for this too) this process listens on for exactly one
+ * purpose: handing its own primary listener fd off to a single
+ * legitimate successor, via SCM_RIGHTS, so that successor can begin
+ * accepting connections on the *same* underlying kernel socket without
+ * ever calling its own bind()/listen() (which would either collide with
+ * this process's still-live one, or -- with SO_REUSEPORT -- silently
+ * split the accept queue between two independently-buffered sockets,
+ * neither of which is what a seamless handoff needs). One-shot by
+ * design: the moment a handoff succeeds, this listener unlinks its own
+ * socket file and stops listening -- there is only ever one legitimate
+ * successor per process, and leaving it listening after that would
+ * just be an unused attack surface. magnusd always passes this flag to
+ * every child it spawns (magnusd_spawn_child()), making the capability
+ * always-available under supervision without any separate per-child
+ * opt-in. Deliberately decoupled from draining (roadmap 5d-1): handing
+ * the fd off does NOT, by itself, put this process into drain mode --
+ * see magnus_upgrade_handle_handoff_request()'s own doc comment for
+ * why that matters (magnusd only sends the drain signal once the new
+ * process is confirmed healthy, never as a side effect of the handoff
+ * alone, so a broken new binary can never cause an availability gap). */
+static int magnus_upgrade_listener = -1;
+static char magnus_upgrade_socket_path[MAGNUS_CONFIG_PATH_MAX];
+/* `--inherit-fd <path>`: at startup (before this process would
+ * otherwise bind its own primary listener), connect to another
+ * process's own `--upgrade-socket` at `path` and receive its listener
+ * fd via SCM_RIGHTS instead -- see magnus_upgrade_receive_listener()'s
+ * own doc comment for the full handshake. Empty means "bind normally",
+ * the same as every other feature in this codebase that is inactive
+ * unless its own flag is actually given. */
+static char magnus_inherit_fd_path[MAGNUS_CONFIG_PATH_MAX];
+/* `--ready-fd <N>`: an already-open, inherited pipe write-end fd
+ * number magnusd created and passed down purely for this one process
+ * to signal "I am genuinely up and about to start serving" on --
+ * see magnusd_upgrade()'s own doc comment for why this exists at all
+ * (a real bug this codebase found and fixed during 5e-1's own live
+ * testing: polling /healthz on the shared port cannot tell magnusd
+ * *which* process answered during an upgrade's own handoff window,
+ * since the old one is deliberately still alive and still serving
+ * throughout it -- a broken new binary that never even starts could
+ * previously still make magnusd_upgrade() believe it had succeeded,
+ * because the *old* process kept answering /healthz the whole time).
+ * -1 means "not given" -- this codebase's other CLI-integer flags all
+ * use 0 as their own valid default, so -1 (never a valid fd) is the
+ * unambiguous sentinel here instead. Written to exactly once, right
+ * before the main loop starts (main()), then closed; a plain restart/
+ * reload spawn never receives this flag at all and this stays -1 for
+ * the whole process lifetime, same as every other feature here that
+ * is inactive unless its own flag is actually given. */
+static int magnus_ready_fd = -1;
+
 /* Kept only so magnus_quic_init() (called once, at startup, after
  * magnus_parse_options() returns -- see main()) has the actual
  * certificate/key file paths to build its own separate QUIC-specific
@@ -13630,6 +13683,129 @@ magnus_create_admin_listener(const char *path)
     return listener;
 }
 
+/* Roadmap 5e-1 (zero-downtime binary upgrade): connects to another
+ * process's own --upgrade-socket at `path` and receives its primary
+ * listener fd via SCM_RIGHTS -- the successor side of the handoff
+ * magnus_upgrade_handle_handoff_request() below implements. A single
+ * blocking round trip (one request byte out, one response byte plus
+ * the fd's ancillary data back), bounded by a 5-second SO_RCVTIMEO/
+ * SO_SNDTIMEO deadline: this only ever runs once, synchronously,
+ * before this process's own main epoll loop starts (there is nothing
+ * useful to do concurrently with it -- this process has no listener of
+ * its own yet either way), so a short blocking wait here is simpler
+ * and just as correct as threading this through the reactor for what
+ * is a one-time startup handshake. Returns the received fd (>= 0) on
+ * success, -1 on any failure (connect refused, timeout, malformed
+ * response, no fd in the ancillary data) -- the caller falls back to
+ * binding its own fresh listener in that case (main()'s own call
+ * site), never leaving this process without some way to listen. */
+static int
+magnus_upgrade_receive_listener(const char *path)
+{
+    int fd;
+    struct sockaddr_un address = {0};
+    struct timeval timeout = { .tv_sec = 5, .tv_usec = 0 };
+    char request = 'F';
+    char response = 0;
+    struct msghdr msg = {0};
+    struct iovec iov;
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } control = {0};
+    struct cmsghdr *cmsg;
+    int received_fd = -1;
+    ssize_t n;
+
+    if (strlen(path) >= sizeof(address.sun_path)) return -1;
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, path);
+    if (connect(fd, (struct sockaddr *) &address, sizeof(address)) < 0) {
+        close(fd);
+        return -1;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    if (send(fd, &request, 1, MSG_NOSIGNAL) != 1) {
+        close(fd);
+        return -1;
+    }
+
+    iov.iov_base = &response;
+    iov.iov_len = 1;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    n = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
+    close(fd);
+    if (n != 1 || response != 'F') return -1;
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == NULL || cmsg->cmsg_level != SOL_SOCKET
+        || cmsg->cmsg_type != SCM_RIGHTS
+        || cmsg->cmsg_len != CMSG_LEN(sizeof(int)))
+        return -1;
+    memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+    return received_fd;
+}
+
+/* Roadmap 5e-1: accepted-connection handler for magnus_upgrade_listener
+ * -- the predecessor side of the handoff magnus_upgrade_receive_
+ * listener() above implements. Reads the one-byte request, sends back
+ * one response byte plus `listener` (this process's own current
+ * primary listener fd) as SCM_RIGHTS ancillary data, then --
+ * regardless of whether that actually succeeded -- unlinks this
+ * process's own upgrade-socket file and removes magnus_upgrade_
+ * listener from epoll: one-shot, see that variable's own top comment
+ * for why. Deliberately does NOT touch magnus_draining here: handing
+ * the fd off, on its own, must never affect whether this process keeps
+ * accepting connections on its own copy of it -- magnusd only sends
+ * the actual drain signal (SIGUSR1, roadmap 5d-1) once it has
+ * separately confirmed the new process is healthy (src/magnusd.c's own
+ * magnusd_upgrade()), so a new binary that never even reaches "healthy"
+ * can never cause an availability gap here. */
+static void
+magnus_upgrade_handle_handoff_request(int epoll_fd, int listener)
+{
+    int client = accept4(magnus_upgrade_listener, NULL, NULL, SOCK_CLOEXEC);
+    if (client >= 0) {
+        char request = 0;
+        ssize_t n = recv(client, &request, 1, 0);
+        if (n == 1 && request == 'F') {
+            char response = 'F';
+            struct msghdr msg = {0};
+            struct iovec iov = { .iov_base = &response, .iov_len = 1 };
+            union {
+                struct cmsghdr align;
+                char buf[CMSG_SPACE(sizeof(int))];
+            } control = {0};
+            struct cmsghdr *cmsg;
+
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.buf;
+            msg.msg_controllen = sizeof(control.buf);
+            cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cmsg), &listener, sizeof(int));
+
+            sendmsg(client, &msg, MSG_NOSIGNAL);
+        }
+        close(client);
+    }
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, magnus_upgrade_listener, NULL);
+    close(magnus_upgrade_listener);
+    magnus_upgrade_listener = -1;
+    unlink(magnus_upgrade_socket_path);
+}
+
 /* Builds new root-fd/TLS-context/cluster/rate-limit state from a validated
  * config and, only once every referenced resource actually opened
  * successfully, swaps it into the live globals in one shot. Since magnus
@@ -14031,11 +14207,21 @@ magnus_parse_options(int argc, char **argv)
         printf("Magnus Web Engine %s (native C17/epoll)\n", MAGNUS_VERSION);
         exit(0);
     }
-    if (argc == 3 && strcmp(argv[1], "--config") == 0) {
+    if (argc >= 3 && strcmp(argv[1], "--config") == 0) {
         /* Config-file mode replaces every other flag: port, root, TLS,
          * upstream cluster and rate limit all come from the file, and the
          * same path is remembered for SIGHUP to re-validate and apply
-         * later (magnus_handle_reload). */
+         * later (magnus_handle_reload). The only exceptions -- checked
+         * below, after the config file itself loads -- are --upgrade-
+         * socket/--inherit-fd (roadmap 5e-1): magnusd-owned process-
+         * lifecycle plumbing that has nothing to do with what a config
+         * file describes, the same reasoning it is a pure CLI flag pair
+         * rather than a config-file key at all (see magnus_upgrade_
+         * socket_path's own doc comment). `argc == 3` (no trailing
+         * flags at all) remains by far the common case -- everything
+         * from magnusd's own very first spawn onward already passes
+         * --upgrade-socket unconditionally, so this widened check
+         * simply stops rejecting what magnusd was already sending. */
         magnus_config_t config;
         char error[192];
         if (magnus_config_load(argv[2], &config, error, sizeof(error))
@@ -14078,6 +14264,45 @@ magnus_parse_options(int argc, char **argv)
         if (config.has_quic_listen) {
             magnus_quic_port = config.quic_listen_port;
             magnus_quic_enabled = true;
+        }
+        /* Roadmap 5e-1: the only flags --config mode still accepts
+         * past the mandatory --config <path> pair, and only these two
+         * -- anything else is rejected exactly as strictly as the old
+         * `argc == 3` check used to reject *everything* extra, so a
+         * genuine operator typo here still fails loudly rather than
+         * being silently ignored. */
+        for (index = 3; index + 1 < argc; index += 2) {
+            if (strcmp(argv[index], "--upgrade-socket") == 0) {
+                if (strlen(argv[index + 1]) >= sizeof(magnus_upgrade_socket_path)) {
+                    fprintf(stderr, "magnus: --upgrade-socket: path too long\n");
+                    exit(2);
+                }
+                strcpy(magnus_upgrade_socket_path, argv[index + 1]);
+            } else if (strcmp(argv[index], "--inherit-fd") == 0) {
+                if (strlen(argv[index + 1]) >= sizeof(magnus_inherit_fd_path)) {
+                    fprintf(stderr, "magnus: --inherit-fd: path too long\n");
+                    exit(2);
+                }
+                strcpy(magnus_inherit_fd_path, argv[index + 1]);
+            } else if (strcmp(argv[index], "--ready-fd") == 0) {
+                char *end;
+                long value = strtol(argv[index + 1], &end, 10);
+                if (*end != '\0' || value < 0 || value >= MAGNUS_MAX_FDS) {
+                    fprintf(stderr, "magnus: --ready-fd: invalid fd\n");
+                    exit(2);
+                }
+                magnus_ready_fd = (int) value;
+            } else {
+                fprintf(stderr, "magnus: --config accepts only "
+                                "--upgrade-socket/--inherit-fd/--ready-fd "
+                                "as extra flags, got '%s'\n", argv[index]);
+                exit(2);
+            }
+        }
+        if (index != argc) {
+            fprintf(stderr, "magnus: trailing argument after --config: "
+                            "'%s'\n", argv[argc - 1]);
+            exit(2);
         }
         return config.port;
     }
@@ -14555,6 +14780,25 @@ magnus_parse_options(int argc, char **argv)
                 break;
             strcpy(magnus_admin_socket_path, argv[index + 1]);
             magnus_admin_enabled = true;
+        } else if (strcmp(argv[index], "--upgrade-socket") == 0) {
+            /* Roadmap 5e-1: internal plumbing magnusd always passes to
+             * every child it spawns -- not documented as an operator-
+             * facing flag the way --admin-socket is, but an ordinary
+             * CLI flag like any other rather than something requiring
+             * its own config-file key, since magnusd (not the operator's
+             * own config file) owns this path's whole lifecycle. */
+            if (strlen(argv[index + 1]) >= sizeof(magnus_upgrade_socket_path))
+                break;
+            strcpy(magnus_upgrade_socket_path, argv[index + 1]);
+        } else if (strcmp(argv[index], "--inherit-fd") == 0) {
+            if (strlen(argv[index + 1]) >= sizeof(magnus_inherit_fd_path))
+                break;
+            strcpy(magnus_inherit_fd_path, argv[index + 1]);
+        } else if (strcmp(argv[index], "--ready-fd") == 0) {
+            char *end;
+            long value = strtol(argv[index + 1], &end, 10);
+            if (*end != '\0' || value < 0 || value >= MAGNUS_MAX_FDS) break;
+            magnus_ready_fd = (int) value;
         } else if (strcmp(argv[index], "--access-log") == 0) {
             if (strcmp(argv[index + 1], "on") == 0) {
                 magnus_access_log_enabled = true;
@@ -14874,7 +15118,24 @@ main(int argc, char **argv)
     }
     port = magnus_parse_options(argc, argv);
     magnus_listen_port = port;
-    listener = magnus_create_listener(port);
+    /* Roadmap 5e-1: --inherit-fd, when given, takes priority over
+     * binding a fresh listener -- receiving another process's live
+     * listener fd is the whole point of a zero-downtime handoff, and
+     * falling back to a plain bind() on any failure (rather than
+     * exiting outright) means a misconfigured/unreachable predecessor
+     * degrades to "start up normally instead" rather than refusing to
+     * start at all, the same graceful-degradation posture magnus_dns_
+     * start()'s own failure handling just above already has. */
+    listener = -1;
+    if (magnus_inherit_fd_path[0] != '\0') {
+        listener = magnus_upgrade_receive_listener(magnus_inherit_fd_path);
+        if (listener < 0) {
+            fprintf(stderr, "magnus: --inherit-fd: could not receive "
+                            "listener from '%s'; binding a fresh one "
+                            "instead\n", magnus_inherit_fd_path);
+        }
+    }
+    if (listener < 0) listener = magnus_create_listener(port);
     int epoll_fd;
     struct epoll_event listener_event;
     struct epoll_event events[MAGNUS_MAX_EVENTS];
@@ -14930,12 +15191,41 @@ main(int argc, char **argv)
             return 1;
         }
     }
+    if (magnus_upgrade_socket_path[0] != '\0') {
+        /* Roadmap 5e-1: unlike --admin-socket just above, a failure
+         * here is not fatal -- this is invisible internal plumbing
+         * magnusd unconditionally passes to every child it spawns, not
+         * an explicit operator request; failing to satisfy it just
+         * means a future upgrade attempt against *this* instance won't
+         * find anything listening to hand its fd off to (magnusd_
+         * upgrade()'s own spawn will simply time out waiting for the
+         * new child to become healthy, the same failure path an
+         * unrelated startup problem in the new binary would already
+         * hit), not a reason to refuse to serve ordinary traffic at
+         * all. */
+        struct epoll_event upgrade_event;
+        magnus_upgrade_listener =
+            magnus_create_admin_listener(magnus_upgrade_socket_path);
+        if (magnus_upgrade_listener >= 0) {
+            upgrade_event = (struct epoll_event) { .events = EPOLLIN,
+                .data.fd = magnus_upgrade_listener };
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, magnus_upgrade_listener,
+                          &upgrade_event) < 0) {
+                close(magnus_upgrade_listener);
+                unlink(magnus_upgrade_socket_path);
+                magnus_upgrade_listener = -1;
+            }
+        }
+        if (magnus_upgrade_listener < 0)
+            perror("magnus: upgrade-socket (non-fatal)");
+    }
     if (magnus_stream_enabled) {
         struct epoll_event stream_event;
         magnus_stream_listener = magnus_create_listener(magnus_stream_port);
         if (magnus_stream_listener < 0) {
             perror("magnus: stream-listen");
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -14947,6 +15237,7 @@ main(int argc, char **argv)
             perror("magnus: stream-listen epoll_ctl");
             close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -14959,6 +15250,7 @@ main(int argc, char **argv)
             perror("magnus: udp-listen");
             if (magnus_stream_listener >= 0) close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -14971,6 +15263,7 @@ main(int argc, char **argv)
             close(magnus_udp_listener);
             if (magnus_stream_listener >= 0) close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -14982,6 +15275,7 @@ main(int argc, char **argv)
             if (magnus_udp_listener >= 0) close(magnus_udp_listener);
             if (magnus_stream_listener >= 0) close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -14992,6 +15286,7 @@ main(int argc, char **argv)
             if (magnus_udp_listener >= 0) close(magnus_udp_listener);
             if (magnus_stream_listener >= 0) close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -15005,6 +15300,7 @@ main(int argc, char **argv)
             if (magnus_udp_listener >= 0) close(magnus_udp_listener);
             if (magnus_stream_listener >= 0) close(magnus_stream_listener);
             if (magnus_admin_listener >= 0) close(magnus_admin_listener);
+            if (magnus_upgrade_listener >= 0) close(magnus_upgrade_listener);
             close(epoll_fd);
             close(listener);
             return 1;
@@ -15025,6 +15321,25 @@ main(int argc, char **argv)
     /* Active-health probe fd slots were already reset to -1 before
      * magnus_parse_options() -- see that call site's own comment. */
     fprintf(stderr, "magnus: native engine listening on 0.0.0.0:%u\n", port);
+    /* Roadmap 5e-1: the readiness signal magnusd_upgrade() actually
+     * waits on -- see magnus_ready_fd's own doc comment for why a
+     * shared-port /healthz poll alone cannot safely stand in for this
+     * during an upgrade's own handoff window. Deliberately the very
+     * last thing before the reactor loop starts (every listener is
+     * already bound/inherited and registered with epoll by this point,
+     * every phase hook registered, every signal handler installed) --
+     * a single byte, then the fd is closed; magnusd only needs to see
+     * EOF-or-a-byte, not any particular content. */
+    if (magnus_ready_fd >= 0) {
+        char ready = 'R';
+        ssize_t written = write(magnus_ready_fd, &ready, 1);
+        (void) written; /* nothing useful to do with a failed write here
+                          * -- magnusd's own read side simply times out
+                          * and treats it as "not ready", same outcome
+                          * as any other startup failure this far. */
+        close(magnus_ready_fd);
+        magnus_ready_fd = -1;
+    }
 
     while (magnus_running) {
         int ready;
@@ -15062,6 +15377,10 @@ main(int argc, char **argv)
             if (magnus_admin_enabled && fd == magnus_admin_listener) {
                 (void) magnus_accept_connections(epoll_fd, magnus_admin_listener,
                                                  true);
+                continue;
+            }
+            if (magnus_upgrade_listener >= 0 && fd == magnus_upgrade_listener) {
+                magnus_upgrade_handle_handoff_request(epoll_fd, listener);
                 continue;
             }
             if (magnus_dns_eventfd >= 0 && fd == magnus_dns_eventfd) {
@@ -15251,6 +15570,24 @@ main(int argc, char **argv)
             magnus_scgi_expire(epoll_fd, now);
             magnus_uwsgi_expire(epoll_fd, now);
             magnus_expire_idle(epoll_fd, now);
+            /* Roadmap 5d-1/5e-1: a draining process with zero active
+             * connections has nothing left to wait for -- exit cleanly
+             * through the exact same graceful-shutdown path SIGTERM
+             * already drives (the GOAWAY-then-hard-close loop just
+             * below this whole reactor loop tears down an already-
+             * empty connection set, a correct no-op). This is what
+             * lets a plain `magnusctl drain` conclude on its own
+             * without a second, separate stop command, and is also
+             * what a zero-downtime upgrade's own predecessor process
+             * relies on to retire itself once magnusd's drain signal
+             * (sent only after the successor is confirmed healthy --
+             * magnusd_upgrade()) has let its own in-flight work finish
+             * naturally. Checked right after magnus_expire_idle() so a
+             * connection that just now expired (rather than closing on
+             * its own) is reflected in magnus_connections_active
+             * within the very same sweep, not one full second later. */
+            if (magnus_draining && magnus_connections_active == 0)
+                magnus_running = 0;
             magnus_stream_expire_idle(epoll_fd, now);
             magnus_udp_expire_idle(epoll_fd, now);
             if (magnus_quic_enabled)
@@ -15315,6 +15652,10 @@ main(int argc, char **argv)
     if (magnus_admin_listener >= 0) {
         close(magnus_admin_listener);
         unlink(magnus_admin_socket_path);
+    }
+    if (magnus_upgrade_listener >= 0) {
+        close(magnus_upgrade_listener);
+        unlink(magnus_upgrade_socket_path);
     }
     if (magnus_stream_listener >= 0) close(magnus_stream_listener);
     if (magnus_udp_listener >= 0) close(magnus_udp_listener);

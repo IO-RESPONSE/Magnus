@@ -29,7 +29,11 @@ cleanup() {
     kill -TERM "$magnusd_pid" >/dev/null 2>&1 || true
     wait "$magnusd_pid" 2>/dev/null || true
   fi
-  pkill -f "^$magnus_bin --config $config\$" >/dev/null 2>&1 || true
+  # No trailing \$ any more (roadmap 5e-1): magnusd_spawn_child_from()
+  # always appends --upgrade-socket (and, for an upgrade's own new
+  # child, --inherit-fd) after --config <path>, so a leftover child from
+  # a failed run mid-script no longer has this exact bare invocation.
+  pkill -f "^$magnus_bin --config $config" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -208,6 +212,79 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
   fi
 done
 test -n "$respawned_pid"
+test "$(curl --fail --silent "http://127.0.0.1:$port/hello.txt")" = 'root-v2'
+
+# Zero-downtime binary upgrade (roadmap 5e-1): a new magnus child
+# inherits the live listener fd from the old one (src/magnus.c's own
+# --upgrade-socket/--inherit-fd SCM_RIGHTS handoff) and is only ever
+# committed to -- old told to drain via the exact same SIGUSR1 `drain`
+# already uses -- once it is *proven* healthy; a broken new binary must
+# leave the old one completely untouched and still serving throughout.
+# Continuous traffic spanning the whole upgrade window, not just a
+# before/after snapshot, is what actually proves "zero-downtime" rather
+# than merely "eventually works again".
+traffic_out="$work/upgrade-traffic.json"
+python3 -c "
+import json, time, urllib.request
+
+results = []
+deadline = time.time() + 10
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:$port/hello.txt', timeout=2) as r:
+            results.append(r.status)
+    except Exception as e:
+        results.append('ERR:' + type(e).__name__)
+    time.sleep(0.05)
+with open('$traffic_out', 'w') as f:
+    json.dump(results, f)
+" &
+traffic_pid=$!
+sleep 3
+upgrade_out=$(ctl upgrade)
+printf '%s\n' "$upgrade_out" | grep -q '^OK '
+printf '%s\n' "$upgrade_out" | grep -q "old_pid=$respawned_pid "
+wait "$traffic_pid"
+python3 -c "
+import json, sys
+results = json.load(open('$traffic_out'))
+bad = [r for r in results if r != 200]
+assert len(results) > 20, 'too few samples: %d' % len(results)
+assert not bad, 'non-200/failed requests during upgrade: %r' % bad[:10]
+print('upgrade: %d/%d requests succeeded across the handoff window' %
+      (len(results) - len(bad), len(results)))
+"
+
+status6=$(ctl status)
+printf '%s\n' "$status6" | grep -q 'last_action=upgrade last_result=ok'
+upgraded_pid=$(printf '%s' "$status6" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+test -n "$upgraded_pid"
+test "$upgraded_pid" != "$respawned_pid"
+grep -q "action=upgrade .* result=ok detail=\"old_pid=$respawned_pid new_pid=$upgraded_pid\"" "$audit"
+
+# The old pid must be gone *and* not left behind as a zombie -- magnusd
+# itself has to reap it (SIGCHLD fires for any child, not just the one
+# currently supervised), not just stop tracking it.
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  kill -0 "$respawned_pid" 2>/dev/null || break
+  sleep 1
+done
+if kill -0 "$respawned_pid" 2>/dev/null; then
+  echo "old pid $respawned_pid still running after a successful upgrade" >&2
+  exit 1
+fi
+if ps -o stat= -p "$respawned_pid" 2>/dev/null | grep -q 'Z'; then
+  echo "old pid $respawned_pid was left behind as a zombie" >&2
+  exit 1
+fi
+
+# A broken upgrade (binary path does not exist) must leave the
+# now-current child completely untouched and still serving -- never
+# committed to until the new one is proven healthy.
+upgrade_bad=$(ctl upgrade /nonexistent/magnus-binary || true)
+printf '%s\n' "$upgrade_bad" | grep -q '^REJECTED'
+status7=$(ctl status)
+test "$(printf '%s' "$status7" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')" = "$upgraded_pid"
 test "$(curl --fail --silent "http://127.0.0.1:$port/hello.txt")" = 'root-v2'
 
 ctl shutdown | grep -q '^OK'
