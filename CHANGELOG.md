@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.61.0
+
+### Added
+
+- **Connection-scale benchmark ladder (roadmap 6a-2).** New
+  `docs/phase6-benchmark-results.md`: `ab` (a real, independent load
+  generator, not a hand-rolled substitute) driven against a plain
+  static-file `magnus` instance across a concurrency ladder from 10 up
+  to 10,000 -- non-keepalive by default, so every tier already
+  exercises full `accept()`/teardown connection churn at the stated
+  concurrency, not just steady-state throughput over already-open
+  connections. Zero failed requests across 522,000 total requests at
+  every tier; throughput holds essentially flat (~9,300-12,000 req/s)
+  regardless of concurrency (the correct signature of a single-
+  threaded epoll reactor already saturating one CPU core's own I/O
+  capacity, not a sign of anything degrading badly) while per-request
+  latency grows linearly under genuine overload rather than erroring
+  out. A separate keep-alive tier (3,000 simultaneously-held
+  connections) measured ~2.3x the non-keepalive throughput, confirming
+  most of the per-request cost at any given tier is connection setup/
+  teardown, not response generation. A medium-payload (13.5 KB) tier
+  under load confirmed byte-exact response integrity, not just that
+  responses arrive. After the full ladder (523,114 cumulative
+  connections served): 7 open fds (back to idle steady-state), 6.2 MB
+  RSS, `magnus_connections_active` reporting only the one in-flight
+  `/metrics` request used to read it -- zero fd/connection/memory leak
+  across any tier. See the new doc's own
+  "What this does and does not establish" section for explicit scope
+  boundaries (no nginx/HAProxy comparison attempted, upstream-dispatch-
+  path concurrency already covered separately in `tests/test-core.sh`).
+
 ## 1.60.0
 
 ### Added

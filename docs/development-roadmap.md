@@ -1627,13 +1627,26 @@ connection-pool and common-request-model decisions).
   itself rather than finding a bug this time -- see `CHANGELOG.md`
   1.60.0.
 
+  **6a-2 (connection-scale benchmark ladder) shipped in 1.61.0** -- new
+  `docs/phase6-benchmark-results.md`: `ab` driven against a plain
+  static-file instance from concurrency 10 up to 10,000 (non-keepalive
+  by default, so every tier already exercises full connection churn,
+  not just steady-state throughput), zero failed requests across
+  522,000 total requests, throughput holding flat regardless of
+  concurrency (the correct signature of a single-threaded epoll reactor
+  saturating one CPU core's own I/O capacity, not degradation), and
+  zero fd/connection/memory leak afterward. See `CHANGELOG.md` 1.61.0
+  and the new doc's own scope-boundary section (no nginx/HAProxy
+  comparison attempted; upstream-dispatch-path concurrency already
+  covered separately in `tests/test-core.sh`).
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
-  original master prompt's own Section 8.1 attack-list/Section 10
-  benchmark-ladder text is not preserved in this repo, only referenced
-  by section number from `development-roadmap.md` itself, so later
-  Phase 6 increments reconstruct that scope directly against standard
-  web-gateway attack classes and this codebase's own accumulated real-
-  bug history rather than a literal external checklist).
+  original master prompt's own Section 8.1 attack-list text is not
+  preserved in this repo, only referenced by section number from
+  `development-roadmap.md` itself, so later Phase 6 increments
+  reconstruct that scope directly against standard web-gateway attack
+  classes and this codebase's own accumulated real-bug history rather
+  than a literal external checklist).
 
 ## 4. Module structure
 
