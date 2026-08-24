@@ -637,6 +637,16 @@ typedef struct {
      * to dictate this; magnus_fastcgi_translate_headers() already
      * discards any Connection: header the application itself sent). */
     bool fastcgi_client_wants_close;
+    /* Roadmap 5a-5: session affinity, mirroring proxy_affinity_key/
+     * proxy_issue_affinity_cookie's own identical roles -- the target
+     * endpoint this request's own attempt actually used (encoded via
+     * magnus_encode_affinity_cookie(), the same 2-hex-digit-endpoint-
+     * prefix format every cluster already shares) and whether a fresh
+     * MAGNUS_AFFINITY Set-Cookie needs issuing (a client with no usable
+     * cookie yet, or one whose sticky target turned out unavailable so
+     * a different endpoint had to be used instead). */
+    char fastcgi_affinity_key[64];
+    bool fastcgi_issue_affinity_cookie;
     /* The whole outbound byte stream (BEGIN_REQUEST + every PARAMS
      * record + the empty PARAMS/STDIN terminators) is built once, up
      * front, at dispatch time -- there is no request body to stream
@@ -9183,15 +9193,20 @@ magnus_fastcgi_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
                                           fd, result == 0, 0);
 }
 
-/* Roadmap 5a-1/5a-2: dispatches a matched action=fastcgi route.
+/* Roadmap 5a-1/5a-2/5a-5: dispatches a matched action=fastcgi route.
  * Builds the whole FastCGI request up front
  * (magnus_fastcgi_build_request() -- any request body was already
  * fully buffered into connection->body ahead of dispatch, the same
  * generic pre-dispatch buffering every route gets, and is copied
  * into the request buffer there rather than streamed separately) and
  * opens a non-blocking connection to the cluster's own next endpoint
- * (round_robin only, see magnus_fastcgi_cluster's own comment) via
- * magnus_fastcgi_connect_endpoint(). Returns 0 once that connect
+ * via magnus_fastcgi_connect_endpoint() -- the client's own
+ * MAGNUS_AFFINITY cookie (parsed->affinity_key, the same generic
+ * per-request field magnus_http_parse() already extracts for every
+ * dispatch path to share) is honored via magnus_cluster_select_sticky()
+ * for this first attempt if present and decodable, falling back to
+ * plain round-robin exactly like magnus_proxy_pick_and_start()'s own
+ * identical sticky/non-sticky choice. Returns 0 once that connect
  * attempt (and the request buffer to send once it completes) is in
  * flight -- magnus_fastcgi_handle_upstream() drives the rest, the
  * exact same "request/response is asynchronous from here" contract
@@ -9210,15 +9225,23 @@ magnus_fastcgi_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                               bool client_wants_close)
 {
     int endpoint;
+    size_t preferred_index;
+    bool sticky = magnus_decode_affinity_cookie(parsed->affinity_key,
+                                                &preferred_index);
 
-    endpoint = magnus_cluster_select(&magnus_fastcgi_cluster, magnus_now_ms(),
-                                     NULL, connection->client_address);
+    endpoint = sticky
+        ? magnus_cluster_select_sticky(&magnus_fastcgi_cluster,
+                                       magnus_now_ms(), preferred_index,
+                                       connection->client_address)
+        : magnus_cluster_select(&magnus_fastcgi_cluster, magnus_now_ms(),
+                                NULL, connection->client_address);
     if (endpoint < 0) return -1;
     if (!magnus_fastcgi_build_request(connection, parsed, forward_path))
         return -1;
 
     connection->fastcgi_attempt = 0;
     connection->fastcgi_client_wants_close = client_wants_close;
+    connection->fastcgi_issue_affinity_cookie = !sticky;
     memcpy(connection->fastcgi_request_id, request->request_id,
           sizeof(connection->fastcgi_request_id));
 
@@ -9232,9 +9255,25 @@ magnus_fastcgi_pick_and_start(int epoll_fd, magnus_connection_t *connection,
      * established for the identical reason. */
     for (;;) {
         connection->fastcgi_attempt++;
+        if (sticky) {
+            sticky = false;
+        } else if (connection->fastcgi_attempt > 1) {
+            /* Deviating from the client's original sticky target (or
+             * from plain round-robin) because a previous attempt
+             * failed: the cookie must be refreshed to reflect the
+             * endpoint actually used, not what a retried/failed
+             * attempt implied -- same reasoning magnus_proxy_pick_
+             * and_start()'s own identical branch documents. */
+            connection->fastcgi_issue_affinity_cookie = true;
+        }
         if (magnus_fastcgi_connect_endpoint(epoll_fd, connection,
-                                            (size_t) endpoint) == 0)
+                                            (size_t) endpoint) == 0) {
+            if (connection->fastcgi_issue_affinity_cookie)
+                magnus_encode_affinity_cookie(connection->fastcgi_affinity_key,
+                    sizeof(connection->fastcgi_affinity_key),
+                    (size_t) endpoint);
             return 0;
+        }
         magnus_cluster_result(&magnus_fastcgi_cluster, (size_t) endpoint,
                               false, magnus_now_ms());
         if (connection->fastcgi_attempt >= MAGNUS_FASTCGI_MAX_ATTEMPTS) {
@@ -9284,9 +9323,18 @@ magnus_fastcgi_connect_failed(int epoll_fd, magnus_connection_t *connection,
         if (endpoint >= 0) {
             connection->fastcgi_attempt++;
             if (magnus_fastcgi_connect_endpoint(epoll_fd, connection,
-                                                (size_t) endpoint) == 0)
+                                                (size_t) endpoint) == 0) {
+                /* deviated from whatever selection produced the failed
+                 * attempt: refresh the cookie to match reality, same
+                 * as magnus_proxy_connect_failed()'s own identical
+                 * comment. */
+                connection->fastcgi_issue_affinity_cookie = true;
+                magnus_encode_affinity_cookie(connection->fastcgi_affinity_key,
+                    sizeof(connection->fastcgi_affinity_key),
+                    (size_t) endpoint);
                 return magnus_update_interest(epoll_fd, connection,
                                               EPOLLRDHUP);
+            }
             magnus_cluster_result(&magnus_fastcgi_cluster, (size_t) endpoint,
                                   false, magnus_now_ms());
         }
@@ -9481,8 +9529,10 @@ magnus_fastcgi_finish(int epoll_fd, magnus_connection_t *connection)
         return magnus_fastcgi_fail(epoll_fd, connection, 502, "Bad Gateway");
     headers_length = magnus_fastcgi_translate_headers(
         connection->fastcgi_stdout, header_text_length, body_length,
-        connection->fastcgi_client_wants_close, headers,
-        MAGNUS_PROXY_SANITIZED_LIMIT, &status);
+        connection->fastcgi_client_wants_close,
+        connection->fastcgi_issue_affinity_cookie
+            ? connection->fastcgi_affinity_key : NULL,
+        headers, MAGNUS_PROXY_SANITIZED_LIMIT, &status);
     if (headers_length < 0) {
         free(headers);
         return magnus_fastcgi_fail(epoll_fd, connection, 502, "Bad Gateway");

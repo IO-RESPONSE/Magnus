@@ -113,18 +113,24 @@ const char *magnus_fastcgi_find_body(const char *data, size_t length,
  * the same client-preference-driven decision every other response in
  * this codebase makes; any Status:/Content-Length/Connection header
  * line the application sent is consumed, not passed through
- * (superseded by what this function itself decides). Returns the
- * number of bytes written to `out` (excluding the NUL terminator), or
- * -1 if a Status: line's own numeric code is malformed, or `out` is
- * too small. `*out_status` is set to the real status code decided
- * (200 when no Status: line was present) whenever a non-negative
- * value is returned -- the caller's own access-log line needs the
- * real code, not just the bytes written, and re-deriving it a second
- * time from `out` would mean re-parsing what this function already
- * parsed once. */
+ * (superseded by what this function itself decides). `affinity_cookie_
+ * value`, if non-NULL (roadmap 5a-5), appends a `Set-Cookie:
+ * MAGNUS_AFFINITY=<value>; Path=/; HttpOnly; SameSite=Lax` line --
+ * identical format to magnus_proxy_sanitize_response_headers()'s own,
+ * so a client that bounces between action=proxy and action=fastcgi
+ * routes on the same origin still gets one consistent cookie shape.
+ * Returns the number of bytes written to `out` (excluding the NUL
+ * terminator), or -1 if a Status: line's own numeric code is
+ * malformed, or `out` is too small. `*out_status` is set to the real
+ * status code decided (200 when no Status: line was present) whenever
+ * a non-negative value is returned -- the caller's own access-log line
+ * needs the real code, not just the bytes written, and re-deriving it
+ * a second time from `out` would mean re-parsing what this function
+ * already parsed once. */
 int magnus_fastcgi_translate_headers(const char *header_text,
                                      size_t header_text_length,
                                      size_t body_length, bool close_connection,
+                                     const char *affinity_cookie_value,
                                      char *out, size_t out_capacity,
                                      unsigned *out_status);
 

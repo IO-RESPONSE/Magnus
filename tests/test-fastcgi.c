@@ -122,7 +122,7 @@ main(void)
          * clean no-Status block instead, tested separately below) */
         const char *clean = "Content-Type: text/html\r\nX-App: yes\r\n";
         n = magnus_fastcgi_translate_headers(clean, strlen(clean), 42, false,
-                                             out, sizeof(out), &status);
+                                             NULL, out, sizeof(out), &status);
         assert(n > 0);
         assert(status == 200);
         assert(strncmp(out, "HTTP/1.1 200 OK\r\n", 17) == 0);
@@ -131,7 +131,24 @@ main(void)
         assert(strstr(out, "Content-Length: 42\r\n") != NULL);
         assert(strstr(out, "Connection: keep-alive\r\n") != NULL);
         assert(strstr(out, "X-Magnus-Via: magnus-fastcgi/0.1\r\n") != NULL);
+        assert(strstr(out, "Set-Cookie:") == NULL);
         (void) headers;
+    }
+
+    /* Header translation: a non-NULL affinity_cookie_value (roadmap
+     * 5a-5) appends a Set-Cookie in the same format magnus_proxy_
+     * sanitize_response_headers() already uses. */
+    {
+        const char *clean = "Content-Type: text/html\r\n";
+        char out[1024];
+        unsigned status = 0;
+        int n = magnus_fastcgi_translate_headers(clean, strlen(clean), 0,
+                                                 false, "05-abc123", out,
+                                                 sizeof(out), &status);
+        assert(n > 0);
+        assert(strstr(out,
+            "Set-Cookie: MAGNUS_AFFINITY=05-abc123; Path=/; HttpOnly; "
+            "SameSite=Lax\r\n") != NULL);
     }
 
     /* Header translation: an explicit Status: line sets the real status
@@ -147,7 +164,8 @@ main(void)
         char out[1024];
         unsigned status = 0;
         int n = magnus_fastcgi_translate_headers(hdrs, strlen(hdrs), 3, true,
-                                                  out, sizeof(out), &status);
+                                                  NULL, out, sizeof(out),
+                                                  &status);
         assert(n > 0);
         assert(status == 201);
         assert(strncmp(out, "HTTP/1.1 201 Created\r\n", 22) == 0);
@@ -163,7 +181,8 @@ main(void)
         char out[1024];
         unsigned status = 0;
         int n = magnus_fastcgi_translate_headers(hdrs, strlen(hdrs), 0, false,
-                                                  out, sizeof(out), &status);
+                                                  NULL, out, sizeof(out),
+                                                  &status);
         assert(n > 0);
         assert(status == 404);
         assert(strncmp(out, "HTTP/1.1 404 OK\r\n", 17) == 0);
@@ -175,7 +194,7 @@ main(void)
         char out[1024];
         unsigned status = 0;
         assert(magnus_fastcgi_translate_headers(hdrs, strlen(hdrs), 0, false,
-                                                 out, sizeof(out),
+                                                 NULL, out, sizeof(out),
                                                  &status) == -1);
     }
 
@@ -185,7 +204,7 @@ main(void)
         char out[8];
         unsigned status = 0;
         assert(magnus_fastcgi_translate_headers(hdrs, strlen(hdrs), 0, false,
-                                                 out, sizeof(out),
+                                                 NULL, out, sizeof(out),
                                                  &status) == -1);
     }
 

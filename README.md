@@ -129,9 +129,11 @@ independently by IORESPONSE.
   and reused per endpoint (`FCGI_KEEP_CONN` always requested; a
   connection the application server closed anyway is caught by a
   staleness check at reuse time and simply discarded, no different from
-  finding none available) -- no session affinity yet. Both a connect
-  and a stalled read/response are bounded by a timeout, answered with a
-  clean `504` rather than hanging the client; any upstream-side failure
+  finding none available); session affinity (the same `MAGNUS_AFFINITY`
+  cookie the proxy/gRPC paths already issue) works identically here
+  too. Both a connect and a stalled read/response are bounded by a
+  timeout, answered with a clean `504` rather than hanging the client;
+  any upstream-side failure
   -- connect, send, receive, or a malformed response, not just a
   connect-stage one -- retries against a different healthy endpoint
   once before giving up with a clean 502/504, since nothing is ever

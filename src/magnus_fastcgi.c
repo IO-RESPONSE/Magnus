@@ -1,5 +1,11 @@
 #include "magnus_fastcgi.h"
 
+/* For MAGNUS_AFFINITY_COOKIE_NAME only (roadmap 5a-5) -- reused rather
+ * than a second hardcoded copy of the cookie name, so a client that
+ * bounces between action=proxy and action=fastcgi routes on the same
+ * origin only ever sees one cookie name. */
+#include "magnus_http.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -142,6 +148,7 @@ int
 magnus_fastcgi_translate_headers(const char *header_text,
                                  size_t header_text_length,
                                  size_t body_length, bool close_connection,
+                                 const char *affinity_cookie_value,
                                  char *out, size_t out_capacity,
                                  unsigned *out_status)
 {
@@ -219,8 +226,21 @@ magnus_fastcgi_translate_headers(const char *header_text,
 
     written = snprintf(out + total, out_capacity - total,
                        "Content-Length: %zu\r\nConnection: %s\r\n"
-                       "X-Magnus-Via: magnus-fastcgi/0.1\r\n\r\n",
+                       "X-Magnus-Via: magnus-fastcgi/0.1\r\n",
                        body_length, close_connection ? "close" : "keep-alive");
+    if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+    total += (size_t) written;
+
+    if (affinity_cookie_value != NULL) {
+        written = snprintf(out + total, out_capacity - total,
+                           "Set-Cookie: " MAGNUS_AFFINITY_COOKIE_NAME
+                           "=%s; Path=/; HttpOnly; SameSite=Lax\r\n",
+                           affinity_cookie_value);
+        if (written < 0 || (size_t) written >= out_capacity - total) return -1;
+        total += (size_t) written;
+    }
+
+    written = snprintf(out + total, out_capacity - total, "\r\n");
     if (written < 0 || (size_t) written >= out_capacity - total) return -1;
     total += (size_t) written;
 

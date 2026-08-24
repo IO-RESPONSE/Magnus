@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.55.0
+
+### Added
+
+- **FastCGI session affinity (roadmap 5a-5) -- closes out "FastCGI
+  고도화" (connection pooling/retry/affinity, the three items grouped
+  together for this phase of work).** The same `MAGNUS_AFFINITY`
+  cookie `action=proxy`/`action=grpc` dispatch already issue and honor
+  now works identically for `action=fastcgi`: a client's own cookie
+  (`parsed->affinity_key`, the same generic per-request field every
+  dispatch path already shares -- no new parsing needed) is decoded and
+  honored via `magnus_cluster_select_sticky()` for the first connect
+  attempt, falling back to plain round-robin when absent or
+  undecodable, mirroring `magnus_proxy_pick_and_start()`'s own
+  sticky/non-sticky choice exactly. A fresh cookie is issued whenever
+  the client had none yet, or whenever an attempt had to deviate from
+  the sticky target (its own endpoint down, or a later retry -- 5a-3 --
+  landing elsewhere) so the cookie always reflects the endpoint
+  actually used, never a stale intention.
+
+  `magnus_fastcgi_translate_headers()` gained an `affinity_cookie_
+  value` parameter, appending a `Set-Cookie: MAGNUS_AFFINITY=<value>;
+  Path=/; HttpOnly; SameSite=Lax` line in the identical format
+  `magnus_proxy_sanitize_response_headers()` already uses -- a client
+  that happens to bounce between `action=proxy` and `action=fastcgi`
+  routes on the same origin sees one consistent cookie shape either
+  way. New connection fields `fastcgi_affinity_key`/`fastcgi_issue_
+  affinity_cookie` mirror `proxy_affinity_key`/`proxy_issue_affinity_
+  cookie` exactly.
+
+  Verified against a real two-instance PHP-FPM 8.3.31 cluster (two
+  separate pools on different ports, so the actual backend a request
+  reached could be distinguished from the outside): a fresh cookie
+  captured from an uncookied request, then reused across further
+  requests, consistently routed to the same endpoint every time
+  (confirmed directly via the same TCP connection -- not just the same
+  endpoint -- being reused throughout, since pooling and affinity now
+  compose correctly together); two different clients with different
+  cookies stayed pinned to their own distinct endpoints even
+  interleaved; a client's target endpoint being stopped mid-session
+  correctly rerouted to the other endpoint with a freshly reissued
+  cookie reflecting it; a client presenting an already-valid cookie for
+  a healthy target got no redundant `Set-Cookie` at all. A realistic
+  cookie-jar-based concurrent-client test (15 clients, 3 sequential
+  requests each, real `http.cookiejar` session persistence rather than
+  a hand-copied header) succeeded overwhelmingly against the same
+  deliberately under-provisioned PHP-FPM setup 5a-4 already exercised,
+  with the small remainder answered by a clean `504` rather than
+  hanging. `make test` (twice, clean) and direct ASan/UBSan testing of
+  the live server zero findings.
+
 ## 1.54.0
 
 ### Added

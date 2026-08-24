@@ -1509,9 +1509,20 @@ connection-pool and common-request-model decisions).
   with a new `magnus_fastcgi_expire()` mirroring `magnus_expire_
   proxies()`).
 
-  Still ahead for Phase 5: session affinity for FastCGI (parity with
-  what proxy/gRPC dispatch already have), SCGI, uWSGI, Runtime API
-  expansion, and the zero-downtime binary upgrade mechanism itself.
+  **5a-5 (FastCGI session affinity) shipped in 1.55.0** -- the same
+  `MAGNUS_AFFINITY` cookie `action=proxy`/`action=grpc` already share
+  now works for `action=fastcgi` too (sticky endpoint selection,
+  fresh-cookie-on-deviation, `Set-Cookie` in the identical format),
+  closing out "FastCGI 고도화" (pooling/retry/affinity as one grouped
+  phase of work). Verified against a real two-instance PHP-FPM cluster
+  that a cookie sticks to its own endpoint (including across a
+  target-endpoint outage, correctly rerouting with a fresh cookie) and
+  that pooling/affinity compose correctly together (the same pooled
+  connection, not just the same endpoint, gets reused) -- see
+  `CHANGELOG.md` 1.55.0.
+
+  Still ahead for Phase 5: SCGI, uWSGI, Runtime API expansion, and the
+  zero-downtime binary upgrade mechanism itself.
 - **Phase 6 — Production hardening.** Not a feature phase — the security
   attack list in Section 8.1, the fuzz corpus expansion in Section 9, and
   the connection-scale benchmark ladder in Section 10 apply continuously
