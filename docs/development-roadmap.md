@@ -1690,6 +1690,28 @@ connection-pool and common-request-model decisions).
   in its original form could not have caught this (it only asserted
   eventual recovery, which a busy loop also exhibits).
 
+  **Reviewed, no gap found: HTTP/2 log injection via CR/LF in `:method`/
+  `:path`.** `magnus_h2_on_header()` copies HPACK-decoded pseudo-header
+  values into `stream->parsed.method`/`.target` with only a length/
+  overflow check -- no byte-level control-character filter equivalent to
+  `magnus_http_parse()`'s own (HTTP/1.1's CRLF-delimited request line has
+  no way to carry an embedded literal CR/LF inside a token to begin with,
+  which is exactly why that parser never needed one there; HPACK's
+  length-prefixed binary framing has no such structural guarantee, so the
+  two protocols were not obviously equivalent here without checking).
+  Verified directly rather than assumed: a standalone spike
+  (`nghttp2_session_mem_recv2()` against a hand-built server-side session,
+  fed a real HPACK-encoded HEADERS frame carrying a `:path` value of
+  `/foo\r\nFAKE-INJECTED-LOG-LINE status=200`) shows nghttp2's own default
+  HTTP-semantics validation rejects the frame ("Invalid HTTP header field
+  was received") before `on_header` ever fires -- confirmed
+  `magnus_h2_on_header()` cannot observe a raw CR/LF in a header value at
+  all. This protection is nghttp2's default behavior, gated only on the
+  application never calling `nghttp2_option_set_no_http_messaging()`;
+  grepped and confirmed magnus never calls any `nghttp2_option_*`
+  function anywhere, so the default stays in effect. Not a bug; recorded
+  here so a future audit does not re-open this thread from scratch.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
