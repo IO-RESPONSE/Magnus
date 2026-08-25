@@ -567,8 +567,14 @@ and `docs/ROADMAP.md`.
 - `magnusd`: supervises one `magnus` child -- validates config before ever
   applying it, reloads it via SIGHUP, and rolls back to the last-known-good
   config (respawning the child if it did not survive) on a failed reload
-  or a crash. Not bundled into the data-plane image; it is a separate
-  control-plane binary per `docs/ENTERPRISE_ARCHITECTURE.md`.
+  or a crash. `--workers <n>|auto` (2.0.0) instead launches a pool of `n`
+  independent `magnusd` sub-instances (`auto` = host core count), each
+  supervising its own `--reuseport on` `magnus` child bound to the same
+  port -- the kernel load-balances connections across them, so one
+  `magnusd` now scales across every core the host has instead of the one
+  a bare `magnus` process could ever use. This is now the shipped data-
+  plane image's own PID 1 (`CMD` defaults to `--workers auto`), not a
+  separate control-plane-only binary.
 - `magnusctl`: thin CLI for `magnusd` -- `check` validates a config file
   standalone (no daemon needed); `reload`, `status`, `drain`,
   `upgrade`, `shutdown` talk to a running `magnusd` over a Unix domain

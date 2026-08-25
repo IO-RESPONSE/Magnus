@@ -1794,6 +1794,27 @@ static char magnus_inherit_fd_path[MAGNUS_CONFIG_PATH_MAX];
  * is inactive unless its own flag is actually given. */
 static int magnus_ready_fd = -1;
 
+/* `--reuseport on|off` (default off, preserving every existing
+ * standalone/single-process deployment's exact prior behavior):
+ * SO_REUSEPORT on the primary and stream-passthrough TCP listeners
+ * (magnus_create_listener(), the one function both share), letting N
+ * independent magnus processes each bind the *same* port and have the
+ * kernel load-balance new connections across them by its own internal
+ * hash -- the actual mechanism a future N-worker magnusd (roadmap
+ * multi-core scaling) needs each worker to opt into. Deliberately NOT
+ * used by magnus_upgrade_listener/magnus_admin_listener (owner-only
+ * Unix sockets, never multi-bound) nor folded into the SCM_RIGHTS
+ * zero-downtime handoff path (magnus_upgrade_listener's own doc
+ * comment above already explains why splitting *one* listener's own
+ * accept queue across two live generations is wrong -- that reasoning
+ * is about a single listener's handoff moment, not about reuseport as
+ * a general mechanism, so it does not argue against a pool of already-
+ * independent worker processes each individually still using their own
+ * single-listener handoff for their own upgrades). A worker process
+ * still upgrades exactly the way one always has; only how it first
+ * binds its listener(s) changes. */
+static bool magnus_reuseport;
+
 /* Kept only so magnus_quic_init() (called once, at startup, after
  * magnus_parse_options() returns -- see main()) has the actual
  * certificate/key file paths to build its own separate QUIC-specific
@@ -13732,6 +13753,17 @@ magnus_create_listener(unsigned port)
         close(listener);
         return -1;
     }
+    /* See magnus_reuseport's own doc comment: off by default, so a
+     * plain standalone run binds exactly as exclusively as it always
+     * has; a worker opting in lets the kernel spread new connections
+     * on this same port across every other process that also opted
+     * in. */
+    if (magnus_reuseport
+        && setsockopt(listener, SOL_SOCKET, SO_REUSEPORT, &enabled,
+                      sizeof(enabled)) < 0) {
+        close(listener);
+        return -1;
+    }
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     address.sin_port = htons((uint16_t) port);
@@ -14410,10 +14442,21 @@ magnus_parse_options(int argc, char **argv)
                     exit(2);
                 }
                 magnus_ready_fd = (int) value;
+            } else if (strcmp(argv[index], "--reuseport") == 0) {
+                if (strcmp(argv[index + 1], "on") == 0) {
+                    magnus_reuseport = true;
+                } else if (strcmp(argv[index + 1], "off") == 0) {
+                    magnus_reuseport = false;
+                } else {
+                    fprintf(stderr, "magnus: --reuseport: expected "
+                                    "on/off\n");
+                    exit(2);
+                }
             } else {
                 fprintf(stderr, "magnus: --config accepts only "
-                                "--upgrade-socket/--inherit-fd/--ready-fd "
-                                "as extra flags, got '%s'\n", argv[index]);
+                                "--upgrade-socket/--inherit-fd/--ready-fd/"
+                                "--reuseport as extra flags, got '%s'\n",
+                                argv[index]);
                 exit(2);
             }
         }
@@ -14917,6 +14960,14 @@ magnus_parse_options(int argc, char **argv)
             long value = strtol(argv[index + 1], &end, 10);
             if (*end != '\0' || value < 0 || value >= MAGNUS_MAX_FDS) break;
             magnus_ready_fd = (int) value;
+        } else if (strcmp(argv[index], "--reuseport") == 0) {
+            if (strcmp(argv[index + 1], "on") == 0) {
+                magnus_reuseport = true;
+            } else if (strcmp(argv[index + 1], "off") == 0) {
+                magnus_reuseport = false;
+            } else {
+                break;
+            }
         } else if (strcmp(argv[index], "--access-log") == 0) {
             if (strcmp(argv[index + 1], "on") == 0) {
                 magnus_access_log_enabled = true;
@@ -15172,6 +15223,7 @@ magnus_parse_options(int argc, char **argv)
                     "[--udp-max-sessions <n>] "
                     "[--quic-port <1-65535>] "
                     "[--route <spec> ...] "
+                    "[--reuseport on|off] "
                     "| %s --config <path> | %s --version\n",
             argv[0], argv[0], argv[0]);
     exit(2);

@@ -58,6 +58,29 @@ static char magnusd_upgrade_socket_path[MAGNUS_CONFIG_PATH_MAX];
 static char magnusd_audit_log_path[MAGNUS_CONFIG_PATH_MAX];
 static pid_t magnusd_child_pid = -1;
 static unsigned magnusd_port;
+/* `--reuseport on|off` (default off): forwarded verbatim to every magnus
+ * child this instance spawns, as that child's own `--reuseport` flag --
+ * see src/magnus.c's magnus_reuseport doc comment for what it actually
+ * does. magnusd itself still only ever supervises exactly one child; a
+ * multi-core worker *pool* is N independently-supervised magnusd
+ * instances that each pass --reuseport on and bind the same config
+ * `port` (see magnusd_launcher_main() below, entered via --workers). */
+static bool magnusd_reuseport;
+/* `--rollback-path <path>` (optional; defaults to the existing
+ * "<config>.last-good" derivation below when not given, so a plain
+ * single-instance invocation is byte-for-byte unchanged). Exists only
+ * so magnusd_launcher_main() can give each of the N sub-instances it
+ * spawns its own distinct rollback file even though they all share one
+ * --config path -- without this, two sub-instances reloading around the
+ * same moment would race on the very same "<config>.last-good" file,
+ * each stomping the other's own last-known-good snapshot. */
+static char magnusd_rollback_path_arg[MAGNUS_CONFIG_PATH_MAX];
+/* `--workers <n>|auto` (default 1, preserving today's single-child
+ * behavior exactly): >1 diverts main() into magnusd_launcher_main()
+ * instead of ever touching magnusd_child_pid/spawn_child/reload/upgrade
+ * at all -- see that function's own doc comment for the full design. */
+static int magnusd_workers = 1;
+#define MAGNUSD_MAX_WORKERS 128
 static uint64_t magnusd_current_hash;
 static time_t magnusd_applied_at;
 static char magnusd_last_action[16] = "none";
@@ -252,28 +275,38 @@ magnusd_spawn_child_from(const char *binary, const char *inherit_from,
     pid_t pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
-        if (ready_write_fd >= 0
-            && dup2(ready_write_fd, MAGNUSD_CHILD_READY_FD) < 0)
-            _exit(127);
+        /* Built as an argv[] + execv() rather than a fixed execl() call
+         * so the reuseport-or-not/inherit-or-not/ready-fd-or-not
+         * combinations do not multiply into separate execl() call
+         * sites -- adding --reuseport here as a fourth independent
+         * on/off axis would otherwise have doubled the three existing
+         * execl() variants into six. */
+        const char *args[12];
+        int argi = 0;
+        char ready_fd_text[16];
+        args[argi++] = binary;
+        args[argi++] = "--config";
+        args[argi++] = magnusd_config_path;
+        args[argi++] = "--upgrade-socket";
+        args[argi++] = magnusd_upgrade_socket_path;
         if (inherit_from != NULL) {
+            args[argi++] = "--inherit-fd";
+            args[argi++] = inherit_from;
             if (ready_write_fd >= 0) {
-                char ready_fd_text[16];
+                if (dup2(ready_write_fd, MAGNUSD_CHILD_READY_FD) < 0)
+                    _exit(127);
                 snprintf(ready_fd_text, sizeof(ready_fd_text), "%d",
                         MAGNUSD_CHILD_READY_FD);
-                execl(binary, binary, "--config", magnusd_config_path,
-                     "--upgrade-socket", magnusd_upgrade_socket_path,
-                     "--inherit-fd", inherit_from, "--ready-fd",
-                     ready_fd_text, (char *) NULL);
-            } else {
-                execl(binary, binary, "--config", magnusd_config_path,
-                     "--upgrade-socket", magnusd_upgrade_socket_path,
-                     "--inherit-fd", inherit_from, (char *) NULL);
+                args[argi++] = "--ready-fd";
+                args[argi++] = ready_fd_text;
             }
-        } else {
-            execl(binary, binary, "--config", magnusd_config_path,
-                 "--upgrade-socket", magnusd_upgrade_socket_path,
-                 (char *) NULL);
         }
+        if (magnusd_reuseport) {
+            args[argi++] = "--reuseport";
+            args[argi++] = "on";
+        }
+        args[argi] = NULL;
+        execv(binary, (char * const *) args);
         _exit(127);
     }
     magnusd_child_pid = pid;
@@ -653,7 +686,9 @@ magnusd_usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s --config <path> --magnus-binary <path> "
-            "--socket <path> --audit-log <path>\n", program);
+            "--socket <path> --audit-log <path> "
+            "[--workers <n>|auto] [--reuseport on|off] "
+            "[--rollback-path <path>]\n", program);
     exit(2);
 }
 
@@ -682,6 +717,194 @@ magnusd_ensure_standard_fds(void)
             if (opened >= 0 && opened != fd) close(opened);
         }
     }
+}
+
+/* Roadmap (multi-core scaling): `--workers <n>` diverts here instead of
+ * ever running the single-child body below. Rather than reworking every
+ * single-child-oriented piece of this file (health-check-gated reload/
+ * rollback, the SCM_RIGHTS zero-downtime upgrade dance, the status/
+ * audit protocol) to understand "N children" as a new first-class
+ * concept, this forks N *independent, ordinary, unmodified magnusd
+ * instances* -- each one re-executing this same binary with its own
+ * --socket/--audit-log/--rollback-path (suffixed ".w<i>", so no two
+ * instances ever share a file two of them could race on writing) and
+ * --reuseport on, all pointed at the *same* --config path/port. Each
+ * instance's own magnus child binds that port with SO_REUSEPORT (see
+ * src/magnus.c's magnus_reuseport doc comment); the kernel spreads new
+ * connections across all of them. Every existing single-instance
+ * capability -- crash-restart, reload-with-rollback, magnusctl status/
+ * drain, and in particular the zero-downtime binary upgrade -- keeps
+ * working completely unmodified, per instance, against that instance's
+ * own --socket; a rolling pool-wide upgrade is simply calling
+ * `magnusctl upgrade` against each instance's socket in turn, one at a
+ * time, from outside (an ordinary shell loop, not new code here).
+ *
+ * This function's own job is only one layer up from that: keep exactly
+ * `magnusd_workers` of these sub-instances alive (respawning one if its
+ * own magnusd process -- not its magnus child, which its own internal
+ * crash-restart already covers -- ever exits unexpectedly), and forward
+ * a clean shutdown (SIGINT/SIGTERM) to the whole group, letting each
+ * sub-instance drain and tear down its own magnus child and control
+ * socket exactly as it already does today. */
+static int
+magnusd_launcher_main(const char *self_path)
+{
+    pid_t pids[MAGNUSD_MAX_WORKERS];
+    bool live[MAGNUSD_MAX_WORKERS] = { 0 };
+    int alive_count = 0;
+
+    for (int i = 0; i < MAGNUSD_MAX_WORKERS; i++) pids[i] = -1;
+    for (int i = 0; i < magnusd_workers; i++) {
+        char socket_path[MAGNUS_CONFIG_PATH_MAX];
+        char audit_path[MAGNUS_CONFIG_PATH_MAX];
+        char rollback_path[MAGNUS_CONFIG_PATH_MAX];
+        if (snprintf(socket_path, sizeof(socket_path), "%s.w%d",
+                    magnusd_socket_path, i) >= (int) sizeof(socket_path)
+            || snprintf(audit_path, sizeof(audit_path), "%s.w%d",
+                    magnusd_audit_log_path, i) >= (int) sizeof(audit_path)
+            /* Derived from magnusd_rollback_path (the launcher's own
+             * already-resolved rollback base -- either an explicit
+             * --rollback-path or the "<config>.last-good" default), not
+             * magnusd_config_path directly: a --rollback-path the user
+             * gave the launcher must actually take effect for every
+             * worker, the same as it does for the single-instance
+             * (--workers 1) path below. This also matters whenever the
+             * config file itself lives somewhere unwritable (e.g. a
+             * read-only container image root) -- --rollback-path is
+             * exactly how that gets pointed at a writable directory
+             * instead, and silently ignoring it here would leave every
+             * worker unable to persist its rollback snapshot at all. */
+            || snprintf(rollback_path, sizeof(rollback_path),
+                    "%s.w%d", magnusd_rollback_path, i)
+                    >= (int) sizeof(rollback_path)) {
+            fprintf(stderr, "magnusd: worker %d: path too long\n", i);
+            goto fail;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            fprintf(stderr, "magnusd: worker %d: fork: %s\n", i,
+                    strerror(errno));
+            goto fail;
+        }
+        if (pid == 0) {
+            execlp(self_path, self_path, "--config", magnusd_config_path,
+                  "--magnus-binary", magnusd_magnus_binary, "--socket",
+                  socket_path, "--audit-log", audit_path, "--rollback-path",
+                  rollback_path, "--reuseport", "on", (char *) NULL);
+            _exit(127);
+        }
+        pids[i] = pid;
+        live[i] = true;
+        alive_count++;
+    }
+    fprintf(stderr, "magnusd: launcher supervising %d workers "
+                    "(reuseport pool on port %u)\n", magnusd_workers,
+            magnusd_port);
+
+    signal(SIGINT, magnusd_signal_handler);
+    signal(SIGTERM, magnusd_signal_handler);
+    signal(SIGCHLD, magnusd_signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    while (magnusd_running && alive_count > 0) {
+        struct timespec remaining = { .tv_sec = 2, .tv_nsec = 0 };
+        nanosleep(&remaining, NULL);
+        if (magnusd_child_reaped) {
+            magnusd_child_reaped = 0;
+            for (;;) {
+                int status;
+                pid_t exited = waitpid(-1, &status, WNOHANG);
+                if (exited <= 0) break;
+                for (int i = 0; i < magnusd_workers; i++) {
+                    if (!live[i] || pids[i] != exited) continue;
+                    alive_count--;
+                    if (!magnusd_running) {
+                        live[i] = false;
+                        break;
+                    }
+                    fprintf(stderr, "magnusd: worker %d (pid=%d) exited "
+                                    "unexpectedly; restarting\n", i,
+                            (int) exited);
+                    char socket_path[MAGNUS_CONFIG_PATH_MAX];
+                    char audit_path[MAGNUS_CONFIG_PATH_MAX];
+                    char rollback_path[MAGNUS_CONFIG_PATH_MAX];
+                    /* Same derivation as the initial spawn loop above
+                     * (magnusd_rollback_path, not magnusd_config_path) --
+                     * see that call site's comment. Truncation is
+                     * checked here too (unlike a bare snprintf(), which
+                     * both risks a silently-corrupted path *and* is
+                     * what -Wformat-truncation flags as a build
+                     * warning): on overflow this worker is left dead
+                     * rather than restarted against a mangled path --
+                     * the other workers are unaffected. */
+                    if (snprintf(socket_path, sizeof(socket_path), "%s.w%d",
+                                magnusd_socket_path, i) >= (int) sizeof(socket_path)
+                        || snprintf(audit_path, sizeof(audit_path), "%s.w%d",
+                                magnusd_audit_log_path, i) >= (int) sizeof(audit_path)
+                        || snprintf(rollback_path, sizeof(rollback_path),
+                                "%s.w%d", magnusd_rollback_path, i)
+                                >= (int) sizeof(rollback_path)) {
+                        fprintf(stderr, "magnusd: worker %d: path too "
+                                        "long; not restarting\n", i);
+                        live[i] = false;
+                        break;
+                    }
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        execlp(self_path, self_path, "--config",
+                              magnusd_config_path, "--magnus-binary",
+                              magnusd_magnus_binary, "--socket", socket_path,
+                              "--audit-log", audit_path, "--rollback-path",
+                              rollback_path, "--reuseport", "on",
+                              (char *) NULL);
+                        _exit(127);
+                    } else if (pid > 0) {
+                        pids[i] = pid;
+                        live[i] = true;
+                        alive_count++;
+                    } else {
+                        fprintf(stderr, "magnusd: worker %d: restart "
+                                        "fork failed: %s\n", i,
+                                strerror(errno));
+                        live[i] = false;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < magnusd_workers; i++) {
+        if (live[i]) kill(pids[i], SIGTERM);
+    }
+    for (int attempt = 0; attempt < 150; attempt++) {
+        bool any_live = false;
+        for (int i = 0; i < magnusd_workers; i++) {
+            if (!live[i]) continue;
+            int status;
+            pid_t result = waitpid(pids[i], &status, WNOHANG);
+            if (result == pids[i] || result < 0) live[i] = false;
+            else any_live = true;
+        }
+        if (!any_live) break;
+        usleep(100000);
+    }
+    for (int i = 0; i < magnusd_workers; i++) {
+        if (!live[i]) continue;
+        kill(pids[i], SIGKILL);
+        waitpid(pids[i], NULL, 0);
+    }
+    fprintf(stderr, "magnusd: launcher stopped\n");
+    return 0;
+
+fail:
+    for (int i = 0; i < MAGNUSD_MAX_WORKERS; i++) {
+        if (pids[i] > 0) {
+            kill(pids[i], SIGTERM);
+            waitpid(pids[i], NULL, 0);
+        }
+    }
+    return 1;
 }
 
 int
@@ -717,6 +940,31 @@ main(int argc, char **argv)
             if (strlen(argv[index + 1]) >= sizeof(magnusd_audit_log_path))
                 magnusd_usage(argv[0]);
             strcpy(magnusd_audit_log_path, argv[index + 1]);
+        } else if (strcmp(argv[index], "--reuseport") == 0) {
+            if (strcmp(argv[index + 1], "on") == 0) {
+                magnusd_reuseport = true;
+            } else if (strcmp(argv[index + 1], "off") == 0) {
+                magnusd_reuseport = false;
+            } else {
+                magnusd_usage(argv[0]);
+            }
+        } else if (strcmp(argv[index], "--rollback-path") == 0) {
+            if (strlen(argv[index + 1]) >= sizeof(magnusd_rollback_path_arg))
+                magnusd_usage(argv[0]);
+            strcpy(magnusd_rollback_path_arg, argv[index + 1]);
+        } else if (strcmp(argv[index], "--workers") == 0) {
+            if (strcmp(argv[index + 1], "auto") == 0) {
+                long detected = sysconf(_SC_NPROCESSORS_ONLN);
+                magnusd_workers = detected > 0
+                    ? (int) detected : 1;
+            } else {
+                char *end;
+                long value = strtol(argv[index + 1], &end, 10);
+                if (*end != '\0' || value < 1) magnusd_usage(argv[0]);
+                magnusd_workers = (int) value;
+            }
+            if (magnusd_workers > MAGNUSD_MAX_WORKERS)
+                magnusd_workers = MAGNUSD_MAX_WORKERS;
         } else {
             magnusd_usage(argv[0]);
         }
@@ -724,7 +972,9 @@ main(int argc, char **argv)
     if (magnusd_config_path[0] == '\0' || magnusd_magnus_binary[0] == '\0'
         || magnusd_socket_path[0] == '\0' || magnusd_audit_log_path[0] == '\0')
         magnusd_usage(argv[0]);
-    if (snprintf(magnusd_rollback_path, sizeof(magnusd_rollback_path),
+    if (magnusd_rollback_path_arg[0] != '\0') {
+        strcpy(magnusd_rollback_path, magnusd_rollback_path_arg);
+    } else if (snprintf(magnusd_rollback_path, sizeof(magnusd_rollback_path),
                 "%s.last-good", magnusd_config_path)
         >= (int) sizeof(magnusd_rollback_path)) {
         fprintf(stderr, "magnusd: config path too long\n");
@@ -744,6 +994,29 @@ main(int argc, char **argv)
         return 2;
     }
     magnusd_port = config.port;
+
+    if (magnusd_workers > 1) {
+        /* Scope cut for this increment (documented, not silently
+         * broken): admin_socket is a config-file key, so it is the
+         * *same* Unix domain socket path for every one of the N
+         * sub-instances this spawns -- unlike --socket/--audit-log/
+         * --rollback-path above, magnusd_launcher_main() has no way to
+         * give each sub-instance its own admin_socket without a
+         * per-worker config file (a real feature this increment
+         * deliberately does not build). Refusing to start beats
+         * letting N-1 of them silently fail to bind admin_socket at
+         * startup. */
+        if (config.has_admin_socket) {
+            fprintf(stderr, "magnusd: --workers %d: config's admin_socket "
+                            "is a single shared path all workers would "
+                            "collide on binding; disable admin_socket in "
+                            "the config to run a multi-worker pool\n",
+                    magnusd_workers);
+            return 2;
+        }
+        return magnusd_launcher_main(argv[0]);
+    }
+
     {
         char *initial_content = magnusd_read_file(magnusd_config_path);
         if (initial_content != NULL) {

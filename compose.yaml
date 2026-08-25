@@ -1,6 +1,6 @@
 services:
   magnus:
-    image: ${MAGNUS_IMAGE:-ioresponse/magnus:1.24.0}
+    image: ${MAGNUS_IMAGE:-ioresponse/magnus:2.0.0}
     container_name: magnus-dev
     ports:
       - "127.0.0.1:8080:8080"
@@ -10,7 +10,11 @@ services:
         soft: 65536
         hard: 65536
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=16m
+      # mode=1777 explicit: a bare --tmpfs mount defaults to owner
+      # root, and magnusd runs as USER 65534 (Dockerfile) -- without
+      # this it cannot create its control socket/audit-log/rollback
+      # files under /tmp at all.
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:

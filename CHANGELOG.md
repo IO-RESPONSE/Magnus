@@ -1,5 +1,75 @@
 # Changelog
 
+## 2.0.0
+
+### Added
+
+- **Multi-process worker model for real multi-core scaling -- a MAJOR
+  version bump because it changes the engine's own process architecture,
+  not just a feature.** Until this release, one `magnus` process ever
+  used exactly one CPU core regardless of how many the host actually had
+  (single-threaded `epoll` event loop, no forking) -- an 16-core/32GB
+  host ran Magnus no faster than a 1-core/2GB one. Fixed nginx-style:
+  `SO_REUSEPORT` (`--reuseport on|off` on `magnus` itself, off by
+  default so a bare `magnus` process's own behavior -- including a
+  same-port bind conflict when a second instance is started by mistake
+  -- is unchanged) lets any number of independent `magnus` processes
+  bind the *same* port; the kernel then load-balances new connections
+  across all of them itself, no shared state or coordination needed
+  between workers.
+  `magnusd` gained `--workers <n>|auto` (default `1`, so today's single-
+  child supervision is unchanged unless explicitly opted into) to drive
+  this: it launches `n` independent `magnusd` sub-instances (`auto`
+  detects the host's own core count via `sysconf(_SC_NPROCESSORS_ONLN)`,
+  capped at `MAGNUSD_MAX_WORKERS` = 128), each passed `--reuseport on`
+  and its own `.w<N>`-suffixed `--socket`/`--audit-log`/`--rollback-path`
+  (so magnusctl/hot-reload/audit trails stay per-worker and never
+  collide), all pointed at the same `--config` path/port. Each sub-
+  instance supervises its own `magnus` child exactly as `--workers 1`
+  always has (crash-restart, SIGHUP reload-with-rollback, drain-and-
+  upgrade); losing one worker only costs that worker's share of
+  capacity, the other N-1 keep serving. A worker's own crash-restart
+  loop derives its `.wN` paths a second time (on respawn); this call
+  site's `snprintf()` truncation is now checked the same way the
+  initial spawn loop's already was, so a pathologically long `--socket`/
+  `--audit-log`/`--rollback-path` leaves that one worker dead rather
+  than restarted against a silently-corrupted path -- the other workers
+  are unaffected either way.
+  `admin_socket` is a single shared config-file path every worker would
+  otherwise collide on binding (only the first would succeed, N-1 would
+  silently fail); `--workers N>1` with `admin_socket` set in the config
+  now refuses to start with a clear error instead of degrading silently.
+  Verified live in a 6-core container: `--workers auto` correctly
+  detected 6 cores, spawned 6 `magnus` workers all successfully bound to
+  port 8080 via `SO_REUSEPORT`, served requests normally, passed the
+  Docker healthcheck, and shut down cleanly (all 6 workers + the
+  launcher exiting 0) on `SIGTERM` well inside the 15s stop grace
+  period.
+
+### Changed
+
+- **The shipped Docker image now runs `magnusd`, not bare `magnus`, as
+  PID 1**, with `CMD` set to `--workers auto` -- one container now
+  scales across every core the host gives it instead of the single core
+  a bare `magnus` process could ever use, degrading to exactly today's
+  one-`magnusd`/one-`magnus` supervision on a single-core host (or
+  `--workers 1`). All of `magnusd`'s own runtime paths (`--socket`,
+  `--audit-log`, `--rollback-path`) point under `/tmp`, the one writable
+  path under this image's `read_only: true` root; the baked-in `/etc/
+  magnus/magnus.conf` is not writable, so a `SIGHUP`-triggered hot-
+  reload's rollback-on-bad-config rewrite has nowhere to persist against
+  it -- deployments that need live config reload should mount their own
+  writable `--config` path instead of relying on the image's built-in
+  one. The baked-in default config now also ships `root = /var/www` (an
+  empty directory in the image) alongside `port = 8080`, matching what
+  was actually approved for this image before the switch to a
+  `magnusd`-based entrypoint.
+- `compose.yaml`'s `tmpfs` mount for `/tmp` now sets `mode=1777`
+  explicitly -- a bare `--tmpfs` mount defaults to owner `root`, and
+  `magnusd`/`magnus` run as `USER 65534:65534`; without this they could
+  not create their control socket/audit-log/rollback files under `/tmp`
+  at all.
+
 ## 1.63.0
 
 ### Fixed

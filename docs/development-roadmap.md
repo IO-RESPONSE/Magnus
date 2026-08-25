@@ -1766,6 +1766,53 @@ connection-pool and common-request-model decisions).
   receives (only ever compresses its own responses), so a decompression-
   bomb attack class simply has no applicable surface here.
 
+  **Phase 6 itself is paused as of 2.0.0.** The multi-process worker
+  model below took priority: a single `magnus` process using exactly one
+  CPU core regardless of the host's own capacity (confirmed directly by
+  the user: a 16-core/32GB host ran Magnus no faster than a 1-core/2GB
+  one) was judged the larger gap. Phase 6's cross-cutting audit resumes
+  once that work — and the fixed-memory-cap relaxation work queued
+  behind it (see below) — lands.
+
+- **Multi-process worker model (2.0.0) — real multi-core scaling,
+  nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
+  single-threaded epoll reactor throughout (Section 8's own performance
+  goals list `SO_REUSEPORT` as a not-yet-landed optimization). Chosen
+  over the alternative of just tuning deployment-level CPU limits
+  because it actually uses the hardware instead of constraining Magnus
+  to it. `magnus` gained `--reuseport on|off` (default off, so a bare
+  `magnus` process's own behavior — including today's same-port-bind-
+  conflict diagnostic — is unchanged); any number of independent
+  `magnus` processes can now bind the same port, with the kernel
+  spreading new connections across them, no shared state between
+  workers at all. `magnusd` gained `--workers <n>|auto` (default `1`,
+  preserving today's single-child supervision unless explicitly opted
+  into) to drive a pool of these: `auto` detects the host's own core
+  count (`sysconf(_SC_NPROCESSORS_ONLN)`, capped at 128), spawns that
+  many independent `magnusd` sub-instances each with `--reuseport on`
+  and its own `.w<N>`-suffixed socket/audit-log/rollback path (so
+  magnusctl, hot-reload, and audit trails all stay correctly scoped per
+  worker), and supervises each with the exact same crash-restart/
+  reload/drain-and-upgrade logic `--workers 1` already had — losing one
+  worker only costs that worker's share of capacity. `admin_socket` is a
+  single shared config-file path every worker would otherwise collide
+  on binding; `--workers N>1` with it set now refuses to start with a
+  clear error rather than letting N-1 workers silently fail to bind it.
+  The shipped Docker image now runs `magnusd --workers auto` as PID 1
+  instead of bare `magnus`. Verified live, not assumed: a 6-core
+  container correctly spawned 6 `SO_REUSEPORT` workers all bound to
+  port 8080, served ordinary requests and the Docker healthcheck
+  normally, and shut down cleanly (all 6 workers + the launcher exiting
+  0) on `SIGTERM`. See `CHANGELOG.md` 2.0.0 for the full detail,
+  including the crash-restart loop's own `snprintf()` truncation-guard
+  fix found while finishing this work.
+
+  **Deferred to a later increment, not started:** relaxing or removing
+  this codebase's internal fixed memory caps (e.g. `MAGNUS_MAX_BODY`)
+  now that a 16-core/32GB-class host can actually be saturated —
+  queued behind this worker-model landing, per the user's own stated
+  two-part priority.
+
 ## 4. Module structure
 
 `magnus.c` at 2,467 lines is still one file handling the reactor, HTTP/1
