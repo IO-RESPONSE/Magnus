@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.63.0
+
+### Fixed
+
+- **`accept()`-EMFILE/ENFILE busy-loop -- a real, reachable resource-
+  exhaustion amplifier found and fixed during Phase 6's own cross-cutting
+  audit (roadmap 6a-4).** The public (and admin) listener is registered
+  with plain level-triggered `EPOLLIN` (no `EPOLLET` anywhere in this
+  codebase). `magnus_accept_connections()`'s own accept loop, on any
+  `accept4()` failure other than `EAGAIN`/`EWOULDBLOCK`/`EINTR`, simply
+  `return -1`ed and let the caller discard it. That is correct for a
+  genuinely unexpected error, but `EMFILE`/`ENFILE` (the process, or the
+  system, is out of file descriptors) is neither rare nor exotic here --
+  every connection this process ever accepts holds an fd for its
+  lifetime, so nothing more than opening enough connections to reach
+  `RLIMIT_NOFILE` (frequently 1024 by default, well below `MAGNUS_MAX_
+  FDS`'s own 65536 array bound) and holding them open within the
+  ordinary idle timeout reaches it -- no malformed input, no protocol
+  abuse, just ordinary connection volume. Once reached, the listener's
+  own backlog still holds unaccepted, already-`SYN`-completed
+  connections, keeping the fd level-triggered-readable; the very next
+  `epoll_wait()` reports it again immediately, `accept4()` fails
+  `EMFILE`/`ENFILE` again immediately, forever -- a tight loop pinning
+  one CPU core at up to 100% for as long as the pressure lasts, on top of
+  (and considerably worse than) the fd exhaustion alone, since it also
+  starves every *other* fd this same epoll instance is servicing (every
+  already-accepted connection, health probes, DNS, the admin socket, ...)
+  of any of that core's time.
+
+  Fixed the same way nginx's own `ngx_disable_accept_events()` does: on
+  `EMFILE`/`ENFILE`, `EPOLL_CTL_DEL` the listener (a no-op that never
+  itself needs a new fd, so it always succeeds regardless of the
+  pressure) so it cannot re-signal, and let the main loop's existing
+  once-per-second periodic sweep retry `EPOLL_CTL_ADD` on it (a new
+  `magnus_resume_paused_listener()`, silently ignoring the expected
+  `EEXIST` on the overwhelmingly common "was never paused" case) until it
+  succeeds -- rate-limiting the retry to once a second instead of a tight
+  spin, and resuming within one sweep of any fd actually freeing back up.
+  Applied to both the public listener and (when enabled) the admin
+  listener; every already-accepted connection keeps being serviced
+  normally throughout, and new connections simply queue in the kernel's
+  own backlog (or see `ECONNREFUSED` once that backlog itself fills)
+  while paused, exactly as if the process were momentarily busy.
+
+  This codebase already had an M6 fd-exhaustion test in
+  `tests/test-core.sh` (`ulimit -n 40`, open 80 connections, assert
+  magnus keeps answering `/healthz` afterward) -- it never caught this,
+  because it only ever asserted *eventual* recovery, and a busy loop
+  "recovers" the exact same way a correctly-idle process does the moment
+  the pressure ends. Found instead by reading `magnus_accept_connections()`
+  directly against the "what happens on EMFILE with a level-triggered fd"
+  question, then confirmed empirically two ways: (1) M6 itself extended
+  to hold the 80 connections open for a real multi-second window instead
+  of closing them immediately, sampling magnus's own CPU time from
+  `/proc/$pid/stat` (`utime+stime`, clock ticks) before and after --
+  **177 ticks (1.77s) of CPU spent over a 3.0s window on the pre-fix
+  binary (~59% of a core, continuously spinning) versus 0 ticks on the
+  fixed binary**, both built from the exact same sources with only this
+  fix stashed out/back in; (2) the identical attack repeated directly
+  against the real, read-only, non-root Docker image
+  (`ioresponse/magnus:1.63.0`, `--ulimit nofile=48:48`), sampling `/proc/
+  1/stat` (magnus runs as pid 1 in-container) live during a 4-second
+  attack window -- 0 ticks spent, `pausing new connections`/`resuming
+  accept` logged in lockstep with the pressure, `/healthz` still
+  answering correctly throughout and after. `make test` twice clean
+  (both the plain and the ASan+UBSan `make sanitize` build -- one run hit
+  this codebase's own known, pre-existing, sanitizer-slowdown-sensitive
+  h2 stream-flood-rate-test flake, confirmed unrelated to this change by
+  a clean rerun), zero ASan/UBSan findings.
+
 ## 1.62.0
 
 ### Fixed

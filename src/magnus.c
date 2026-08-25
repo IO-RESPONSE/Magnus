@@ -12285,6 +12285,50 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EMFILE || errno == ENFILE) {
+                /* Roadmap 6a-4: process- or system-wide fd exhaustion.
+                 * `listener` is registered EPOLLIN, level-triggered (no
+                 * EPOLLET anywhere in this codebase) -- if we just
+                 * `return -1` here the way every other unexpected accept4()
+                 * failure does, the pending connection(s) still sitting in
+                 * this listener's own backlog keep the fd readable, so the
+                 * very next epoll_wait() call reports it again immediately,
+                 * accept4() fails EMFILE/ENFILE again immediately, forever:
+                 * a tight busy loop pinning one CPU core at 100% instead of
+                 * blocking in epoll_wait() like the rest of this reactor
+                 * does whenever there is nothing to do -- worse than the
+                 * fd exhaustion alone, since it also starves every other
+                 * fd this same epoll instance is servicing (every existing
+                 * connection, health probes, DNS, ...) of any of that
+                 * CPU's time for as long as the pressure lasts. This is
+                 * reachable by nothing more exotic than opening enough
+                 * connections to hit RLIMIT_NOFILE (frequently 1024 by
+                 * default, well below MAGNUS_MAX_FDS's own 65536 array
+                 * bound above) and holding them open within the ordinary
+                 * idle timeout -- no malformed input of any kind needed.
+                 *
+                 * Fixed the same way nginx's own ngx_disable_accept_
+                 * events() does: stop watching this listener at all
+                 * (EPOLL_CTL_DEL -- a no-op that never itself needs a new
+                 * fd) so it cannot re-signal, and let the main loop's
+                 * existing once-per-second sweep retry EPOLL_CTL_ADD on it
+                 * (magnus_resume_paused_listener(), below) until it
+                 * succeeds -- naturally rate-limiting the retry to once a
+                 * second rather than a tight spin, and resuming within one
+                 * sweep of any fd actually freeing back up. Every
+                 * already-accepted connection keeps being serviced
+                 * normally throughout; only *new* connections queue in the
+                 * kernel's own backlog (or see ECONNREFUSED once that
+                 * backlog itself fills) while paused, exactly as if this
+                 * process were simply busy for a moment. */
+                (void) epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listener, NULL);
+                fprintf(stderr,
+                        "magnus: accept() out of file descriptors (%s) -- "
+                        "pausing new connections on fd %d until some free "
+                        "up\n",
+                        strerror(errno), listener);
+                return 0;
+            }
             return -1;
         }
         if (client >= MAGNUS_MAX_FDS) {
@@ -12396,6 +12440,36 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
             magnus_connections_active++;
         }
     }
+}
+
+/* Roadmap 6a-4: called once per second from the main loop's existing
+ * periodic sweep for both the public listener and (if enabled) the admin
+ * listener. A no-op (EEXIST, silently ignored) unless magnus_accept_
+ * connections() actually paused this exact fd via EPOLL_CTL_DEL after
+ * hitting EMFILE/ENFILE -- see that function's own comment for the full
+ * story. `listener_fd < 0` covers the admin listener when magnusd/the
+ * admin socket is disabled, or any other not-currently-in-use listener a
+ * future caller passes here; harmless to call every second even while
+ * nothing is paused, since the only real cost on the common path is one
+ * failed epoll_ctl() call. */
+static void
+magnus_resume_paused_listener(int epoll_fd, int listener_fd)
+{
+    struct epoll_event event;
+    if (listener_fd < 0) {
+        return;
+    }
+    event = (struct epoll_event) { .events = EPOLLIN,
+                                    .data.fd = listener_fd };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener_fd, &event) == 0) {
+        fprintf(stderr,
+                "magnus: resuming accept() on fd %d (file descriptors "
+                "freed up)\n",
+                listener_fd);
+    }
+    /* EEXIST: was never paused (already registered) -- the expected,
+     * silent common case. Any other error is unexpected but not fatal
+     * here; we simply try again on the next sweep. */
 }
 
 static void
@@ -15643,6 +15717,12 @@ main(int argc, char **argv)
             magnus_dns_tick(now);
             magnus_health_tick(epoll_fd, now);
             magnus_access_log_flush();
+            /* Roadmap 6a-4: retry re-arming any listener magnus_accept_
+             * connections() paused after an EMFILE/ENFILE accept()
+             * failure -- see that function's own comment. */
+            magnus_resume_paused_listener(epoll_fd, listener);
+            if (magnus_admin_enabled)
+                magnus_resume_paused_listener(epoll_fd, magnus_admin_listener);
             last_sweep = now;
         }
     }

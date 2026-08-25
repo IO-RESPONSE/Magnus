@@ -1670,13 +1670,38 @@ connection-pool and common-request-model decisions).
   never string-concatenation-then-validate) were also reviewed and
   found already soundly defended.
 
+  **6a-4 (`accept()`-EMFILE/ENFILE busy-loop fix) shipped in 1.63.0** --
+  a second real, exploitable gap this audit pass found, this time a
+  resource-exhaustion *amplifier* rather than a parsing bug:
+  `magnus_accept_connections()` treated `EMFILE`/`ENFILE` the same as any
+  other unexpected `accept4()` error, but the listener's own level-
+  triggered `EPOLLIN` registration means that failure mode alone re-fires
+  on every single `epoll_wait()` for as long as the listener's backlog
+  stays non-empty -- a tight loop pinning one CPU core, reachable by
+  nothing more than ordinary connection volume reaching `RLIMIT_NOFILE`.
+  Fixed the same way nginx's own `ngx_disable_accept_events()` does:
+  `EPOLL_CTL_DEL` the listener on `EMFILE`/`ENFILE`, retry `EPOLL_CTL_ADD`
+  from the existing once-per-second sweep. Quantified both ways: the
+  existing M6 fd-exhaustion test in `tests/test-core.sh` extended to
+  sample `/proc/$pid/stat` CPU ticks across a held-open fd-pressure
+  window (177 ticks/3s pre-fix vs. 0 post-fix, same sources), and the
+  identical attack repeated live inside the real Docker image. See
+  `CHANGELOG.md` 1.63.0 for the full writeup, including why the M6 test
+  in its original form could not have caught this (it only asserted
+  eventual recovery, which a busy loop also exhibits).
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
   `development-roadmap.md` itself, so later Phase 6 increments
   reconstruct that scope directly against standard web-gateway attack
   classes and this codebase's own accumulated real-bug history rather
-  than a literal external checklist).
+  than a literal external checklist). This same pass also re-confirmed
+  (already recorded above, not re-derived) that Rapid Reset (CVE-2023-
+  44487, roadmap 1e-3) and CONTINUATION-flood abuse are already defended,
+  and separately confirmed this codebase never decompresses anything it
+  receives (only ever compresses its own responses), so a decompression-
+  bomb attack class simply has no applicable surface here.
 
 ## 4. Module structure
 

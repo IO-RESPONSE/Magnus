@@ -670,6 +670,23 @@ grep -q 'magnus: stopped' "$log"
 # M6: fd exhaustion -- under a tight per-process fd limit, magnus must
 # keep running (not crash) and recover once connections close, even
 # though it cannot accept everything while the limit is being hit.
+#
+# Roadmap 6a-4 also extended this block to prove the accept()-EMFILE fix
+# itself, not just eventual recovery: hold the fd-pressure window open
+# for several real seconds (instead of closing every socket immediately)
+# and sample magnus's own CPU time (from /proc/$pid/stat, utime+stime,
+# in clock ticks) at the start and end of that window. Before the fix,
+# accept4() failing EMFILE/ENFILE with the listener still readable
+# (level-triggered, and its own backlog still holding unaccepted
+# connections) span a tight loop pinning one core at ~100% for as long as
+# the pressure lasted -- which this same test's own prior form (close
+# every socket within the same python3 call, no window to sample) could
+# not have caught, since a busy loop still "recovers" once the pressure
+# ends, exactly like a correctly idle process would. A generous
+# clock_ticks_per_sec threshold (half a second of CPU time over the
+# multi-second hold window) comfortably separates "genuinely idle in
+# epoll_wait()" from "spinning" without being sensitive to ordinary
+# CI scheduling noise.
 port_fdlimit=$((port + 21))
 (
   ulimit -n 40
@@ -682,7 +699,17 @@ for attempt in 1 2 3 4 5; do
   sleep 1
 done
 python3 -c "
-import socket
+import socket, subprocess, time
+
+def cpu_ticks(pid):
+    with open('/proc/%d/stat' % pid) as f:
+        fields = f.read().split(')')[-1].split()
+    # After the ')' that closes the (comm) field, utime is field 12 and
+    # stime is field 13 in the space-separated remainder (1-indexed from
+    # 'state' as field 1) -- see proc(5).
+    return int(fields[11]) + int(fields[12])
+
+clk_tck = int(subprocess.check_output(['getconf', 'CLK_TCK']))
 socks = []
 try:
     for _ in range(80):
@@ -691,12 +718,23 @@ try:
 except OSError:
     pass
 print('opened', len(socks), 'connections under fd pressure')
+before = cpu_ticks($server_pid)
+time.sleep(3)
+after = cpu_ticks($server_pid)
 for s in socks:
     s.close()
+spent = after - before
+print('cpu ticks spent while held open:', spent, '(clk_tck=%d)' % clk_tck)
+if spent > clk_tck // 2:
+    raise SystemExit(
+        'accept() EMFILE busy-loop suspected: %d ticks (%.2fs of CPU) '
+        'spent over a 3s idle-pressure window' % (spent, spent / clk_tck))
 "
 sleep 1
 test "$(curl --fail --silent "http://127.0.0.1:$port_fdlimit/healthz")" \
   = 'magnus: ok'
+grep -q 'pausing new connections' "$log"
+grep -q 'resuming accept' "$log"
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
