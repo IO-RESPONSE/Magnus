@@ -1712,6 +1712,25 @@ connection-pool and common-request-model decisions).
   function anywhere, so the default stays in effect. Not a bug; recorded
   here so a future audit does not re-open this thread from scratch.
 
+  **Reviewed, no gap found: the same question for HTTP/3.**
+  `magnus_quic_http_recv_header()` (`magnus_quic.c`) has the exact same
+  shape as `magnus_h2_on_header()` -- length check then `memcpy()`, no
+  control-character filter -- but nghttp3/QPACK is a different library
+  from nghttp2/HPACK and was not assumed to behave identically without
+  its own check. Same spike methodology, adapted for HTTP/3: a
+  standalone `nghttp3_conn_server_new()` server session, fed a real
+  QPACK-encoded HEADERS frame (built with `nghttp3_qpack_encoder_encode()`,
+  `hard_max_dtable_capacity=0` so it stays static-table/literal, no
+  encoder-stream dependency) carrying the same malicious `:path` value,
+  via `nghttp3_conn_read_stream()`. Result: `NGHTTP3_ERR_MALFORMED_HTTP_HEADER`,
+  frame rejected before `recv_header` ever fires -- same outcome as
+  HTTP/2, independently confirmed rather than inferred from it. Notably
+  stronger than nghttp2's case: `nghttp3.h` has no
+  `no_http_messaging`-equivalent option at all, so this validation is not
+  merely left at its default here, it is not something magnus (or any
+  caller) can disable even by accident. Not a bug; recorded here for the
+  same reason as the HTTP/2 finding above.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
