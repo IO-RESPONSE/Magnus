@@ -1867,6 +1867,47 @@ connection-pool and common-request-model decisions).
   reduce. Not a bug; recorded here for the same reason as the other
   findings above.
 
+  **Reviewed, no gap found: X-Forwarded-For / `Forwarded` spoofing to
+  bypass per-IP rate limiting.** `--rate-limit` buckets by client IP
+  (`magnus_rate_check()`), and `magnus_realip_resolve_headers()` lets a
+  configured, trusted proxy's own forwarding headers override which IP
+  that is -- exactly the kind of trust boundary that's easy to get wrong
+  (naively trusting the header at all from an unconfigured/untrusted
+  peer, or picking the wrong hop -- e.g. the client-injectable *leftmost*
+  entry of a multi-hop chain -- out of a spoofable comma list) and worth
+  checking rather than assuming correct from the code's own shape alone.
+  Reading `magnus_realip.c` first: real-IP resolution is gated on
+  `magnus_realip_is_trusted()` against the *actual* TCP peer, checked
+  before any header is even looked at (`magnus.c` line ~11088), and both
+  `magnus_realip_resolve_xff()`/`_resolve_forwarded()` walk their
+  comma-separated list right-to-left, skipping over entries that are
+  themselves trusted and stopping at the first untrusted one -- the
+  same "closest verified hop, first unverified entry beyond it" algorithm
+  nginx's own `realip` module uses, not the naive "trust whatever's
+  leftmost" mistake this class of bug usually is. Verified live rather
+  than trusting the reading alone: three spikes against a running
+  instance with `--rate-limit 1:2` (burst 2). (1) `--trusted-proxies
+  10.0.0.0/8` (excludes the test peer, 127.0.0.1): five requests, each
+  with a distinct spoofed `X-Forwarded-For`, from the same untrusted
+  peer -- 200, 200, 429, 429, 429, i.e. the burst-of-2 limit applied to
+  the one real peer address regardless of the spoofed header, confirming
+  an untrusted peer cannot use XFF to evade the limiter at all. (2)
+  `--trusted-proxies 127.0.0.1/32` (now trusts the test peer): four
+  requests with four distinct spoofed XFF values all returned 200 (each
+  treated as its own bucket, the correct behavior for a real deployment
+  behind a trusted load balancer), then three requests with the *same*
+  XFF value returned 200, 200, 429 -- that one apparent client correctly
+  hit its own burst-of-2. (3) the multi-hop case: `X-Forwarded-For:
+  6.6.6.6, 127.0.0.1` from the trusted peer three times returned 200,
+  200, 429 -- confirming the resolver correctly skipped the trusted
+  rightmost hop and bucketed on the leftmost (client-supplied but
+  now-verified-adjacent-to-a-trusted-hop) `6.6.6.6`, not merged with or
+  bypassing any other bucket. All three outcomes matched the algorithm
+  exactly as read, with no live surprises. Not a bug; recorded here for
+  the same reason as the other findings above -- and as a concrete
+  worked example for any future change to this trust-resolution code of
+  exactly what already-passing behavior it must not regress.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
@@ -1890,11 +1931,12 @@ connection-pool and common-request-model decisions).
   two-part priority are now done as of 2.1.0** (multi-process workers in
   2.0.0, memory-cap relaxation in 2.1.0 below). **Phase 6 resumed by
   explicit user request ("Phase 6 감사 재개해줘") after 2.1.0**, adding
-  the three "Reviewed, no gap found" entries directly above (TLS
-  renegotiation; HTTP/2 HPACK dynamic-table amplification; Slow Read)
-  across two continuation increments -- all three docs-only findings, no
-  code change, so no version bump. Phase 6 remains open-ended and
-  continues from here in future increments.
+  the four "Reviewed, no gap found" entries directly above (TLS
+  renegotiation; HTTP/2 HPACK dynamic-table amplification; Slow Read;
+  X-Forwarded-For rate-limit-bypass) across three continuation
+  increments -- all four docs-only findings, no code change, so no
+  version bump. Phase 6 remains open-ended and continues from here in
+  future increments.
 
 - **Multi-process worker model (2.0.0) — real multi-core scaling,
   nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
