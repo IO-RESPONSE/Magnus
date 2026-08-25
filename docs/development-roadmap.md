@@ -1908,6 +1908,60 @@ connection-pool and common-request-model decisions).
   worked example for any future change to this trust-resolution code of
   exactly what already-passing behavior it must not regress.
 
+  **Reviewed, no gap found: HTTP/2 `:authority` vs. ordinary `host`
+  header desync (cache-poisoning / routing-confusion via Host/`:authority`
+  mismatch).** A well-known HTTP/2 gateway bug class (RFC 9113 8.3.1
+  requires an intermediary to treat `:authority` and an ordinary `host`
+  header as authoritative together, but does not itself force every
+  implementation to enforce that) is: a client sends `:authority:
+  victim.com` (whatever the gateway routes/caches on) alongside an
+  ordinary `host: evil.com` header, hoping some downstream consumer
+  reads the *other* one -- classically, the gateway caches/routes on
+  `:authority` but a backend doing its own virtual hosting trusts the
+  forwarded ordinary `host` header instead, letting one request poison
+  a cache entry keyed for `victim.com` with a response actually meant
+  for `evil.com`. Also checked, as a prerequisite: whether a *duplicate*
+  `:authority` pseudo-header can even reach `magnus_h2_on_header()` --
+  `stream->parsed.host` is written unconditionally on every `:authority`
+  callback with no `host_seen`-style guard the way HTTP/1.1's parser has
+  for a duplicate ordinary Host (`magnus_http.c` line ~125), so if
+  nghttp2 delivered a HEADERS frame with two `:authority` entries at all,
+  the second would silently overwrite the first with no rejection.
+  Traced every consumer of a host value on the h2 path instead of
+  assuming either half of this is exploitable:
+  - `magnus_route_matches()` (`magnus_route.c` line 275) checks a
+    host-based route condition against exactly one field,
+    `request->host` -- populated *only* by the `:authority` callback in
+    `magnus_h2_on_header()`. An ordinary `host` header (if a client sends
+    one at all over h2) falls into `stream->parsed.headers[]` along with
+    every other ordinary header and is never read by route matching.
+  - `magnus_h2_proxy_start()`'s cache key (`stream->cache_host`, line
+    ~6260) is `strncpy`'d from that same `stream->parsed.host` --
+    identical source, so cache and routing can never disagree with each
+    other over which host a request was "for."
+  - Critically, **no proxy path forwards the client's Host/`:authority`
+    to the upstream at all.** Every outbound request magnus builds --
+    the HTTP/1.1 client path (`magnus_proxy_pick_and_start()`), its
+    WebSocket-upgrade branch, and the HTTP/2 client path
+    (`magnus_h2_proxy_start()`) -- hardcodes a literal `Host:
+    magnus-upstream\r\n` (`magnus.c` lines 2696, 2830, 2836, 6322, 6328);
+    the gRPC path (`magnus_grpc_stream_attach()`, line ~8623) builds its
+    own `:authority` from the *selected endpoint's own address*, and
+    explicitly strips any client-sent ordinary `host` header before
+    forwarding the rest (line 8644). So even a backend that itself does
+    Host-based virtual hosting can never receive an attacker-influenced
+    Host value through magnus, regardless of what the client sent on
+    either the pseudo- or ordinary-header side.
+  Conclusion: a duplicate/conflicting `:authority` and ordinary `host`
+  header is inert here by construction -- there is only ever one host
+  value read by anything downstream (`:authority`, exclusively, on the
+  h2 path), and it never leaves magnus toward an upstream anyway. No
+  live spike needed for this one (unlike the previous two entries): the
+  question is fully settled by exhaustively reading every site that
+  reads a host value, not by a runtime timing/behavior question a code
+  read alone can't answer. Not a bug; recorded here for the same reason
+  as the other findings above.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
@@ -1931,12 +1985,12 @@ connection-pool and common-request-model decisions).
   two-part priority are now done as of 2.1.0** (multi-process workers in
   2.0.0, memory-cap relaxation in 2.1.0 below). **Phase 6 resumed by
   explicit user request ("Phase 6 감사 재개해줘") after 2.1.0**, adding
-  the four "Reviewed, no gap found" entries directly above (TLS
+  the five "Reviewed, no gap found" entries directly above (TLS
   renegotiation; HTTP/2 HPACK dynamic-table amplification; Slow Read;
-  X-Forwarded-For rate-limit-bypass) across three continuation
-  increments -- all four docs-only findings, no code change, so no
-  version bump. Phase 6 remains open-ended and continues from here in
-  future increments.
+  X-Forwarded-For rate-limit-bypass; HTTP/2 `:authority`/Host desync)
+  across four continuation increments -- all five docs-only findings,
+  no code change, so no version bump. Phase 6 remains open-ended and
+  continues from here in future increments.
 
 - **Multi-process worker model (2.0.0) — real multi-core scaling,
   nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
