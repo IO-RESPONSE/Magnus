@@ -69,10 +69,14 @@ main(void)
     assert(config.udp_lb_policy == MAGNUS_LB_ROUND_ROBIN);
     assert(config.udp_session_idle_seconds == 30);
     assert(config.udp_max_sessions == 1024);
+    assert(config.cache_max_entries == 512);
+    assert(config.cache_max_bytes == 64u * 1024 * 1024);
+    assert(config.cache_max_entry_bytes == 8u * 1024 * 1024);
+    assert(config.max_body_bytes == 1 * 1024 * 1024);
 
     /* full config: comments, blank lines, all fields */
     {
-        char content[1024];
+        char content[1280];
         snprintf(content, sizeof(content),
             "# a comment\n"
             "\n"
@@ -106,6 +110,10 @@ main(void)
             "udp_lb_policy = least_conn\n"
             "udp_session_idle_seconds = 60\n"
             "udp_max_sessions = 256\n"
+            "cache_max_entries = 1024\n"
+            "cache_max_bytes = 134217728\n"
+            "cache_max_entry_bytes = 16777216\n"
+            "max_body_bytes = 2097152\n"
             "quic_listen = 9093\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, scratch_dir);
@@ -166,6 +174,10 @@ main(void)
     assert(config.udp_lb_policy == MAGNUS_LB_LEAST_CONN);
     assert(config.udp_session_idle_seconds == 60);
     assert(config.udp_max_sessions == 256);
+    assert(config.cache_max_entries == 1024);
+    assert(config.cache_max_bytes == 134217728);
+    assert(config.cache_max_entry_bytes == 16777216);
+    assert(config.max_body_bytes == 2097152);
 
     /* stream_listen/stream_upstream: each requires the other, the port
      * must differ from the main listener, a hostname is rejected (same
@@ -300,6 +312,40 @@ main(void)
     write_file(config_path,
         "port = 8080\nudp_listen = 9092\n"
         "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 4097\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+
+    /* Memory-cap relaxation (roadmap 2.1.0): cache_max_entries/
+     * cache_max_bytes/cache_max_entry_bytes/max_body_bytes each reject 0
+     * and anything past their own *_CEILING (magnus_cache.h's cache
+     * trio; MAGNUS_MAX_BODY_CEILING in magnus.c for the last one),
+     * mirroring udp_max_sessions's own two-sided range check above. */
+    write_file(config_path, "port = 8080\ncache_max_entries = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "cache_max_entries") != NULL);
+    write_file(config_path, "port = 8080\ncache_max_entries = 65537\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\ncache_max_bytes = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "cache_max_bytes") != NULL);
+    write_file(config_path, "port = 8080\ncache_max_bytes = 4294967297\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\ncache_max_entry_bytes = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "cache_max_entry_bytes") != NULL);
+    write_file(config_path, "port = 8080\ncache_max_entry_bytes = 536870913\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\nmax_body_bytes = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "max_body_bytes") != NULL);
+    write_file(config_path, "port = 8080\nmax_body_bytes = 1073741825\n");
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
 

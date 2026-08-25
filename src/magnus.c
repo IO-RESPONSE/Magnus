@@ -48,7 +48,47 @@
 #define MAGNUS_MAX_EVENTS 1024
 #define MAGNUS_MAX_FDS 65536
 #define MAGNUS_INPUT_LIMIT 8192
-#define MAGNUS_MAX_BODY (1 * 1024 * 1024)
+/* Operator-configurable (roadmap 2.1.0), the same role nginx's own
+ * `client_max_body_size` plays -- see magnus_config.h's own
+ * max_body_bytes. Unlike the cache budget above, this stays a *_DEFAULT
+ * plus a hard *_CEILING rather than following nginx all the way to an
+ * "0 = unlimited" option: every path this bounds (client request bodies,
+ * and every upstream response this codebase buffers in full before
+ * relaying -- h2/gRPC/FastCGI/SCGI/uwsgi, see each one's own comment
+ * near its magnus_max_body use) fully buffers via realloc-doubling in
+ * process memory before ever forwarding a byte onward, unlike nginx's
+ * own streaming/temp-file-backed default -- so "unlimited" here would
+ * mean any single connection can be walked up to unbounded process
+ * memory by itself, not scaled work that becomes prohibitively slow the
+ * way it would in a design that spills to disk past some point. A hard
+ * ceiling keeps that per-connection worst case bounded no matter how a
+ * config sets the default; see magnus_max_body's own definition below
+ * for the runtime-effective value magnus_apply_config() sets. */
+#define MAGNUS_MAX_BODY_DEFAULT (1 * 1024 * 1024)
+#define MAGNUS_MAX_BODY_CEILING (1024ull * 1024 * 1024)
+/* Roadmap 2.1.0: once magnus_max_body is raised past its own
+ * MAGNUS_MAX_BODY_DEFAULT (1 MiB), a flat MAGNUS_BODY_TIMEOUT_SECONDS
+ * (30s) for the *entire* body to arrive stops being "generous for any
+ * genuine client" (see that constant's own doc comment below) and starts
+ * rejecting real, merely-not-blazing-fast uploads outright, long before
+ * the RUDY attacker profile it exists to catch would even be
+ * distinguishable from a legitimate slow connection. magnus_begin_body()
+ * derives each request's actual deadline from its own declared
+ * Content-Length against this floor throughput, taking whichever of that
+ * or MAGNUS_BODY_TIMEOUT_SECONDS is larger -- so the *default* 1 MiB
+ * body's own deadline is completely unchanged (1 MiB at this floor
+ * clears in under 16s, well inside the flat 30s), while a config that
+ * raises magnus_max_body gets a proportionally longer, still-bounded
+ * window instead of an unreachable fixed one. */
+#define MAGNUS_BODY_MIN_THROUGHPUT_BYTES_PER_SEC (64 * 1024)
+/* Runtime-effective value every MAGNUS_MAX_BODY_DEFAULT/_CEILING comment
+ * above refers to -- magnus_apply_config() sets this from magnus.conf's
+ * own max_body_bytes (already validated against MAGNUS_MAX_BODY_CEILING
+ * by magnus_config.c) at both startup and every hot reload; defaults to
+ * MAGNUS_MAX_BODY_DEFAULT so a caller that never applies any config at
+ * all (every test binary that links this file's functions directly)
+ * still gets this codebase's pre-2.1.0 fixed 1 MiB behavior unchanged. */
+static size_t magnus_max_body = MAGNUS_MAX_BODY_DEFAULT;
 /* Bumped 2048 -> 9216 (roadmap 3a), then -> 17408 (roadmap 3b): with the
  * `upstream`, `grpc_upstream`, and `stream` clusters all at their own max
  * endpoint count plus every gRPC status code and every latency-histogram
@@ -94,9 +134,9 @@
  * half was built to address, left uncovered for the body-reading phase
  * it applies equally to. This is the "slow POST" / RUDY (R-U-Dead-Yet)
  * attack: hold many connections open indefinitely, each trickling an
- * up-to-MAGNUS_MAX_BODY body just under the idle-timeout window,
+ * up-to-magnus_max_body body just under the idle-timeout window,
  * exhausting connection capacity. 30 seconds for an entire body up to
- * MAGNUS_MAX_BODY (1 MiB) is generous for any genuine client (even an
+ * magnus_max_body (1 MiB) is generous for any genuine client (even an
  * unusually slow ~50 KB/s connection clears 1 MiB in ~20s) while still
  * bounding the attack window, the same MAGNUS_IDLE_SECONDS figure
  * already uses for the identical "how slow is still legitimate"
@@ -182,7 +222,7 @@
  * how far a client-supplied grpc-timeout may extend a stream's
  * connect/read budget past the default MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS/
  * MAGNUS_PROXY_READ_TIMEOUT_SECONDS -- every new resource this codebase
- * introduces gets one (see e.g. MAGNUS_MAX_BODY), and an unbounded
+ * introduces gets one (see e.g. magnus_max_body), and an unbounded
  * client-claimed deadline would otherwise let one request hold an
  * upstream connection (and this stream's memory) open indefinitely. Five
  * minutes is generous for a real streaming RPC while still being a world
@@ -489,7 +529,7 @@ typedef struct {
      * branch). `cache_capture`/_length/_capacity/_overflowed mirror the
      * gRPC pool's own io_buffer growth pattern (roadmap 2c-1/2c-2) to
      * accumulate the response body being relayed, bounded by
-     * MAGNUS_CACHE_MAX_ENTRY_BYTES, purely as a side observation -- the
+     * magnus_cache_entry_byte_limit(), purely as a side observation -- the
      * normal client-facing relay through proxy_buffer is entirely
      * unaffected by capture succeeding, failing, or never being
      * attempted at all. */
@@ -2408,7 +2448,8 @@ magnus_proxy_cache_capture(magnus_connection_t *connection, const char *data,
     if (!connection->cache_enabled || connection->cache_capture_overflowed
         || len == 0)
         return;
-    if (connection->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+    if (connection->cache_capture_length + len
+        > magnus_cache_entry_byte_limit()) {
         connection->cache_capture_overflowed = true;
         return;
     }
@@ -4699,7 +4740,7 @@ struct magnus_h2_stream {
     size_t proxy_request_length;
     size_t proxy_request_sent;
     /* Client's request body, accumulated from DATA frames (see
-     * magnus_h2_on_data_chunk_recv()) up to MAGNUS_MAX_BODY, same cap
+     * magnus_h2_on_data_chunk_recv()) up to magnus_max_body, same cap
      * the HTTP/1.1 path enforces -- then relayed to the upstream once
      * proxy_request has gone out. body_overflow means the client sent
      * more than that; the stream is answered 413 once END_STREAM
@@ -5575,7 +5616,7 @@ magnus_h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
 }
 
 /* Accumulates a proxy-bound stream's request body from DATA frames, up
- * to MAGNUS_MAX_BODY -- the same cap (and the same "buffer whole before
+ * to magnus_max_body -- the same cap (and the same "buffer whole before
  * dispatch" shape) the HTTP/1.1 path enforces via
  * magnus_begin_body()/magnus_continue_body(). A non-proxy stream (static
  * file, denied, or not yet routed) has no use for a body at all, so
@@ -5590,7 +5631,7 @@ magnus_h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
  * streaming RPC) takes a completely different path instead --
  * magnus_h2_grpc_relay_request_chunk() -- relaying each chunk to the
  * upstream as it arrives rather than accumulating a "whole request"
- * MAGNUS_MAX_BODY never actually has to hold at once for a long-lived
+ * magnus_max_body never actually has to hold at once for a long-lived
  * streaming call. */
 static int
 magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
@@ -5614,7 +5655,7 @@ magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
         return 0;
     }
 
-    if (stream->body_length + len > MAGNUS_MAX_BODY) {
+    if (stream->body_length + len > magnus_max_body) {
         stream->body_overflow = true;
         return 0;
     }
@@ -5625,7 +5666,7 @@ magnus_h2_on_data_chunk_recv(nghttp2_session *session, uint8_t flags,
         while (new_capacity < stream->body_length + len) new_capacity *= 2;
         grown = realloc(stream->body, new_capacity);
         if (grown == NULL) {
-            /* Allocation failure this far under MAGNUS_MAX_BODY (1 MiB)
+            /* Allocation failure this far under magnus_max_body (1 MiB)
              * would mean genuine system-wide memory pressure -- folded
              * into the same body_overflow/413 path as an oversized body
              * rather than a distinct code path, since either way this
@@ -6126,7 +6167,7 @@ magnus_h2_proxy_cache_capture(struct magnus_h2_stream *stream,
     if (!stream->cache_enabled || stream->cache_capture_overflowed
         || len == 0)
         return;
-    if (stream->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+    if (stream->cache_capture_length + len > magnus_cache_entry_byte_limit()) {
         stream->cache_capture_overflowed = true;
         return;
     }
@@ -7807,7 +7848,7 @@ magnus_h2_grpc_client_on_header(nghttp2_session *session,
  * session -- appends the upstream response body into the owning stream's
  * io_buffer (resolved via nghttp2_session_get_stream_user_data(), same as
  * on_header() above), growing it (realloc, doubling) as needed up to
- * MAGNUS_MAX_BODY, the same cap the client request-body side already
+ * magnus_max_body, the same cap the client request-body side already
  * enforces (magnus_h2_on_data_chunk_recv()). Unlike the h1-proxy path's
  * fixed MAGNUS_PROXY_BUFFER window, io_buffer genuinely grows here -- see
  * io_capacity's own comment on the struct. Streaming (2c-2): compacts
@@ -7837,7 +7878,7 @@ magnus_h2_grpc_client_on_data_chunk_recv(nghttp2_session *session,
         stream->io_length -= stream->io_sent;
         stream->io_sent = 0;
     }
-    if (stream->io_length + len > MAGNUS_MAX_BODY) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (stream->io_length + len > magnus_max_body) return NGHTTP2_ERR_CALLBACK_FAILURE;
     if (stream->io_length + len > stream->io_capacity) {
         size_t new_capacity = stream->io_capacity == 0
             ? MAGNUS_PROXY_BUFFER : stream->io_capacity * 2;
@@ -8252,7 +8293,7 @@ magnus_grpc_conn_push(magnus_grpc_conn_t *conn)
 /* Relays one chunk of the client's request body to the upstream as it
  * arrives -- magnus_h2_on_data_chunk_recv()'s gRPC-streaming branch
  * (2c-2). Compacts away whatever magnus_h2_grpc_read_request_body() has
- * already drained (body_sent) before appending, so MAGNUS_MAX_BODY bounds
+ * already drained (body_sent) before appending, so magnus_max_body bounds
  * how far behind the *upstream* has fallen, not the request's total size
  * -- the request-direction mirror of magnus_h2_grpc_client_on_data_chunk_recv()'s
  * own compaction on the response side. If the data provider was stalled
@@ -8271,7 +8312,7 @@ magnus_h2_grpc_relay_request_chunk(struct magnus_h2_stream *stream,
         stream->body_length -= stream->body_sent;
         stream->body_sent = 0;
     }
-    if (stream->body_length + len > MAGNUS_MAX_BODY) return -1;
+    if (stream->body_length + len > magnus_max_body) return -1;
     if (stream->body_length + len > stream->body_capacity) {
         size_t new_capacity = stream->body_capacity == 0
             ? MAGNUS_PROXY_BUFFER : stream->body_capacity * 2;
@@ -9244,7 +9285,7 @@ magnus_fastcgi_fail(int epoll_fd, magnus_connection_t *connection,
  * magnus_continue_body() already fully buffered into connection->body
  * ahead of dispatch (roadmap 5a-2 -- split across multiple records
  * only because a single record's own content field is 16 bits wide;
- * connection->body itself is already bounded by MAGNUS_MAX_BODY, the
+ * connection->body itself is already bounded by magnus_max_body, the
  * same cap every other body-relaying dispatch path in this codebase
  * already enforces, so this is never more than a handful of records
  * even at the cap), and the final empty STDIN record terminating the
@@ -9691,7 +9732,7 @@ magnus_fastcgi_append_in(magnus_connection_t *connection,
 
 /* Roadmap 5a-1: appends `data`/`len` (one STDOUT record's own content)
  * to connection->fastcgi_stdout -- growable, doubling, bounded by
- * MAGNUS_MAX_BODY, the same cap this codebase already applies to a
+ * magnus_max_body, the same cap this codebase already applies to a
  * buffered *request* body, reused here for a buffered *response* body
  * since both are "how much are we willing to hold entirely in memory"
  * questions with the identical answer. */
@@ -9699,7 +9740,7 @@ static bool
 magnus_fastcgi_append_stdout(magnus_connection_t *connection,
                              const unsigned char *data, size_t len)
 {
-    if (connection->fastcgi_stdout_length + len > MAGNUS_MAX_BODY) return false;
+    if (connection->fastcgi_stdout_length + len > magnus_max_body) return false;
     if (connection->fastcgi_stdout_length + len
         > connection->fastcgi_stdout_capacity) {
         size_t new_capacity = connection->fastcgi_stdout_capacity == 0
@@ -10316,7 +10357,7 @@ magnus_scgi_pick_and_start(int epoll_fd, magnus_connection_t *connection,
 }
 
 /* Roadmap 5b-1: appends `data`/`len` to connection->scgi_stdout --
- * growable, doubling, bounded by MAGNUS_MAX_BODY, mirrors magnus_
+ * growable, doubling, bounded by magnus_max_body, mirrors magnus_
  * fastcgi_append_stdout()'s own identical shape (response bytes here
  * need no separate not-yet-parsed staging buffer first, unlike
  * FastCGI's own record-framed stream, so this is fed directly from
@@ -10326,7 +10367,7 @@ magnus_scgi_append_stdout(magnus_connection_t *connection, const void *data,
                           size_t len)
 {
     char *grown;
-    if (connection->scgi_stdout_length + len > MAGNUS_MAX_BODY) return false;
+    if (connection->scgi_stdout_length + len > magnus_max_body) return false;
     if (connection->scgi_stdout_length + len
         > connection->scgi_stdout_capacity) {
         size_t new_capacity = connection->scgi_stdout_capacity == 0
@@ -10800,7 +10841,7 @@ magnus_uwsgi_append_stdout(magnus_connection_t *connection, const void *data,
                            size_t len)
 {
     char *grown;
-    if (connection->uwsgi_stdout_length + len > MAGNUS_MAX_BODY) return false;
+    if (connection->uwsgi_stdout_length + len > magnus_max_body) return false;
     if (connection->uwsgi_stdout_length + len
         > connection->uwsgi_stdout_capacity) {
         size_t new_capacity = connection->uwsgi_stdout_capacity == 0
@@ -11666,7 +11707,7 @@ magnus_begin_body(int epoll_fd, magnus_connection_t *connection,
     size_t take;
     size_t consumed;
 
-    if (parsed->content_length > MAGNUS_MAX_BODY) {
+    if (parsed->content_length > magnus_max_body) {
         magnus_request_t request = {0};
         magnus_trace_handler(&request, NULL);
         memcpy(request.method, parsed->method, sizeof(request.method));
@@ -11703,8 +11744,17 @@ magnus_begin_body(int epoll_fd, magnus_connection_t *connection,
     connection->input_length -= consumed;
 
     if (connection->body_length < connection->body_needed) {
+        /* See MAGNUS_BODY_MIN_THROUGHPUT_BYTES_PER_SEC's own doc comment:
+         * the deadline is whichever of the flat floor or this specific
+         * body's own size-proportional minimum is larger, so raising
+         * magnus_max_body past its 1 MiB default does not turn every
+         * larger upload into an unreachable deadline. */
+        time_t min_seconds = (time_t) (parsed->content_length
+            / MAGNUS_BODY_MIN_THROUGHPUT_BYTES_PER_SEC);
         connection->reading_body = true;
-        connection->body_deadline = time(NULL) + MAGNUS_BODY_TIMEOUT_SECONDS;
+        connection->body_deadline = time(NULL)
+            + (min_seconds > MAGNUS_BODY_TIMEOUT_SECONDS
+               ? min_seconds : MAGNUS_BODY_TIMEOUT_SECONDS);
         return 0;
     }
 
@@ -14241,6 +14291,18 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_udp_cluster = new_udp_cluster;
     magnus_udp_session_idle_seconds = config->udp_session_idle_seconds;
     magnus_udp_max_sessions = config->udp_max_sessions;
+    /* Memory-cap relaxation (roadmap 2.1.0): straight overwrites, the
+     * same as every scalar setting above with no in-flight per-
+     * connection state of its own to worry about going stale-by-
+     * position. A lowered cache budget is not enforced by evicting
+     * existing entries on the spot -- see magnus_cache_configure()'s own
+     * doc comment; a lowered magnus_max_body only affects requests/
+     * responses that start being buffered after this point, exactly the
+     * same "config changes apply going forward" precedent as every
+     * other reload-affected setting in this function. */
+    magnus_max_body = config->max_body_bytes;
+    magnus_cache_configure(config->cache_max_entries, config->cache_max_bytes,
+                           config->cache_max_entry_bytes);
     /* Same stale-by-position hazard once more (roadmap 2f): an in-flight
      * active-health probe for old position N belongs to whatever backend
      * used to be there, not necessarily the new cluster's position N.

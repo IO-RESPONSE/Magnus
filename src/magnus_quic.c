@@ -1176,7 +1176,7 @@ magnus_quic_proxy_find_header_end(char *buffer, size_t length)
 }
 
 /* Appends `data`/`len` to stream->cache_capture (growable, doubling,
- * bounded by MAGNUS_CACHE_MAX_ENTRY_BYTES) -- the h3 analogue of
+ * bounded by magnus_cache_entry_byte_limit()) -- the h3 analogue of
  * magnus_h2_proxy_cache_capture(), same shape exactly. A no-op once
  * cache_capture_overflowed is already true (or on this call's own
  * allocation failure, which sets it) -- capture is always a pure,
@@ -1190,7 +1190,7 @@ magnus_quic_proxy_cache_capture(magnus_quic_stream_t *stream,
     if (!stream->cache_enabled || stream->cache_capture_overflowed
         || len == 0)
         return;
-    if (stream->cache_capture_length + len > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+    if (stream->cache_capture_length + len > magnus_cache_entry_byte_limit()) {
         stream->cache_capture_overflowed = true;
         return;
     }

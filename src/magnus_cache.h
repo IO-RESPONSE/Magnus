@@ -29,13 +29,26 @@
  * revalidation (`If-None-Match`/`If-Modified-Since`) once a stored entry
  * expires but still carries an `ETag`/`Last-Modified` validator. */
 
-/* Fixed capacity/budget -- not currently configurable (matches this
- * codebase's existing precedent: the h1 upstream pool and gRPC connection
- * pool sizes are #define constants too, not config keys). Revisit only if
- * a real deployment needs a different budget than these defaults. */
-#define MAGNUS_CACHE_MAX_ENTRIES 512
-#define MAGNUS_CACHE_MAX_BYTES (64u * 1024 * 1024)
-#define MAGNUS_CACHE_MAX_ENTRY_BYTES (8u * 1024 * 1024)
+/* Operator-configurable budget (roadmap 2.1.0), the same role nginx's own
+ * `proxy_cache_path ... keys_zone=name:size max_size=size` plays: a real
+ * deployment's right-sized cache depends entirely on the host it runs on
+ * (a 2GB box and a 32GB box have nothing in common here), so a single
+ * compile-time constant can never be correct for both. magnus.conf's own
+ * cache_max_entries/cache_max_bytes/cache_max_entry_bytes (see
+ * magnus_config.h) set the runtime-effective values below these
+ * *_CEILING bounds via magnus_cache_configure(); the *_DEFAULT values are
+ * what applies when a config omits them, unchanged from this codebase's
+ * pre-2.1.0 hardcoded behavior. magnus_cache_slots[] itself is sized to
+ * MAGNUS_CACHE_MAX_ENTRIES_CEILING (the fixed array size actually
+ * allocated) -- the exact same "runtime value <= a fixed *_CEILING array
+ * size" pattern MAGNUS_UDP_MAX_SESSIONS_CEILING/magnus_udp_max_sessions
+ * (magnus.c) already established. */
+#define MAGNUS_CACHE_MAX_ENTRIES_CEILING 65536
+#define MAGNUS_CACHE_MAX_BYTES_CEILING (4096ull * 1024 * 1024)
+#define MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING (512ull * 1024 * 1024)
+#define MAGNUS_CACHE_MAX_ENTRIES_DEFAULT 512
+#define MAGNUS_CACHE_MAX_BYTES_DEFAULT (64u * 1024 * 1024)
+#define MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT (8u * 1024 * 1024)
 
 typedef struct magnus_cache_entry magnus_cache_entry_t;
 
@@ -65,6 +78,32 @@ void magnus_cache_compute_freshness(const char *cache_control,
                                     const char *expires, const char *vary,
                                     bool has_set_cookie, uint64_t now_ms,
                                     magnus_cache_freshness_t *out);
+
+/* Sets the runtime-effective entry count/byte budgets, each clamped to
+ * its own *_CEILING above (magnus_apply_config() in magnus.c is expected
+ * to have already validated against the same ceilings via magnus_config.c,
+ * but this module clamps defensively too, rather than trust every future
+ * caller to have gone through config validation first). Safe to call
+ * again on a config reload -- a lowered limit is never enforced by
+ * evicting existing entries on the spot; magnus_cache_store()'s own
+ * LRU-eviction-on-store path naturally brings usage back under the new,
+ * smaller budget the next time room is needed, exactly like every other
+ * reload-time shrink in this codebase (see e.g. magnus_pool_close_all()'s
+ * own comment on the analogous connection-pool case). Called once at
+ * startup with magnus.conf's own values (or this header's own *_DEFAULT
+ * trio if the config omitted them) before this module serves any
+ * request. */
+void magnus_cache_configure(size_t max_entries, size_t max_bytes,
+                            size_t max_entry_bytes);
+
+/* The runtime-effective single-entry byte budget magnus_cache_configure()
+ * last set (MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT if never called) --
+ * exported so magnus.c's/magnus_quic.c's own response-capture buffers
+ * (magnus_proxy_cache_capture() and its h3 analogue) can bail out of
+ * capturing a response early, before ever reaching magnus_cache_store()'s
+ * own identical check, using the same effective bound rather than a
+ * second, possibly-stale copy of it. */
+size_t magnus_cache_entry_byte_limit(void);
 
 /* This module's own monotonic "now", in milliseconds -- a local twin of
  * magnus.c's own magnus_now_ms() (same CLOCK_MONOTONIC source), needed
@@ -109,8 +148,9 @@ void magnus_cache_entry_data(const magnus_cache_entry_t *entry,
 /* Stores (or replaces, if one already exists for the same host+target) an
  * entry. No-op -- silently declining to cache, never an error the caller
  * needs to react to -- if `!freshness->cacheable`, if
- * `headers_block_length + body_length` exceeds
- * MAGNUS_CACHE_MAX_ENTRY_BYTES, or on allocation failure: caching is
+ * `headers_block_length + body_length` exceeds the runtime-effective
+ * per-entry budget (magnus_cache_configure()'s own max_entry_bytes), or
+ * on allocation failure: caching is
  * always a pure optimization this codebase can safely decline at any
  * point without affecting correctness. `etag`/`last_modified` may be NULL
  * or "" if that validator was absent from the response. */
@@ -133,8 +173,9 @@ void magnus_cache_revalidated(magnus_cache_entry_t *entry,
                               const magnus_cache_freshness_t *freshness);
 
 /* Proactively evicts every entry already past its freshness deadline --
- * cheap memory hygiene (a linear scan over at most MAGNUS_CACHE_MAX_ENTRIES
- * slots), called once per second alongside this codebase's other periodic
+ * cheap memory hygiene (a linear scan over at most
+ * MAGNUS_CACHE_MAX_ENTRIES_CEILING slots), called once per second
+ * alongside this codebase's other periodic
  * sweeps. Never required for correctness (magnus_cache_entry_is_fresh()
  * is checked on every lookup regardless) or even for bounding memory
  * (magnus_cache_store()'s own LRU eviction already does that) -- purely

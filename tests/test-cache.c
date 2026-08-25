@@ -165,23 +165,24 @@ main(void)
         char target[32];
         magnus_cache_compute_freshness("max-age=60", NULL, NULL, false,
                                        magnus_cache_now_ms(), &fr);
-        for (int i = 0; i < MAGNUS_CACHE_MAX_ENTRIES + 10; i++) {
+        for (int i = 0; i < MAGNUS_CACHE_MAX_ENTRIES_DEFAULT + 10; i++) {
             snprintf(target, sizeof(target), "/t%d", i);
             magnus_cache_store("h", target, 200, "HTTP/1.1 200 OK\r\n", 18,
                                "x", 1, NULL, NULL, &fr);
         }
-        assert(magnus_cache_entries_count() == MAGNUS_CACHE_MAX_ENTRIES);
+        assert(magnus_cache_entries_count() == MAGNUS_CACHE_MAX_ENTRIES_DEFAULT);
         assert(magnus_cache_lookup("h", "/t0") == NULL);
-        snprintf(target, sizeof(target), "/t%d", MAGNUS_CACHE_MAX_ENTRIES + 9);
+        snprintf(target, sizeof(target),
+                "/t%d", MAGNUS_CACHE_MAX_ENTRIES_DEFAULT + 9);
         assert(magnus_cache_lookup("h", target) != NULL);
         magnus_cache_purge_all();
     }
 
-    /* Per-entry size cap: an entry over MAGNUS_CACHE_MAX_ENTRY_BYTES is
-     * silently declined, not stored truncated. */
+    /* Per-entry size cap: an entry over MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT
+     * is silently declined, not stored truncated. */
     {
         magnus_cache_freshness_t fr;
-        static char oversized[MAGNUS_CACHE_MAX_ENTRY_BYTES + 1];
+        static char oversized[MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT + 1];
         magnus_cache_compute_freshness("max-age=60", NULL, NULL, false,
                                        magnus_cache_now_ms(), &fr);
         magnus_cache_store("h", "/big", 200, "HTTP/1.1 200 OK\r\n", 18,
@@ -203,6 +204,49 @@ main(void)
         assert(magnus_cache_lookup("h", "/novalidator") == NULL);
         assert(magnus_cache_lookup("h", "/withvalidator") != NULL);
         magnus_cache_purge_all();
+    }
+
+    /* magnus_cache_configure() (roadmap 2.1.0): a runtime entry-count
+     * budget lower than the *_DEFAULT trio above takes effect immediately,
+     * clamps a zero max_entries up to 1 rather than making the cache
+     * unusable, clamps an over-ceiling request down to the ceiling, and
+     * magnus_cache_entry_byte_limit() reflects whatever max_entry_bytes
+     * was last configured. Restored to the *_DEFAULT trio afterward so
+     * every earlier block above (and any block a future edit adds below)
+     * keeps running against this file's original, well-understood
+     * defaults. */
+    {
+        magnus_cache_freshness_t fr;
+        char target[32];
+        magnus_cache_compute_freshness("max-age=60", NULL, NULL, false,
+                                       magnus_cache_now_ms(), &fr);
+
+        magnus_cache_configure(3, MAGNUS_CACHE_MAX_BYTES_DEFAULT, 1024);
+        assert(magnus_cache_entry_byte_limit() == 1024);
+        for (int i = 0; i < 5; i++) {
+            snprintf(target, sizeof(target), "/c%d", i);
+            magnus_cache_store("h", target, 200, "HTTP/1.1 200 OK\r\n", 18,
+                               "x", 1, NULL, NULL, &fr);
+        }
+        assert(magnus_cache_entries_count() == 3);
+        magnus_cache_purge_all();
+
+        magnus_cache_configure(0, MAGNUS_CACHE_MAX_BYTES_DEFAULT,
+                               MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT);
+        magnus_cache_store("h", "/z", 200, "HTTP/1.1 200 OK\r\n", 18,
+                           "x", 1, NULL, NULL, &fr);
+        assert(magnus_cache_entries_count() == 1);
+        magnus_cache_purge_all();
+
+        magnus_cache_configure(MAGNUS_CACHE_MAX_ENTRIES_CEILING + 10,
+                               MAGNUS_CACHE_MAX_BYTES_CEILING + 10,
+                               MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING + 10);
+        assert(magnus_cache_entry_byte_limit()
+              == MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING);
+
+        magnus_cache_configure(MAGNUS_CACHE_MAX_ENTRIES_DEFAULT,
+                               MAGNUS_CACHE_MAX_BYTES_DEFAULT,
+                               MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT);
     }
 
     return 0;

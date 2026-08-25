@@ -158,6 +158,10 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     config->health_check_cooldown_seconds = 5;
     config->udp_session_idle_seconds = 30;
     config->udp_max_sessions = 1024;
+    config->cache_max_entries = 512;
+    config->cache_max_bytes = 64u * 1024 * 1024;
+    config->cache_max_entry_bytes = 8u * 1024 * 1024;
+    config->max_body_bytes = 1 * 1024 * 1024;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     file = fopen(path, "r");
@@ -670,6 +674,58 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             config->udp_max_sessions = (unsigned) sessions;
+        } else if (strcmp(key, "cache_max_entries") == 0) {
+            unsigned long entries;
+            /* 65536 duplicates MAGNUS_CACHE_MAX_ENTRIES_CEILING
+             * (magnus_cache.h) -- the fixed magnus_cache_slots[] array
+             * size actually allocated -- the same "no shared symbol
+             * between magnus.c/magnus_cache.h and magnus_config.c"
+             * precedent udp_max_sessions's own comment just above
+             * already follows. */
+            if (!magnus_config_parse_uint(value, 1, 65536, &entries)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'cache_max_entries' must be "
+                                        "1-65536, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->cache_max_entries = (size_t) entries;
+        } else if (strcmp(key, "cache_max_bytes") == 0) {
+            unsigned long bytes;
+            /* 4294967296 (4 GiB) duplicates
+             * MAGNUS_CACHE_MAX_BYTES_CEILING -- same precedent. */
+            if (!magnus_config_parse_uint(value, 1, 4294967296ul, &bytes)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'cache_max_bytes' must be "
+                                        "1-4294967296, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->cache_max_bytes = (size_t) bytes;
+        } else if (strcmp(key, "cache_max_entry_bytes") == 0) {
+            unsigned long bytes;
+            /* 536870912 (512 MiB) duplicates
+             * MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING -- same precedent. */
+            if (!magnus_config_parse_uint(value, 1, 536870912ul, &bytes)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'cache_max_entry_bytes' must be "
+                                        "1-536870912, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->cache_max_entry_bytes = (size_t) bytes;
+        } else if (strcmp(key, "max_body_bytes") == 0) {
+            unsigned long bytes;
+            /* 1073741824 (1 GiB) duplicates MAGNUS_MAX_BODY_CEILING
+             * (magnus.c) -- same precedent. */
+            if (!magnus_config_parse_uint(value, 1, 1073741824ul, &bytes)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'max_body_bytes' must be "
+                                        "1-1073741824, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->max_body_bytes = (size_t) bytes;
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,

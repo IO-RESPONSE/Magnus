@@ -30,7 +30,7 @@ struct magnus_cache_entry {
 
 #define MAGNUS_CACHE_HASH_BUCKETS 1024
 
-static magnus_cache_entry_t magnus_cache_slots[MAGNUS_CACHE_MAX_ENTRIES];
+static magnus_cache_entry_t magnus_cache_slots[MAGNUS_CACHE_MAX_ENTRIES_CEILING];
 static magnus_cache_entry_t *magnus_cache_buckets[MAGNUS_CACHE_HASH_BUCKETS];
 /* lru_head = most recently used, lru_tail = least (next to evict). */
 static magnus_cache_entry_t *magnus_cache_lru_head;
@@ -40,6 +40,34 @@ static size_t magnus_cache_used_bytes;
 static uint64_t magnus_cache_hits;
 static uint64_t magnus_cache_misses;
 static uint64_t magnus_cache_revalidations;
+/* Runtime-effective budget -- see magnus_cache_configure()'s own doc
+ * comment in magnus_cache.h. Default to the *_DEFAULT trio so a caller
+ * that never calls magnus_cache_configure() at all (every test binary
+ * that links this module directly, for one) still gets this codebase's
+ * pre-2.1.0 fixed behavior unchanged. */
+static size_t magnus_cache_max_entries = MAGNUS_CACHE_MAX_ENTRIES_DEFAULT;
+static size_t magnus_cache_max_bytes = MAGNUS_CACHE_MAX_BYTES_DEFAULT;
+static size_t magnus_cache_max_entry_bytes = MAGNUS_CACHE_MAX_ENTRY_BYTES_DEFAULT;
+
+void
+magnus_cache_configure(size_t max_entries, size_t max_bytes,
+                       size_t max_entry_bytes)
+{
+    magnus_cache_max_entries = max_entries == 0 ? 1
+        : (max_entries > MAGNUS_CACHE_MAX_ENTRIES_CEILING
+           ? MAGNUS_CACHE_MAX_ENTRIES_CEILING : max_entries);
+    magnus_cache_max_bytes = max_bytes > MAGNUS_CACHE_MAX_BYTES_CEILING
+        ? MAGNUS_CACHE_MAX_BYTES_CEILING : max_bytes;
+    magnus_cache_max_entry_bytes =
+        max_entry_bytes > MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING
+        ? MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING : max_entry_bytes;
+}
+
+size_t
+magnus_cache_entry_byte_limit(void)
+{
+    return magnus_cache_max_entry_bytes;
+}
 
 uint64_t
 magnus_cache_now_ms(void)
@@ -171,7 +199,13 @@ magnus_cache_evict_lru(void)
 static magnus_cache_entry_t *
 magnus_cache_claim_slot(void)
 {
-    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES; i++) {
+    /* Scans the full physical array (its *_CEILING size), not just the
+     * runtime-configured magnus_cache_max_entries -- correct regardless,
+     * since magnus_cache_store()'s own eviction loop below already keeps
+     * magnus_cache_used_entries under the configured budget before ever
+     * reaching this call, so a free slot within that budget always
+     * exists somewhere in the full array by the time this runs. */
+    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES_CEILING; i++) {
         if (!magnus_cache_slots[i].in_use) return &magnus_cache_slots[i];
     }
     return NULL;
@@ -294,7 +328,7 @@ magnus_cache_store(const char *host, const char *target, unsigned status,
         headers_block_length, &headers_copy_length);
     if (headers_copy == NULL) return;
     total_bytes = headers_copy_length + body_length;
-    if (total_bytes > MAGNUS_CACHE_MAX_ENTRY_BYTES) {
+    if (total_bytes > magnus_cache_max_entry_bytes) {
         free(headers_copy);
         return;
     }
@@ -312,8 +346,8 @@ magnus_cache_store(const char *host, const char *target, unsigned status,
         entry->body = NULL;
         magnus_cache_lru_unlink(entry);
     } else {
-        while (magnus_cache_used_entries >= MAGNUS_CACHE_MAX_ENTRIES
-               || magnus_cache_used_bytes + total_bytes > MAGNUS_CACHE_MAX_BYTES) {
+        while (magnus_cache_used_entries >= magnus_cache_max_entries
+               || magnus_cache_used_bytes + total_bytes > magnus_cache_max_bytes) {
             if (!magnus_cache_evict_lru()) break;
         }
         entry = magnus_cache_claim_slot();
@@ -372,7 +406,7 @@ magnus_cache_revalidated(magnus_cache_entry_t *entry,
 void
 magnus_cache_expire_sweep(uint64_t now_ms)
 {
-    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES; i++) {
+    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES_CEILING; i++) {
         magnus_cache_entry_t *entry = &magnus_cache_slots[i];
         if (entry->in_use && now_ms >= entry->expires_at_ms
             && !magnus_cache_entry_has_validator(entry)) {
@@ -392,7 +426,7 @@ magnus_cache_expire_sweep(uint64_t now_ms)
 void
 magnus_cache_purge_all(void)
 {
-    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES; i++) {
+    for (size_t i = 0; i < MAGNUS_CACHE_MAX_ENTRIES_CEILING; i++) {
         if (magnus_cache_slots[i].in_use) magnus_cache_release(&magnus_cache_slots[i]);
     }
 }

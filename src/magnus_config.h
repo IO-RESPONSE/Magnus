@@ -259,6 +259,21 @@ typedef struct {
      * see magnus_quic.h. */
     bool has_quic_listen;
     unsigned quic_listen_port;
+    /* Operator-configurable memory budget (roadmap 2.1.0) -- the same
+     * role nginx's own `proxy_cache_path ... keys_zone=name:size
+     * max_size=size` and `client_max_body_size` directives play,
+     * replacing this codebase's own pre-2.1.0 fixed compile-time
+     * caps (MAGNUS_CACHE_MAX_ENTRIES/_BYTES/_ENTRY_BYTES in
+     * magnus_cache.h, magnus_max_body in magnus.c). Right-sizing these
+     * for a given deployment depends entirely on the host it runs on --
+     * a single compile-time constant can never be correct for both a
+     * 2GB box and a 32GB one. Each is validated against a hard ceiling
+     * (see magnus_config_load()'s own doc comment below) that this
+     * struct's fields alone cannot exceed even on a config typo. */
+    size_t cache_max_entries;
+    size_t cache_max_bytes;
+    size_t cache_max_entry_bytes;
+    size_t max_body_bytes;
 } magnus_config_t;
 
 typedef enum {
@@ -289,7 +304,12 @@ typedef enum {
  *     address, udp_lb_policy is the same enum as lb_policy,
  *     udp_session_idle_seconds is 1-3600, udp_max_sessions is
  *     1-MAGNUS_UDP_MAX_SESSIONS_CEILING (magnus.c), udp_listen requires
- *     at least one udp_upstream and vice versa)
+ *     at least one udp_upstream and vice versa; cache_max_entries is
+ *     1-MAGNUS_CACHE_MAX_ENTRIES_CEILING (magnus_cache.h, 65536),
+ *     cache_max_bytes is 1-MAGNUS_CACHE_MAX_BYTES_CEILING (4 GiB),
+ *     cache_max_entry_bytes is 1-MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING
+ *     (512 MiB), max_body_bytes is 1-MAGNUS_MAX_BODY_CEILING (magnus.c,
+ *     1 GiB))
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
  *     lb_policy defaults to "round_robin" when omitted; health_check_path
@@ -304,7 +324,12 @@ typedef enum {
  *     stream connection uses the plain stream_upstream cluster); udp_listen
  *     is optional (the UDP listener does not exist at all when omitted);
  *     udp_lb_policy defaults to "round_robin"; udp_session_idle_seconds
- *     defaults to 30; udp_max_sessions defaults to 1024
+ *     defaults to 30; udp_max_sessions defaults to 1024;
+ *     cache_max_entries defaults to 512, cache_max_bytes to 64 MiB,
+ *     cache_max_entry_bytes to 8 MiB (magnus_cache.h's own pre-2.1.0
+ *     fixed values, unchanged when omitted); max_body_bytes defaults to
+ *     1 MiB (magnus.c's own pre-2.1.0 fixed value, unchanged when
+ *     omitted)
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

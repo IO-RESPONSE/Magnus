@@ -1,5 +1,60 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+
+- **Memory-cap relaxation: the reverse-proxy response cache's budget and
+  the request/response body size cap are now `magnus.conf` directives
+  instead of hardcoded compile-time constants -- a MINOR version bump
+  because it is a feature (new config surface), not an engine change.**
+  Before this release, `MAGNUS_CACHE_MAX_ENTRIES` (512)/
+  `MAGNUS_CACHE_MAX_BYTES` (64 MiB)/`MAGNUS_CACHE_MAX_ENTRY_BYTES`
+  (8 MiB) and `MAGNUS_MAX_BODY` (1 MiB) were fixed at build time and
+  ignored the host's actual RAM entirely -- raising a container's own
+  `mem_limit` did nothing on its own, since Magnus never read it. Fixed
+  nginx/Apache-style (the same `proxy_cache_path ... max_size=`/
+  `client_max_body_size` precedent, not auto-detection of host RAM --
+  neither web server does that either): four new directives,
+  `cache_max_entries`/`cache_max_bytes`/`cache_max_entry_bytes`/
+  `max_body_bytes`, each validated against its own hard ceiling
+  (`MAGNUS_CACHE_MAX_ENTRIES_CEILING` 65536, `MAGNUS_CACHE_MAX_BYTES_
+  CEILING` 4 GiB, `MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING` 512 MiB,
+  `MAGNUS_MAX_BODY_CEILING` 1 GiB) and defaulting, when omitted, to this
+  codebase's own pre-2.1.0 hardcoded values (512/64 MiB/8 MiB/1 MiB) so
+  an existing `magnus.conf` with none of these set is unaffected.
+  `magnus_max_body` stays a hard cap rather than nginx's own `0 =
+  unlimited` option -- unlike nginx, Magnus fully buffers a request/
+  response body in process memory (a `realloc()`-doubling growable
+  buffer) before ever forwarding a byte, so an unlimited cap would let a
+  single connection be walked to unbounded process memory; nginx avoids
+  this by streaming/spilling to a temp file instead. The cache module's
+  own `magnus_cache_slots[]` array stays sized to
+  `MAGNUS_CACHE_MAX_ENTRIES_CEILING` (the fixed allocation), with
+  `cache_max_entries` only ever bounding how much of it is actually
+  used -- the same "runtime value <= a fixed `*_CEILING` array size"
+  pattern `MAGNUS_UDP_MAX_SESSIONS_CEILING`/`udp_max_sessions` already
+  established. A lowered budget on config reload is never enforced by
+  evicting existing entries on the spot; the cache's own LRU-eviction-
+  on-store path naturally brings usage back under a smaller budget the
+  next time room is needed, same as `udp_max_sessions`'s own reload
+  behavior.
+  Raising `max_body_bytes` well past its 1 MiB default surfaced a real
+  interaction with the existing RUDY (slow-POST) mitigation:
+  `MAGNUS_BODY_TIMEOUT_SECONDS`'s 30s deadline is absolute (set once
+  when body-reading starts, never reset per read, unlike nginx's own
+  per-read `client_body_timeout`) and was only ever sized against a
+  1 MiB body -- left unchanged, a legitimate upload at a realistic
+  (non-extremely-fast) upload rate would have become impossible to
+  complete once `max_body_bytes` was configured larger, indistinguishable
+  from an intentional RUDY attack. Fixed with a size-proportional
+  minimum, `MAGNUS_BODY_MIN_THROUGHPUT_BYTES_PER_SEC` (64 KiB/s): the
+  deadline is now `max(MAGNUS_BODY_TIMEOUT_SECONDS, content_length /
+  64 KiB/s)`, chosen so the default 1 MiB body's own deadline is
+  unchanged (1 MiB / 64 KiB/s ~= 16.4s, still under the 30s floor) while
+  a larger configured body gets a proportionally longer, still-bounded
+  window instead of an unreachable fixed one.
+
 ## 2.0.0
 
 ### Added

@@ -1772,7 +1772,10 @@ connection-pool and common-request-model decisions).
   the user: a 16-core/32GB host ran Magnus no faster than a 1-core/2GB
   one) was judged the larger gap. Phase 6's cross-cutting audit resumes
   once that work — and the fixed-memory-cap relaxation work queued
-  behind it (see below) — lands.
+  behind it (see below) — lands. **Both parts of the user's own stated
+  two-part priority are now done as of 2.1.0** (multi-process workers in
+  2.0.0, memory-cap relaxation in 2.1.0 below); Phase 6 has not yet been
+  explicitly resumed with the user.
 
 - **Multi-process worker model (2.0.0) — real multi-core scaling,
   nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
@@ -1812,6 +1815,56 @@ connection-pool and common-request-model decisions).
   now that a 16-core/32GB-class host can actually be saturated —
   queued behind this worker-model landing, per the user's own stated
   two-part priority.
+
+- **Memory-cap relaxation (2.1.0) — cache budget and body-size cap
+  exposed as `magnus.conf` directives, nginx/Apache-style.** The second
+  half of the user's own two-part priority above, picked up once
+  2.0.0 landed. Before implementing, the user asked two clarifying
+  questions worth recording since they shaped the design: (1) whether
+  caps are even necessary at all if a container is simply given more
+  RAM — no, a container/host memory limit is a ceiling, not a target;
+  software still has to be written to actually consume up to it, and
+  Magnus's caps were hardcoded compile-time constants that never read
+  the host's own limit in the first place; (2) how nginx/Apache handle
+  this themselves — both use explicit operator-set config directives
+  with conservative defaults (`proxy_cache_path ... max_size=`,
+  `client_max_body_size`), neither auto-detects host RAM, and the
+  "uses all available RAM" effect people associate with serving static
+  files comes from the OS kernel page cache via `sendfile`, not the web
+  server's own userspace cache. The user's explicit decision: proceed
+  with the nginx/Apache-style config-exposure route, not auto-detection.
+  Four new directives — `cache_max_entries`/`cache_max_bytes`/
+  `cache_max_entry_bytes`/`max_body_bytes` — replace what were
+  `MAGNUS_CACHE_MAX_ENTRIES`/`MAGNUS_CACHE_MAX_BYTES`/
+  `MAGNUS_CACHE_MAX_ENTRY_BYTES`/`MAGNUS_MAX_BODY`, each still bounded
+  by a hard `*_CEILING` (the same "runtime value <= a fixed array-
+  dimensioning ceiling" pattern `udp_max_sessions` already established)
+  and defaulting, when a config omits them, to this codebase's own
+  pre-2.1.0 hardcoded values — an existing deployment's `magnus.conf`
+  is unaffected until it opts in. `max_body_bytes` deliberately keeps a
+  hard ceiling (1 GiB) rather than nginx's own `0 = unlimited`: unlike
+  nginx, Magnus fully buffers a request/response body in process memory
+  before forwarding a byte, so an unlimited cap would be a straight
+  memory-exhaustion primitive. Raising the body cap surfaced a real
+  RUDY-mitigation interaction — `MAGNUS_BODY_TIMEOUT_SECONDS`'s 30s
+  deadline was an absolute, size-agnostic value only ever justified
+  against the old fixed 1 MiB body — fixed with a size-proportional
+  minimum keyed off `MAGNUS_BODY_MIN_THROUGHPUT_BYTES_PER_SEC`
+  (64 KiB/s) so a legitimate large upload is no longer indistinguishable
+  from an attack once the cap is raised, while the unchanged 1 MiB
+  default keeps its exact pre-2.1.0 30s deadline. See `CHANGELOG.md`
+  2.1.0 for the full detail. `make test` x2 clean and `make sanitize`
+  (ASan/UBSan) both clean after this change — no Docker image rebuild
+  done for this increment (no Dockerfile-baked `magnus.conf` change was
+  needed; the shipped image's defaults are unaffected).
+
+  **Deferred to a later increment, not started:** relaxing the
+  remaining fixed-scale caps this work's own initial scoping pass
+  identified but excluded — FD-table-scale limits (`MAGNUS_MAX_FDS`,
+  `MAGNUS_QUIC_MAX_CONNECTIONS`, `MAGNUS_UDP_MAX_SESSIONS_CEILING`) and
+  per-endpoint connection-pool sizes (`MAGNUS_POOL_MAX_IDLE_PER_
+  ENDPOINT`, `MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT`) — not yet
+  confirmed as in-scope with the user.
 
 ## 4. Module structure
 
