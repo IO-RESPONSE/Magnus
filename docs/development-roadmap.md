@@ -1753,6 +1753,81 @@ connection-pool and common-request-model decisions).
   behavioral unknown) since the library's own header documents the exact
   mechanism unambiguously and no code path in magnus.c touches it.
 
+  **Reviewed, no gap found: TLS renegotiation as a DoS vector.**
+  `SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)` (magnus.c) permits
+  TLS 1.2, which supports renegotiation, and magnus never calls
+  `SSL_CTX_set_options()` with `SSL_OP_NO_RENEGOTIATION` anywhere in its
+  own TLS setup -- not obviously safe without checking, since the classic
+  attack (repeated client-initiated renegotiation handshakes to burn CPU,
+  or as a smuggling vector) depends entirely on what the linked TLS
+  library does by default, not on anything magnus's own code decides.
+  Verified directly against the running binary rather than assumed:
+  `openssl s_client -connect 127.0.0.1:<port> -state -msg`, with a piped
+  interactive `R` (renegotiate) command once the handshake completed.
+  (Note: the same test using `-quiet` does *not* work -- the piped `R\n`
+  is sent through as literal request body instead of being interpreted as
+  the renegotiate command, producing an ordinary `400 Bad Request` on the
+  next pipelined request; `-state -msg` must be used instead to see the
+  real renegotiation attempt.) With `-state -msg`, the client's own debug
+  log shows `RENEGOTIATING` -> a new `ClientHello` is sent -> magnus's
+  side (via this build's OpenSSL 3.5.5) responds `TLS 1.2, Alert [length
+  0002], warning no_renegotiation`, which the client's own OpenSSL
+  escalates to a fatal handshake failure and tears down the connection.
+  This is OpenSSL 3.x's own default server-side behavior (rejecting
+  client-initiated renegotiation unless explicitly re-enabled via
+  `SSL_OP_ALLOW_CLIENT_RENEGOTIATION`, which magnus never sets), the same
+  "mandatory library-level protection inherited automatically" shape as
+  the PING/SETTINGS-flood finding above. No lingering connection/socket
+  state observed after the rejected attempt. Not a bug; recorded here for
+  the same reason as the other findings above.
+
+  **Reviewed, no gap found: HTTP/2 HPACK dynamic-table-reference
+  amplification (a "HPACK bomb" -- adjacent to, but distinct from,
+  CVE-2019-9516 "0-Length Headers Leak", which the PING/SETTINGS finding
+  above does not cover).** HPACK's dynamic table (RFC 7541) persists
+  across HEADERS frames on one connection, so an attacker can seed a
+  small set of short header entries in one frame, then send follow-up
+  frames consisting almost entirely of 1-byte indexed references to
+  those entries -- a small compressed frame decompressing to a much
+  larger header-field count. Two things made this worth checking rather
+  than assuming safe by analogy to the already-reviewed cases above:
+  `MAGNUS_HTTP_MAX_HEADERS` (32, `magnus_http.h`) bounds *stored* headers
+  per request but doesn't by itself say what decoding a much larger
+  count *costs* before truncation kicks in; and this is a genuinely
+  distinct CVE from the ones already covered. Verified with a live spike
+  against the running binary (not a standalone library harness this
+  time, since the question is magnus's own runtime cost/behavior, not
+  HPACK decode correctness): a hand-crafted client (Python `hpack`/
+  `hyperframe`, bypassing the well-behaved `h2` protocol layer entirely)
+  seeds 60 short dynamic-table entries in one frame, then sends
+  follow-up HEADERS frames built almost entirely from indexed references
+  to them -- 272 repeats of the 60-entry set fits one frame under
+  nghttp2's default 16384-byte `SETTINGS_MAX_FRAME_SIZE` (magnus never
+  raises this), yielding 16,320 decompressed header fields from a
+  ~16,333-byte wire frame. Findings: (1) `magnus_h2_on_header()` performs
+  no per-header heap allocation (headers land in a fixed-size array,
+  `MAGNUS_HTTP_MAX_HEADERS` slots, extras silently dropped), so the
+  classic CVE-2019-9516 "leak memory per header field" shape is
+  structurally impossible here regardless of decompressed count; (2) the
+  connection is reliably torn down by nghttp2's own internal
+  `NGHTTP2_ERR_FLOODED` protection (`magnus_h2_service()`,
+  `nghttp2_session_mem_recv2()` returning negative -> connection closed)
+  before any concerning cost accrues -- confirmed across multiple runs
+  against separately-started live instances, terminating within roughly
+  26-186 bomb frames depending on client-side read pacing, i.e. well
+  under the ~300 frames attempted in either case; (3) even the
+  worst-observed case before cutoff (186 frames, ~3,000,000 total
+  decompressed header fields, ~3 MB wire) cost only ~160ms of CPU
+  (`/proc/<pid>/stat` utime+stime delta, ~53ns/header field -- linear,
+  not amplified) with zero `VmRSS` growth, and the process itself never
+  crashed or hung. This is the same "mandatory, inherited library-level
+  protection" shape as the PING/SETTINGS-flood finding above -- the exact
+  trigger condition for nghttp2's own flood heuristic was not reverse-
+  engineered further (undocumented internal accounting, not this
+  codebase's own logic), since the empirical outcome across every run
+  was consistent: connection torn down, cost bounded, no leak. Not a
+  bug; recorded here for the same reason as the other findings above.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
@@ -1774,8 +1849,12 @@ connection-pool and common-request-model decisions).
   once that work — and the fixed-memory-cap relaxation work queued
   behind it (see below) — lands. **Both parts of the user's own stated
   two-part priority are now done as of 2.1.0** (multi-process workers in
-  2.0.0, memory-cap relaxation in 2.1.0 below); Phase 6 has not yet been
-  explicitly resumed with the user.
+  2.0.0, memory-cap relaxation in 2.1.0 below). **Phase 6 resumed by
+  explicit user request ("Phase 6 감사 재개해줘") after 2.1.0**, adding
+  the two "Reviewed, no gap found" entries directly above (TLS
+  renegotiation; HTTP/2 HPACK dynamic-table amplification) -- both
+  docs-only findings, no code change, so no version bump. Phase 6
+  remains open-ended and continues from here in future increments.
 
 - **Multi-process worker model (2.0.0) — real multi-core scaling,
   nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
