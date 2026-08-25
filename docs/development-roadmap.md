@@ -1828,6 +1828,45 @@ connection-pool and common-request-model decisions).
   was consistent: connection torn down, cost bounded, no leak. Not a
   bug; recorded here for the same reason as the other findings above.
 
+  **Reviewed, no gap found: Slow Read (the write-side mirror of the
+  slow-POST/RUDY gap fixed in 6a-3).** `MAGNUS_IDLE_SECONDS` (30) is reset
+  by `last_active = time(NULL)` on *any* successful write, however small
+  -- there is no write-side counterpart of `MAGNUS_BODY_MIN_THROUGHPUT_
+  BYTES_PER_SEC`, so on paper a client acking a single TCP byte just
+  under every 30s could hold a response open indefinitely at near-zero
+  throughput. Worth checking rather than assuming safe by analogy to
+  6a-3 -- it looks like the same shape (a response-phase deadline with no
+  minimum-throughput floor) as a gap already fixed once in this exact
+  codebase. Verified with a live spike against the running binary: a
+  20MB static file served over plain HTTP/1.1, read back 1 byte at a
+  time with a 4s sleep between reads (~0.25 B/s, chosen to cross
+  `MAGNUS_IDLE_SECONDS` three times over within the test window) --
+  connection survived the full 95s run with no server-side kill, plus
+  `/proc/<pid>/stat` (utime+stime) and `VmRSS` sampled every 5s the whole
+  time: RSS flat at 4048 KB throughout (no per-connection buffer growth
+  at all), 3 CPU ticks (~30ms) total. The reason it costs nothing despite
+  having no throughput floor: `sendfile()` streams straight from the
+  page cache with zero userspace buffering on the plain-HTTP static-file
+  path (the `tls == NULL` branch of the write-relay loop, magnus.c), the
+  TLS static-file path uses one fixed 4096-byte `file_buffer` per
+  connection regardless of how slowly it drains, and the proxy/relay
+  paths (checked via `magnus_ws_update_interest()`'s own comment, the
+  clearest statement of the pattern) only re-arm reading from upstream
+  once the client-side write buffer has actually drained -- proper
+  backpressure, not "buffer everything upstream sends while the client
+  dawdles." So the actual worst case a Slow Read attacker achieves here
+  is occupying one of `MAGNUS_MAX_FDS` (65536) connection slots for a
+  long time at negligible per-connection cost -- the same generic
+  "many held-open connections" surface essentially every TCP server
+  bears by default (including nginx's own `send_timeout`, which resets
+  on any successful write the same way), not a magnus-specific
+  amplification gap the way 6a-3's missing `body_deadline` coverage
+  actually was. Deliberately not "fixed" by adding a symmetric
+  min-throughput floor to the write side purely for cosmetic symmetry
+  with 6a-3, since there is no measured cost here for such a floor to
+  reduce. Not a bug; recorded here for the same reason as the other
+  findings above.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
@@ -1851,10 +1890,11 @@ connection-pool and common-request-model decisions).
   two-part priority are now done as of 2.1.0** (multi-process workers in
   2.0.0, memory-cap relaxation in 2.1.0 below). **Phase 6 resumed by
   explicit user request ("Phase 6 감사 재개해줘") after 2.1.0**, adding
-  the two "Reviewed, no gap found" entries directly above (TLS
-  renegotiation; HTTP/2 HPACK dynamic-table amplification) -- both
-  docs-only findings, no code change, so no version bump. Phase 6
-  remains open-ended and continues from here in future increments.
+  the three "Reviewed, no gap found" entries directly above (TLS
+  renegotiation; HTTP/2 HPACK dynamic-table amplification; Slow Read)
+  across two continuation increments -- all three docs-only findings, no
+  code change, so no version bump. Phase 6 remains open-ended and
+  continues from here in future increments.
 
 - **Multi-process worker model (2.0.0) — real multi-core scaling,
   nginx-style.** Not a Phase 1–6 item; the roadmap above assumed a
