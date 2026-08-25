@@ -77,6 +77,31 @@
 #define MAGNUS_METRICS_BUFFER 16384
 #define MAGNUS_IDLE_SECONDS 30
 #define MAGNUS_HEADER_TIMEOUT_SECONDS 10
+/* Roadmap 6a-3 (Phase 6 cross-cutting audit): a real gap this pass
+ * found and fixed -- magnus_expire_idle()'s own slowloris guard
+ * (header_deadline) explicitly stops applying the instant a request's
+ * headers finish parsing (request_started_ms != 0 from that point on,
+ * by design: legitimate keep-alive idling between *later* requests on
+ * the same connection must not be penalized). That instant is also
+ * exactly when a Content-Length-bearing request body, if any, starts
+ * being read -- meaning a client that sends complete, valid headers
+ * quickly and then trickles the body in one byte at a time was
+ * previously bounded by *nothing* but MAGNUS_IDLE_SECONDS' own
+ * last_active check, which magnus_expire_idle()'s own existing comment
+ * already explicitly says cannot catch a trickling client ("a trickle
+ * of bytes keeps resetting last_active... without ever finishing a
+ * request") -- the exact same reasoning that guard's own header-phase
+ * half was built to address, left uncovered for the body-reading phase
+ * it applies equally to. This is the "slow POST" / RUDY (R-U-Dead-Yet)
+ * attack: hold many connections open indefinitely, each trickling an
+ * up-to-MAGNUS_MAX_BODY body just under the idle-timeout window,
+ * exhausting connection capacity. 30 seconds for an entire body up to
+ * MAGNUS_MAX_BODY (1 MiB) is generous for any genuine client (even an
+ * unusually slow ~50 KB/s connection clears 1 MiB in ~20s) while still
+ * bounding the attack window, the same MAGNUS_IDLE_SECONDS figure
+ * already uses for the identical "how slow is still legitimate"
+ * judgment call. */
+#define MAGNUS_BODY_TIMEOUT_SECONDS 30
 #define MAGNUS_PROXY_BUFFER 16384
 #define MAGNUS_INITIAL_INPUT 2048
 #define MAGNUS_PROXY_CONNECT_TIMEOUT_SECONDS 5
@@ -855,6 +880,15 @@ typedef struct {
     size_t body_length;
     size_t body_needed;
     bool reading_body;
+    /* Roadmap 6a-3: absolute deadline (from the moment body-reading
+     * starts) for finishing the body, checked in magnus_expire_idle()
+     * -- see MAGNUS_BODY_TIMEOUT_SECONDS's own doc comment for the
+     * real slow-POST/RUDY DoS gap this closes (header_deadline's own
+     * slowloris guard stops applying the instant headers finish, which
+     * is exactly when body-reading begins). Only meaningful while
+     * reading_body is true, the same scoping pending_parsed below
+     * already has. */
+    time_t body_deadline;
     /* The already-parsed request a body-bearing connection is waiting on
      * more bytes for; only meaningful while reading_body is true. */
     magnus_http_request_t pending_parsed;
@@ -11649,6 +11683,7 @@ magnus_begin_body(int epoll_fd, magnus_connection_t *connection,
 
     if (connection->body_length < connection->body_needed) {
         connection->reading_body = true;
+        connection->body_deadline = time(NULL) + MAGNUS_BODY_TIMEOUT_SECONDS;
         return 0;
     }
 
@@ -12382,6 +12417,15 @@ magnus_expire_idle(int epoll_fd, time_t now)
          * what MAGNUS_IDLE_SECONDS above is for. */
         if (connection->request_started_ms == 0
             && now > connection->header_deadline) {
+            magnus_close_connection(epoll_fd, connection);
+            continue;
+        }
+        /* Roadmap 6a-3: the identical slow-client guard as the header-
+         * phase one just above, for the body-reading phase the header
+         * one explicitly stops covering the instant headers finish (see
+         * MAGNUS_BODY_TIMEOUT_SECONDS's own doc comment for the real
+         * slow-POST/RUDY gap this closes). */
+        if (connection->reading_body && now > connection->body_deadline) {
             magnus_close_connection(epoll_fd, connection);
         }
     }

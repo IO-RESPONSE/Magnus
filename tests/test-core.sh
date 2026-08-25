@@ -539,6 +539,55 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 
+# Roadmap 6a-3: the same slowloris principle as M6 below, but for the
+# body-reading phase instead of the header phase -- a "slow POST"/RUDY
+# attack. header_deadline's own guard explicitly stops applying the
+# instant headers finish (request_started_ms != 0 from then on), which
+# is exactly when body-reading starts, so a client that sends complete
+# headers quickly and then trickles the body one byte at a time,
+# staying under MAGNUS_IDLE_SECONDS between each byte, was previously
+# bounded by nothing at all. A real bug this codebase found and fixed
+# during Phase 6's own cross-cutting audit -- see CHANGELOG.md 1.62.0.
+port_slowbody=$((port + 135))
+"$binary" --port "$port_slowbody" --root "$web_root" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_slowbody/healthz" >/dev/null \
+    && break
+  sleep 1
+done
+slowbody_start=$(date +%s)
+python3 -c "
+import socket, time
+
+s = socket.create_connection(('127.0.0.1', $port_slowbody), timeout=45)
+s.sendall(b'POST /hello.txt HTTP/1.1\r\nHost: a\r\nContent-Length: 20\r\n'
+          b'Connection: keep-alive\r\n\r\n')
+sent = 0
+closed_at = None
+start = time.time()
+try:
+    for _ in range(6):
+        time.sleep(8)
+        s.sendall(b'x')
+        sent += 1
+except (BrokenPipeError, ConnectionResetError, OSError):
+    closed_at = time.time() - start
+print('sent=%d closed_at=%s' % (sent, closed_at))
+"  > "$web_root/slowbody-response.txt" 2>&1 || true
+cat "$web_root/slowbody-response.txt"
+slowbody_elapsed=$(( $(date +%s) - slowbody_start ))
+# Must have been cut off well before all 6 trickled bytes (48s of
+# steady, sub-idle-timeout trickling) went out -- MAGNUS_BODY_TIMEOUT_
+# SECONDS (30s, fixed from when body-reading started) is what ends it,
+# not idle expiry (which this trickle pattern is deliberately designed
+# to never trip) and not simply the test's own 48s loop finishing.
+grep -q '^sent=[0-5] ' "$web_root/slowbody-response.txt"
+test "$slowbody_elapsed" -lt 48
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
 # M6: slowloris -- a client that trickles request bytes one at a time,
 # never idling long enough to trip MAGNUS_IDLE_SECONDS, must still be cut
 # off by the header-phase deadline instead of holding the connection (and

@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.62.0
+
+### Fixed
+
+- **Slow-POST / RUDY denial-of-service gap (roadmap 6a-3) -- a real,
+  exploitable bug found and fixed during Phase 6's own cross-cutting
+  audit.** `magnus_expire_idle()`'s own slowloris guard
+  (`header_deadline`) is deliberately gated on `request_started_ms ==
+  0` -- it explicitly stops applying the instant a request's headers
+  finish parsing, since legitimate keep-alive idling between *later*
+  requests on the same connection must not be penalized. That exact
+  instant, though, is also when a `Content-Length`-bearing request
+  body (if any) starts being read -- meaning a client that sent
+  complete, valid headers quickly and then trickled the body in one
+  byte at a time, staying just under `MAGNUS_IDLE_SECONDS` (30s)
+  between each byte, was previously bounded by **nothing at all**:
+  `magnus_expire_idle()`'s own existing comment on the header-phase
+  guard already explicitly says a trickle "keeps resetting
+  `last_active`... without ever finishing a request, so [the idle
+  timer] alone cannot catch this" -- the exact same reasoning applies
+  identically to the body-reading phase, which was simply never given
+  an equivalent guard. This is the "slow POST"/RUDY (R-U-Dead-Yet)
+  attack: hold many connections open indefinitely, each trickling an
+  up-to-`MAGNUS_MAX_BODY` (1 MiB) body just under the idle-timeout
+  window, exhausting connection capacity.
+
+  Fixed with a new `body_deadline` field (mirroring `header_deadline`'s
+  own shape exactly) set the instant body-reading starts, and checked
+  in `magnus_expire_idle()` gated on `connection->reading_body` instead
+  of `request_started_ms == 0`. `MAGNUS_BODY_TIMEOUT_SECONDS` (30s, for
+  the *entire* body transfer, not reset by activity) is generous for
+  any genuine client -- even an unusually slow ~50 KB/s connection
+  clears 1 MiB in ~20s -- while still bounding the attack window to the
+  same order of magnitude `MAGNUS_IDLE_SECONDS` already judges
+  acceptable for the identical "how slow is still legitimate" call.
+
+  Verified by literally reproducing the attack against the real fixed
+  binary: complete headers sent immediately, then one body byte every
+  8 seconds (comfortably under the 30s idle window each time) -- the
+  connection was cut off at the ~30-32s mark regardless, never
+  surviving the trickle pattern that would previously have let it live
+  indefinitely. Confirmed unambiguously server-side (not just via a
+  client-side socket exception, which through Docker's own userland
+  port-forwarding proxy can be a misleading signal on its own -- a
+  `sendall()` succeeding there only proves the proxy's own local buffer
+  accepted the write, not that the container-side connection was still
+  alive) by polling `magnus_connections_active` live during the attack
+  inside a real container: 2 (the attack connection + the polling
+  request itself) at t=8/16/24s, dropping to 1 at t=32s and staying
+  there -- an exact, live-observed match to the 30-second deadline.
+  New `tests/test-core.sh` regression block (mirroring the existing M6
+  slowloris test's own shape) makes this permanent: the connection must
+  be cut off well before all 6 trickled bytes (48s of steady, sub-
+  idle-timeout trickling) go out. A legitimate, reasonably-paced POST
+  (well within 30s) still completes and dispatches correctly --
+  confirmed no regression to normal body handling. `make test` twice
+  clean, direct ASan/UBSan testing with zero findings, and confirmed
+  inside the real read-only/non-root Docker image
+  (`ioresponse/magnus:1.62.0`).
+
 ## 1.61.0
 
 ### Added

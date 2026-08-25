@@ -1640,6 +1640,36 @@ connection-pool and common-request-model decisions).
   comparison attempted; upstream-dispatch-path concurrency already
   covered separately in `tests/test-core.sh`).
 
+  **6a-3 (slow-POST/RUDY denial-of-service fix) shipped in 1.62.0** --
+  a real, exploitable gap this audit pass found: `magnus_expire_idle()`'s
+  own slowloris guard (`header_deadline`) is gated on `request_started_
+  ms == 0`, so it explicitly stops applying the instant headers finish
+  -- exactly when a `Content-Length`-bearing body starts being read, an
+  identical trickle-to-evade-idle-timeout window the header-phase guard
+  was built to close, left uncovered for the body-reading phase. Fixed
+  with a new `body_deadline` (30s for the whole body transfer, mirroring
+  `header_deadline`'s own shape), checked in `magnus_expire_idle()`
+  gated on `reading_body` instead. Verified by literally reproducing
+  the attack against the fixed binary (trickled bytes staying under the
+  idle window, connection still cut off at ~30s) and, unambiguously,
+  server-side via live `magnus_connections_active` polling inside a
+  real container (a client-side socket-exception signal alone proved
+  misleading through Docker's own userland port-forwarding proxy) --
+  see `CHANGELOG.md` 1.62.0 for the full writeup, including why the
+  client-side observation needed a server-side cross-check at all.
+
+  This session's own affinity-cookie-decoded-index path (a client-
+  controlled value feeding a cluster endpoint array lookup) was also
+  reviewed as a plausible-looking lead during this same pass and found
+  to already be correctly bounds-checked at its one real call site
+  (`magnus_cluster_select_sticky()`) -- confirmed safe, not a bug, but
+  recorded here so a future audit does not need to re-derive that from
+  scratch. Request smuggling (duplicate/malformed `Content-Length`,
+  any `Transfer-Encoding` at all) and static-file path traversal
+  (component-by-component `openat()` with `O_NOFOLLOW` at every level,
+  never string-concatenation-then-validate) were also reviewed and
+  found already soundly defended.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
