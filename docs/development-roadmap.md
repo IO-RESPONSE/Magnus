@@ -1731,6 +1731,28 @@ connection-pool and common-request-model decisions).
   caller) can disable even by accident. Not a bug; recorded here for the
   same reason as the HTTP/2 finding above.
 
+  **Reviewed, no gap found: HTTP/2 PING/SETTINGS/empty-frame flood
+  (the 2019 "HTTP/2 DoS" CVE set, CVE-2019-9511/9512/9513/9518, distinct
+  from 2023's Rapid Reset already confirmed defended above).** magnus.c
+  has no PING- or SETTINGS-frame-specific rate limiting of its own --
+  only HEADERS (new-stream) and RST_STREAM (roadmap 1e-3) are counted.
+  Not a gap: `nghttp2.h` (this build's pinned 1.68.0, confirmed via
+  `nghttp2ver.h` on the same host the Docker image builds on) documents
+  `NGHTTP2_ERR_FLOODED` as unconditional, built-in library behavior --
+  "flooding is measured by how many PING and SETTINGS frames with ACK
+  flag set are queued for transmission... peer can cause memory
+  exhaustion on server side to send these frames forever and does not
+  read network" -- exactly the 2019 CVE class, mitigated inside nghttp2
+  itself since 1.39.2 (mid-2019, long before this build's 1.68.0) with
+  no `nghttp2_option_set_*` toggle anywhere in the header to disable it
+  (checked the full option list). Same shape as the HTTP/2 and HTTP/3
+  CRLF findings above: a mandatory library-level protection this
+  codebase inherits automatically rather than something it implements
+  or could accidentally opt out of. Not re-verified with a live spike
+  here (unlike the CRLF findings, which needed one to settle a genuine
+  behavioral unknown) since the library's own header documents the exact
+  mechanism unambiguously and no code path in magnus.c touches it.
+
   Still ahead for Phase 6: the rest of the cross-cutting audit (the
   original master prompt's own Section 8.1 attack-list text is not
   preserved in this repo, only referenced by section number from
