@@ -31,10 +31,19 @@ extern int magnus_root_fd;
 
 /* Resolves `target` (a request path, e.g. "/index.html", query string
  * and all -- see the .c definition for the exact traversal-safety
- * rules) against magnus_root_fd and returns an open, read-only fd for
- * it plus its metadata, or -1 if it doesn't resolve to a regular file
- * magnus_root_fd can safely serve. Caller owns the returned fd. */
-int magnus_open_static(const char *target, struct stat *metadata);
+ * rules) against `root_override` if non-NULL, or magnus_root_fd
+ * otherwise, and returns an open, read-only fd for it plus its
+ * metadata, or -1 if it doesn't resolve to a regular file the chosen
+ * root can safely serve. `root_override` (roadmap 1b: a matched
+ * action=static route's own `root=<path>` -- src/magnus_route.h) is a
+ * plain directory path, opened fresh (O_DIRECTORY) on every call rather
+ * than cached the way magnus_root_fd is, since it is not known until a
+ * route actually matches and this codebase has no per-route fd table to
+ * keep one warm in; NULL means "no route-level override applies, use
+ * the process's own global document root" exactly as before this
+ * parameter existed. Caller owns the returned fd. */
+int magnus_open_static(const char *target, struct stat *metadata,
+                       const char *root_override);
 
 /* MIME type for `path`, by extension; a safe generic default when the
  * extension is unrecognized or absent. Never fails. */

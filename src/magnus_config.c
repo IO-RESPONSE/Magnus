@@ -917,6 +917,25 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
+            /* `root=` (roadmap 1b): magnus_route_parse() itself stays
+             * filesystem-free (tests/fuzz-route.c fuzzes it directly), so
+             * the directory-existence check every other root-like key
+             * (root/fastcgi_root/scgi_root/uwsgi_root, all just above)
+             * already gets happens here instead, same stat()+S_ISDIR
+             * check, same error style. */
+            if (config->routes[config->route_count].root_set) {
+                struct stat metadata;
+                const char *route_root
+                    = config->routes[config->route_count].root;
+                if (stat(route_root, &metadata) != 0
+                    || !S_ISDIR(metadata.st_mode)) {
+                    magnus_config_set_error(error, error_capacity, line_number,
+                                            "'route': 'root' is not a "
+                                            "directory: '%s'", route_root);
+                    fclose(file);
+                    return MAGNUS_CONFIG_ERROR;
+                }
+            }
             config->route_count++;
         } else if (strcmp(key, "trusted_proxies") == 0) {
             char spec[512];

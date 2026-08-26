@@ -4625,7 +4625,8 @@ magnus_compress_static(int fd, const struct stat *metadata,
 }
 
 int
-magnus_open_static(const char *target, struct stat *metadata)
+magnus_open_static(const char *target, struct stat *metadata,
+                   const char *root_override)
 {
     char path[256];
     char *part;
@@ -4634,14 +4635,27 @@ magnus_open_static(const char *target, struct stat *metadata)
     size_t length = strcspn(target, "?");
     int directory;
     int fd = -1;
-    if (magnus_root_fd < 0 || length < 2 || length >= sizeof(path)
+    if ((root_override == NULL && magnus_root_fd < 0)
+        || length < 2 || length >= sizeof(path)
         || memchr(target, '%', length) != NULL
         || strstr(target, "//") != NULL || strstr(target, "/../") != NULL
         || (length >= 3 && memcmp(target + length - 3, "/..", 3) == 0))
         return -1;
     memcpy(path, target + 1, length - 1);
     path[length - 1] = '\0';
-    directory = dup(magnus_root_fd);
+    /* Roadmap 1b: a matched action=static route's own `root=` overrides
+     * the process's global document root for just this request -- opened
+     * fresh here (there is no per-route fd to dup() the way
+     * magnus_root_fd itself is below) rather than cached, since which
+     * route (if any) applies is not known until routing already ran, one
+     * request at a time; magnus_config.c already validated this path is
+     * a real, stat()-able directory at config-load time, so a failure
+     * here means it stopped being one (removed/permissions changed)
+     * since then, not a config bug -- treated the same as any other
+     * open() failure below, a clean -1/404. */
+    directory = root_override != NULL
+        ? open(root_override, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        : dup(magnus_root_fd);
     if (directory < 0) return -1;
     part = strtok_r(path, "/", &state);
     while (part != NULL) {
@@ -5603,10 +5617,14 @@ magnus_h2_dispatch_static_streaming(magnus_connection_t *connection,
  * helpers) -- reused rather than reimplemented so both protocols agree
  * on path resolution/traversal safety by construction. Called from
  * magnus_h2_dispatch() below once routing has decided this request is
- * not a proxy match and its method is GET/HEAD. */
+ * not a proxy match and its method is GET/HEAD; `root_override` is
+ * whatever that same caller's route-matching loop captured (roadmap
+ * 1b -- NULL if no matched route set its own `root=`), passed straight
+ * through to magnus_open_static(). */
 static void
 magnus_h2_dispatch_static(magnus_connection_t *connection,
-                          struct magnus_h2_stream *stream)
+                          struct magnus_h2_stream *stream,
+                          const char *root_override)
 {
     nghttp2_session *session = connection->h2_session;
     struct stat metadata;
@@ -5620,7 +5638,7 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     magnus_encoding_t encoding;
     bool use_gzip;
 
-    fd = magnus_open_static(stream->parsed.target, &metadata);
+    fd = magnus_open_static(stream->parsed.target, &metadata, root_override);
     if (fd < 0) {
         magnus_h2_submit_status(session, stream->stream_id, "404");
         return;
@@ -5720,6 +5738,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
     bool is_metrics_path;
     bool head_only;
     const char *forward_path;
+    const char *static_route_root = NULL;
 
     if (stream->method_overflow) {
         stream->dispatched = true;
@@ -5769,6 +5788,14 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
             route_denied = true;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
             is_grpc_route = true;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_STATIC
+                  && magnus_routes[r].root_set) {
+            /* Roadmap 1b: not a dispatch decision (action=static falls
+             * through to the same static branch below a non-matching
+             * request gets) -- just captures a document-root override for
+             * that branch, exactly like the HTTP/1.1 path's own identical
+             * capture in magnus_dispatch_request(). */
+            static_route_root = magnus_routes[r].root;
         }
         break;
     }
@@ -5854,7 +5881,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         magnus_h2_proxy_start(connection, stream, forward_path, cache_route_enabled);
         return;
     }
-    magnus_h2_dispatch_static(connection, stream);
+    magnus_h2_dispatch_static(connection, stream, static_route_root);
 }
 
 /* Rolls `connection`'s Rapid-Reset-hardening window over to the current
@@ -11499,6 +11526,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     const char *fastcgi_forward_path = NULL;
     const char *scgi_forward_path = NULL;
     const char *uwsgi_forward_path = NULL;
+    const char *static_route_root = NULL;
 
     memcpy(request.method, parsed->method, sizeof(request.method));
     memcpy(request.path, parsed->target, sizeof(request.path));
@@ -11533,10 +11561,14 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
      * The admin channel is exempt outright, same as it already is from
      * the literal "/proxy" prefix above -- its own routing is that
      * socket's filesystem permissions, not this. An action=static match
-     * needs no special handling here: matching and being neither deny nor
-     * proxy already falls through to the same static-file dispatch a
-     * request with no matching route at all gets, which is the point --
-     * it lets a route's *conditions* gate access to it. */
+     * needs no dispatch branch of its own here: matching and being
+     * neither deny nor proxy/grpc/fastcgi/scgi/uwsgi already falls
+     * through to the same static-file dispatch a request with no
+     * matching route at all gets, which is the point -- it lets a
+     * route's *conditions* gate access to it. Its own `root=` (roadmap
+     * 1b), if set, is still captured here -- not a dispatch decision, but
+     * a document-root override the static branch below needs to know
+     * about regardless of which dispatch path gets there. */
     if (!connection->admin_only) {
         for (size_t r = 0; r < magnus_route_count; r++) {
             if (!magnus_route_matches(&magnus_routes[r], parsed,
@@ -11559,6 +11591,9 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
             } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_UWSGI) {
                 is_uwsgi_route = true;
                 uwsgi_forward_path = request.path;
+            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_STATIC
+                      && magnus_routes[r].root_set) {
+                static_route_root = magnus_routes[r].root;
             }
             break;
         }
@@ -11760,7 +11795,8 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 head_only, close_connection, &request);
     } else {
         struct stat metadata;
-        int file_fd = magnus_open_static(request.path, &metadata);
+        int file_fd = magnus_open_static(request.path, &metadata,
+                                         static_route_root);
         if (file_fd >= 0)
             magnus_prepare_file_response(connection, file_fd, &metadata,
                                          head_only, close_connection, &request,

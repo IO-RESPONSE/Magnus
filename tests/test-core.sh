@@ -1043,6 +1043,19 @@ http.server.HTTPServer(('127.0.0.1', $upstream_route), Handler).serve_forever()
 " >/dev/null 2>&1 &
 backend_pid=$!
 sleep 1
+# action=static root override (roadmap 1b): a route matched under a
+# path_prefix serves out of its own root=<dir> instead of the process's
+# global --root/`root=` document root -- a *different* file at the same
+# request path than the global root's own copy, so a passing test can
+# only mean the override is actually taking effect, not just that some
+# static file (any file) got served. Like action=proxy, a route's
+# path_prefix condition only *gates* the match -- it never strips the
+# matched prefix from the path actually resolved (only the literal
+# hardcoded "/proxy" shortcut does that), so /alt/hello.txt resolves
+# against <root>/alt/hello.txt, not <root>/hello.txt.
+route_static_root="$web_root/route-static-root"
+mkdir -p "$route_static_root/alt"
+printf '%s' 'alt root hello' > "$route_static_root/alt/hello.txt"
 route_config="$web_root/route.conf"
 cat > "$route_config" <<EOF
 port = $port_route
@@ -1051,6 +1064,7 @@ upstream = 127.0.0.1:$upstream_route:1
 route = host=api.internal; path_prefix=/v1; action=proxy
 route = header:X-Blocked=1; action=deny
 route = source_cidr=127.0.0.0/8; path_prefix=/blocked-by-cidr; action=deny
+route = path_prefix=/alt; action=static; root=$route_static_root
 EOF
 "$binary" --config "$route_config" 2>>"$log" &
 server_pid=$!
@@ -1089,6 +1103,23 @@ test "$(curl --fail --silent "http://127.0.0.1:$port_route/hello.txt")" \
 # any of the above: still strips the "/proxy" prefix before forwarding.
 test "$(curl --fail --silent "http://127.0.0.1:$port_route/proxy/x")" \
   = 'backend saw path=/x'
+
+# action=static root= override: /alt/hello.txt resolves against the
+# route's own root, not the global one -- same filename, different
+# content proves it actually switched document roots rather than just
+# happening to find *a* file.
+test "$(curl --fail --silent "http://127.0.0.1:$port_route/alt/hello.txt")" \
+  = 'alt root hello'
+# The global root's own copy is reachable as always, unaffected by the
+# route-level override existing at all.
+test "$(curl --fail --silent "http://127.0.0.1:$port_route/hello.txt")" \
+  = 'magnus static file'
+# A file that only exists under the global root (big.bin, created near
+# the top of this script), not the alt one, 404s under the /alt prefix --
+# the override is a real substitution, not an additional search path
+# layered on top of the global root.
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_route/alt/big.bin")" = 404
 
 kill -TERM "$server_pid"
 wait "$server_pid"

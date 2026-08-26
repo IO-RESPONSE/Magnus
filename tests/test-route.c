@@ -197,5 +197,44 @@ main(void)
     assert(!magnus_route_parse("path_prefix=/; action=grpc; cache=on",
                                &route, error, sizeof(error)));
 
+    /* root=<path> (roadmap 1b): only valid alongside action=static, same
+     * "requires" pairing cache=on already established for action=proxy.
+     * magnus_route_parse() itself never touches the filesystem (that
+     * validation lives in magnus_config.c -- see tests/test-config.c),
+     * so any non-empty value that fits the field parses here regardless
+     * of whether it names a real directory. */
+    assert(magnus_route_parse("path_prefix=/; action=static; root=/srv/alt",
+                              &route, error, sizeof(error)));
+    assert(route.root_set);
+    assert(strcmp(route.root, "/srv/alt") == 0);
+    /* order-independent: root= before action= too. */
+    assert(magnus_route_parse("root=/srv/alt; path_prefix=/; action=static",
+                              &route, error, sizeof(error)));
+    assert(route.root_set);
+    assert(strcmp(route.root, "/srv/alt") == 0);
+    /* a route that never mentions root= leaves it unset/empty. */
+    assert(magnus_route_parse("path_prefix=/; action=static", &route, error,
+                              sizeof(error)));
+    assert(!route.root_set);
+    assert(route.root[0] == '\0');
+    assert(!magnus_route_parse("path_prefix=/; action=proxy; root=/srv/alt",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=deny; root=/srv/alt",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=grpc; root=/srv/alt",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse("path_prefix=/; action=static; root=",
+                               &route, error, sizeof(error)));
+    assert(!magnus_route_parse(
+        "path_prefix=/; action=static; root=/a; root=/b", &route, error,
+        sizeof(error)));
+    /* cache= and root= are independent modifiers -- combining a cache=on
+     * (requires action=proxy) with a root= (requires action=static) on
+     * the same route is rejected on whichever check runs first, not
+     * silently accepted because each modifier individually "looks" set. */
+    assert(!magnus_route_parse(
+        "path_prefix=/; action=static; root=/srv/alt; cache=on", &route,
+        error, sizeof(error)));
+
     return 0;
 }

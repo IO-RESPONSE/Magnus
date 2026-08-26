@@ -1,5 +1,62 @@
 # Changelog
 
+## 2.5.0
+
+### Added
+
+- **`action=static` per-route document-root override (roadmap 1b).** Until
+  this release, a `route = ...` entry could gate an ordinary static
+  request with match conditions (`path_prefix`, `host`, etc.) but every
+  static request -- routed or not -- was always resolved against the one
+  global document root (`--root`/`root=`). This was an explicitly
+  documented gap left open by 1b's own 1.3.0 entry below ("no per-route
+  root override yet").
+
+  Fixed by adding a new `root=<path>` route modifier, valid only
+  alongside `action=static` (rejected with `action=proxy`/`deny`/`grpc`,
+  mirroring the existing `cache=on`-requires-`action=proxy` pairing
+  established in 2d-1) and order-independent with `action=` the same
+  way. `magnus_route_parse()` itself stays entirely filesystem-free by
+  design (it is fuzzed directly against arbitrary strings via
+  `tests/fuzz-route.c`, which never touches a real directory), so the
+  override path's directory-existence check lives in `magnus_config.c`
+  instead, at config-load time, using the exact same
+  `stat()`/`S_ISDIR()` validation already applied to `root`/
+  `fastcgi_root`/`scgi_root`/`uwsgi_root`. A matched route's `root=` (if
+  set) is threaded through all three protocol dispatch paths -- HTTP/1.1
+  (inline in the h1 request handler), HTTP/2
+  (`magnus_h2_dispatch_static()`), and HTTP/3/QUIC
+  (`magnus_quic_http_dispatch_static()`) -- as a new `root_override`
+  parameter on the shared `magnus_open_static()`, which opens that
+  directory fresh per call instead of the cached global `magnus_root_fd`
+  when an override is present.
+
+  Important semantic note, caught by an initial wrong test assumption
+  during development: a route's `path_prefix` (like every other match
+  condition) only *gates* whether the route applies -- it never strips
+  anything from the path actually resolved against the root, overridden
+  or not. This is exactly the same behavior already documented for
+  `action=proxy` ("forwards the *full* path ... nothing gets stripped,
+  unlike [the literal `/proxy`] dispatch path"): a route
+  `path_prefix=/alt; action=static; root=/srv/alt` matching a request to
+  `/alt/hello.txt` resolves `/srv/alt/alt/hello.txt`, not
+  `/srv/alt/hello.txt`.
+
+  Verified with new unit coverage in `tests/test-route.c` (DSL parsing:
+  valid/duplicate/empty/too-long `root=`, order-independence with
+  `action=`, rejection under every non-`static` action, rejection when
+  combined with `cache=on` on the same route) and `tests/test-config.c`
+  (config-load-time directory validation: accepts a real directory,
+  rejects a non-existent one with a `'route':` error, leaves `root_set`
+  false when the key is absent), plus a new live-binary integration
+  block in `tests/test-core.sh`'s existing "Advanced routing (1b)"
+  section serving from a second, override document root over real HTTP
+  and confirming both the override root and the global root remain
+  independently reachable, and that a path missing from the override
+  root still 404s rather than silently falling back to the global root.
+
+  Verified: `make test` x2 clean, `make sanitize` (ASan/UBSan) clean.
+
 ## 2.4.0
 
 ### Added

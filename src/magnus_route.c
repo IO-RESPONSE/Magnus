@@ -158,6 +158,26 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
             continue;
         }
 
+        if (colon == NULL && strncmp(cursor, "root", (size_t) (equals - cursor)) == 0
+            && (size_t) (equals - cursor) == 4) {
+            char *root_value = equals + 1;
+            size_t root_length = strlen(root_value);
+            if (out->root_set) {
+                if (error != NULL && error_capacity > 0)
+                    snprintf(error, error_capacity, "duplicate 'root'");
+                return false;
+            }
+            if (root_length == 0 || root_length >= sizeof(out->root)) {
+                if (error != NULL && error_capacity > 0)
+                    snprintf(error, error_capacity,
+                            "'root' path too long or empty");
+                return false;
+            }
+            strcpy(out->root, root_value);
+            out->root_set = true;
+            continue;
+        }
+
         if (out->condition_count == MAGNUS_ROUTE_MAX_CONDITIONS) {
             if (error != NULL && error_capacity > 0)
                 snprintf(error, error_capacity,
@@ -260,6 +280,12 @@ magnus_route_parse(const char *value, magnus_route_t *out, char *error,
         if (error != NULL && error_capacity > 0)
             snprintf(error, error_capacity,
                     "'cache=on' requires 'action=proxy'");
+        return false;
+    }
+    if (out->root_set && out->action != MAGNUS_ROUTE_ACTION_STATIC) {
+        if (error != NULL && error_capacity > 0)
+            snprintf(error, error_capacity,
+                    "'root=' requires 'action=static'");
         return false;
     }
     return true;

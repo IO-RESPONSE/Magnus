@@ -2785,10 +2785,15 @@ magnus_quic_http_dispatch_static_streaming(magnus_quic_connection_t *connection,
  * magnus_quic_http_dispatch() below has ruled out /healthz, /metrics,
  * and every route (roadmap 4f). Method/head_only validation already
  * happened there, same as magnus_h2_dispatch()'s own single validation
- * pass ahead of its own healthz/metrics/static branches. */
+ * pass ahead of its own healthz/metrics/static branches. `root_override`
+ * is whatever that same caller's route-matching loop captured (roadmap
+ * 1b -- NULL if no matched route set its own `root=`), passed straight
+ * through to magnus_open_static(), exactly like magnus_h2_dispatch_
+ * static()'s own identical parameter. */
 static void
 magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
-                                 magnus_quic_stream_t *stream)
+                                 magnus_quic_stream_t *stream,
+                                 const char *root_override)
 {
     struct stat metadata;
     const char *content_type;
@@ -2801,7 +2806,7 @@ magnus_quic_http_dispatch_static(magnus_quic_connection_t *connection,
     magnus_encoding_t encoding;
     bool use_gzip;
 
-    fd = magnus_open_static(stream->parsed.target, &metadata);
+    fd = magnus_open_static(stream->parsed.target, &metadata, root_override);
     if (fd < 0) {
         magnus_quic_http_submit_status(connection, stream, "404");
         return;
@@ -2907,6 +2912,7 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
     bool is_grpc_route = false;
     bool cache_route_enabled = false;
     const char *forward_path;
+    const char *static_route_root = NULL;
     struct in_addr client_ip;
 
     stream->head_only = strcmp(stream->parsed.method, "HEAD") == 0;
@@ -3004,12 +3010,19 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
             route_denied = true;
         } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
             is_grpc_route = true;
+        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_STATIC
+                  && magnus_routes[r].root_set) {
+            /* Roadmap 1b: still not a dispatch branch of its own -- just
+             * captures a document-root override for the static branch
+             * below, exactly like magnus_h2_dispatch()'s own identical
+             * capture. */
+            static_route_root = magnus_routes[r].root;
         }
-        /* action=static needs no branch of its own here: matching and
-         * being neither deny/proxy/grpc already falls through to the
-         * same static-file dispatch a request with no matching route
-         * at all gets, exactly like magnus_h2_dispatch()'s own comment
-         * documents. */
+        /* action=static otherwise needs no branch of its own here:
+         * matching and being neither deny/proxy/grpc already falls
+         * through to the same static-file dispatch a request with no
+         * matching route at all gets, exactly like magnus_h2_dispatch()'s
+         * own comment documents. */
         break;
     }
 
@@ -3037,7 +3050,7 @@ magnus_quic_http_dispatch(magnus_quic_connection_t *connection,
                                 cache_route_enabled);
         return;
     }
-    magnus_quic_http_dispatch_static(connection, stream);
+    magnus_quic_http_dispatch_static(connection, stream, static_route_root);
 }
 
 /* nghttp3's own documented contract for a read_data callback's returned

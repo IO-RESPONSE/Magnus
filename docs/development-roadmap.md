@@ -186,12 +186,20 @@ checkpoint from the prior sub-phase being green.
    *full* path — a route isn't anchored to the literal `/proxy/*`
    prefix, so nothing gets stripped, unlike that dispatch path), `deny`
    (403, short-circuits ahead of everything else), and `static` (lets a
-   route's conditions gate an otherwise-ordinary static request; no
-   per-route root override yet — see below). Required extending
-   `magnus_http_parse()` to retain the Host value and every header
-   field for lookup, which `header:<name>` conditions need.
-   Not yet done: `action=static` root override (deferred — no `root=`
-   key on a route spec yet, not silently unsupported), regex matching
+   route's conditions gate an otherwise-ordinary static request, with an
+   optional per-route document-root override — see below). Required
+   extending `magnus_http_parse()` to retain the Host value and every
+   header field for lookup, which `header:<name>` conditions need.
+   Per-route `action=static` root override shipped in 2.5.0: a new
+   `root=<path>` modifier, valid only alongside `action=static`
+   (mirroring `cache=on`'s `action=proxy`-only pairing), validated as a
+   real directory at config-load time in `magnus_config.c` (the DSL
+   parser itself stays filesystem-free) and threaded through all three
+   protocol dispatch paths via a new `root_override` parameter on
+   `magnus_open_static()`. Like every other match condition, the owning
+   route's `path_prefix` only gates the match — it does not strip the
+   prefix from the path resolved against the override root; see
+   CHANGELOG.md's 2.5.0 entry. Not yet done: regex matching
    (path_prefix is a literal anchored prefix only), OR-combined
    conditions (only AND), and multiple upstream clusters — every
    `action=proxy` route still targets the one cluster this whole

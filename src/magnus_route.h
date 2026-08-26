@@ -110,6 +110,23 @@ typedef struct {
      * requires a deliberate opt-in; see magnus_cache.h's own top comment
      * on why explicit opt-in matters here, not just convenience. */
     bool cache_enabled;
+    /* Roadmap 1b: per-route document-root override, opt-in per route via
+     * a `root=<path>` modifier -- parsed and validated (requires
+     * action=static, the same "requires" pairing cache_enabled already
+     * establishes for action=proxy) by magnus_route_parse(), consumed by
+     * magnus_dispatch_request()/magnus_h2_dispatch()/
+     * magnus_quic_http_dispatch() in magnus.c/magnus_quic.c: a matched
+     * action=static route with root_set overrides the process's global
+     * --root/`root=` document root for just that request, falling back
+     * to the global root exactly as before whenever no route matches or
+     * the matched one never set `root=`. Directory-existence validation
+     * (like the global root's own) happens in magnus_config.c at parse
+     * time, not here -- this parser stays filesystem-free on purpose
+     * (tests/fuzz-route.c fuzzes it directly). `root` itself is only
+     * meaningful when `root_set` is true; both are zero-valued (false /
+     * empty string) for every route that never mentions `root=`. */
+    bool root_set;
+    char root[256];
 } magnus_route_t;
 
 /* Parses one `route = ...` config value into `out`: semicolon-separated
@@ -117,8 +134,10 @@ typedef struct {
  * header_prefix/cookie/query, which need a field name as well as an
  * expected value) plus exactly one `action=proxy|deny|static|grpc|fastcgi|scgi|uwsgi`, plus
  * an optional `cache=on|off` modifier (roadmap 2d-1; only valid alongside
- * `action=proxy` -- see magnus_route_t's own `cache_enabled` field), in
- * any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with
+ * `action=proxy` -- see magnus_route_t's own `cache_enabled` field) and/or
+ * an optional `root=<path>` modifier (roadmap 1b; only valid alongside
+ * `action=static` -- see magnus_route_t's own `root`/`root_set` fields),
+ * in any order, combinable up to MAGNUS_ROUTE_MAX_CONDITIONS. A route with
  * zero conditions is valid and matches every request -- a deliberate
  * catch-all, e.g. for a route whose only job is to be an explicit
  * default action.
@@ -133,9 +152,10 @@ typedef struct {
  * any malformed token, an unrecognized key, a value that overflows the
  * fixed field it would be stored in, more than MAGNUS_ROUTE_MAX_CONDITIONS
  * conditions, a missing/duplicate/invalid action, a duplicate/invalid
- * `cache=`, or `cache=on` without `action=proxy` -- writing a
- * human-readable reason into `error` (if non-NULL and error_capacity > 0)
- * in every failure case. */
+ * `cache=`, `cache=on` without `action=proxy`, a duplicate/empty/too-long
+ * `root=`, or `root=` without `action=static` -- writing a human-readable
+ * reason into `error` (if non-NULL and error_capacity > 0) in every
+ * failure case. */
 bool magnus_route_parse(const char *value, magnus_route_t *out, char *error,
                         size_t error_capacity);
 

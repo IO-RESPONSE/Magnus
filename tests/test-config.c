@@ -576,6 +576,44 @@ main(void)
         assert(magnus_config_hash(&a) != magnus_config_hash(&c));
     }
 
+    /* route's root= (roadmap 1b): magnus_route_parse() itself stays
+     * filesystem-free (see tests/test-route.c), so the directory-
+     * existence check -- same stat()+S_ISDIR test every other root-like
+     * key (root/fastcgi_root/scgi_root/uwsgi_root) already gets -- is
+     * magnus_config.c's own responsibility instead. A route naming a
+     * real directory loads fine; one naming a path that does not exist
+     * is rejected at config-load time, not deferred to a 404 the first
+     * time a request actually matches it. */
+    {
+        char content[512];
+        snprintf(content, sizeof(content),
+                "port = 8080\nroute = action=static; root=%s\n", scratch_dir);
+        write_file(config_path, content);
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_OK);
+        assert(config.route_count == 1);
+        assert(config.routes[0].root_set);
+        assert(strcmp(config.routes[0].root, scratch_dir) == 0);
+
+        snprintf(content, sizeof(content),
+                "port = 8080\nroute = action=static; root=%s\n",
+                path_in_scratch("no-such-route-root"));
+        write_file(config_path, content);
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_ERROR);
+        assert(strstr(error, "route") != NULL);
+
+        /* A route with no root= at all is unaffected -- no directory to
+         * validate, action=static alone is enough (roadmap 1b's own
+         * pre-existing "gate an otherwise-ordinary static request"
+         * behavior, unchanged). */
+        write_file(config_path,
+                   "port = 8080\nroute = path_prefix=/x; action=static\n");
+        assert(magnus_config_load(config_path, &config, error, sizeof(error))
+               == MAGNUS_CONFIG_OK);
+        assert(!config.routes[0].root_set);
+    }
+
     unlink(config_path);
     unlink(cert_path);
     unlink(key_path);
