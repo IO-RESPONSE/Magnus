@@ -57,6 +57,17 @@ typedef struct {
      * `magnus_upstream_active_requests` in /metrics regardless of which
      * policy is configured. */
     unsigned active_requests;
+    /* TLS-upstream connection support (roadmap 1a-2): true when this
+     * endpoint was configured with an "https://" scheme (the plain
+     * "upstream" directive/--upstream flag only -- see
+     * magnus_config_parse_upstream()'s own `allow_tls` argument for why
+     * every other upstream kind still rejects a scheme prefix outright
+     * rather than silently ignoring it). Magnus originates a fresh TLS
+     * handshake (magnus_upstream_tls_handshake()) to this endpoint before
+     * ever writing a byte of the proxied request, exactly mirroring the
+     * already-existing downstream/client-facing TLS termination this
+     * codebase has always had, just in the opposite direction. */
+    bool tls;
 } magnus_endpoint_t;
 
 typedef struct {

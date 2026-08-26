@@ -70,6 +70,14 @@ typedef struct {
     bool is_hostname;
     unsigned port;
     unsigned weight;
+    /* TLS-upstream connection support (roadmap 1a-2): set only for an
+     * "upstream" directive/--upstream flag written with an "https://"
+     * scheme prefix -- magnus_config_parse_upstream()'s own `allow_tls`
+     * argument rejects that prefix outright for every other upstream
+     * kind (grpc/fastcgi/scgi/uwsgi/stream/stream_sni_route/udp), so this
+     * is always false for those and need not be checked by their own,
+     * unrelated call sites. */
+    bool tls;
 } magnus_config_upstream_t;
 
 typedef struct {
@@ -102,6 +110,23 @@ typedef struct {
      * memset(), so a config that never mentions `lb_policy` at all keeps
      * this codebase's original behavior unchanged. */
     magnus_lb_policy_t lb_policy;
+    /* TLS-upstream connection support (roadmap 1a-2), for the `upstream`
+     * cluster above only. `upstream_tls_verify` defaults true (via
+     * magnus_config_load()'s own memset() leaving it at 0/false --
+     * magnus_config_load() flips the *absence* of this key to true
+     * explicitly, the same "default is the safe choice" precedent
+     * `stream_proxy_protocol` documents for itself just below) so an
+     * https:// upstream with no further configuration still gets real
+     * certificate verification, not silent SSL_VERIFY_NONE. When
+     * `has_upstream_tls_ca_file` is false, verification falls back to
+     * this host's own system trust store (SSL_CTX_set_default_verify_
+     * paths()) exactly like a browser or curl would for an ordinary
+     * public HTTPS backend; set it to pin a private/internal CA instead,
+     * the same "ca bundle path" shape every other TLS client tool
+     * exposes. */
+    bool upstream_tls_verify;
+    bool has_upstream_tls_ca_file;
+    char upstream_tls_ca_file[MAGNUS_CONFIG_PATH_MAX];
     /* gRPC upstream cluster (roadmap 2c-1): same ipv4:port[:weight] shape
      * and validation as `upstreams` above (magnus_config_parse_upstream()
      * is reused as-is), but a hostname entry is rejected here -- DNS

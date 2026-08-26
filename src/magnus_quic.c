@@ -1400,8 +1400,13 @@ magnus_quic_proxy_connect_endpoint(magnus_quic_connection_t *connection,
     int fd;
     int result;
     unsigned pooled_requests_served;
+    /* TLS-upstream connection support (roadmap 1a-2): out_tls is always
+     * NULL here -- QUIC/HTTP/3's own proxy dispatch is not TLS-upstream-
+     * aware in this increment (see docs/development-roadmap.md and
+     * magnus_pool_checkout()'s own comment); any pooled TLS session is
+     * simply discarded rather than handed to this caller. */
     int pooled_fd = magnus_pool_checkout(endpoint_index,
-                                         &pooled_requests_served);
+                                         &pooled_requests_served, NULL);
 
     if (pooled_fd >= 0) {
         if (magnus_quic_proxy_attach_upstream(connection, stream,
@@ -1645,8 +1650,11 @@ magnus_quic_proxy_maybe_complete(magnus_quic_connection_t *connection,
         magnus_quic_upstream_owner[fd] = NULL;
         magnus_quic_upstream_connection[fd] = NULL;
         stream->upstream_fd = -1;
+        /* QUIC's own proxy dispatch never carries an upstream TLS session
+         * (see this function's own comment on the matching checkout
+         * call). */
         magnus_pool_checkin(stream->endpoint_index, fd,
-                            stream->upstream_requests_served + 1);
+                            stream->upstream_requests_served + 1, NULL);
         if (stream->cluster_endpoint_counted) {
             magnus_cluster_endpoint_end(&magnus_cluster, stream->endpoint_index);
             stream->cluster_endpoint_counted = false;
@@ -1775,7 +1783,7 @@ magnus_quic_proxy_receive_headers(magnus_quic_connection_t *connection,
                 magnus_quic_upstream_connection[fd] = NULL;
                 stream->upstream_fd = -1;
                 magnus_pool_checkin(stream->endpoint_index, fd,
-                                    stream->upstream_requests_served + 1);
+                                    stream->upstream_requests_served + 1, NULL);
                 if (stream->cluster_endpoint_counted) {
                     magnus_cluster_endpoint_end(&magnus_cluster,
                                                 stream->endpoint_index);

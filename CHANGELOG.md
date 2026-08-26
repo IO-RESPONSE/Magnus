@@ -1,5 +1,79 @@
 # Changelog
 
+## 2.2.0
+
+### Added
+
+- **TLS-upstream connection support (roadmap 1a-2) -- Magnus can now
+  originate its own TLS handshake to an HTTPS-marked backend, not only
+  terminate TLS on the client side.** A MINOR bump because it is new
+  config surface, not an engine change. `upstream`/`--upstream` accepts
+  an optional `https://` scheme prefix (`http://` is also accepted, as a
+  no-op courtesy -- either way, a bare `host:port` with no prefix stays
+  the overwhelmingly common case and is unaffected); every other
+  upstream kind (`grpc_upstream`/`fastcgi_upstream`/`scgi_upstream`/
+  `uwsgi_upstream`/`stream_upstream`/`stream_sni_route`/`udp_upstream`)
+  rejects the prefix outright with a config error rather than silently
+  ignoring it, since none of those proxy paths originate a TLS handshake
+  of their own. Two new directives apply uniformly to every TLS-marked
+  endpoint in the one `upstream` cluster: `upstream_tls_verify` (default
+  `on`) and `upstream_tls_ca_file` (unset falls back to this host's own
+  system trust store, exactly as a browser or curl would for an ordinary
+  public HTTPS backend). The existing idle connection pool (1a, 1.2.0)
+  now carries a live TLS session alongside a pooled TLS endpoint's fd, so
+  a reused connection skips its handshake exactly as it already skipped
+  its TCP one; the h2 proxy dispatch path (1e-2) reuses this unmodified.
+  QUIC's own HTTP/3 proxy dispatch (4j) is deliberately not TLS-upstream-
+  aware in this increment -- see docs/development-roadmap.md's 1a-2
+  entry for the exact scope cut and what falls back to what.
+
+### Fixed
+
+- **Build system: `build/%.o: src/%.c` had no header-dependency
+  tracking, so editing only a `.h` (no matching same-day `.c` edit) left
+  `make` reporting "Nothing to be done" while a stale `.o` -- compiled
+  against the old struct layout -- stayed linked into `build/magnus`.**
+  Not hypothetical: developing 1a-2 above hit this directly. Adding a
+  field to `magnus_endpoint_t` (`magnus_policy.h`) grew that struct, but
+  `magnus_policy.c` itself never mentions TLS and so was never touched
+  -- and `make` alone had no way to know it needed recompiling anyway.
+  The result was two translation units silently disagreeing on the
+  layout of the one shared `magnus_cluster_t` global: functions compiled
+  into the stale `magnus_policy.o` read and wrote the wrong byte offsets
+  relative to the freshly-rebuilt `magnus.o`, corrupting `cluster->count`
+  and briefly regressing the most basic plain-TCP reverse-proxy case to
+  a 502 on every request -- caught by `make test`'s own e2e coverage
+  before this reached a commit, not in the field, but a `make clean`
+  should never be required to get a correct build from a plain `make`.
+  Fixed with `-MMD -MP` on the `build/%.o` rule plus an `-include` of the
+  generated `.d` files (see the Makefile's own comment on that rule for
+  the full incident writeup) -- a header edit now forces exactly the
+  `.o` files that actually depend on it, the same as a `.c` edit always
+  has.
+
+- **TLS-upstream connections (1a-2 above) never actually worked: every
+  attempt failed with a 502, regardless of `upstream_tls_verify`.**
+  `magnus_upstream_tls_new()` built the client-side `SSL*` correctly --
+  `SSL_new()`, SNI/hostname or IP-based verification armed as
+  configured -- but never called `SSL_set_fd()`, so the `SSL*` had no
+  underlying socket to actually speak over. `SSL_connect()` then failed
+  immediately, before a single byte reached the network, which is why
+  every one of `upstream_tls_verify`'s settings failed identically --
+  the handshake never got far enough for that setting to matter. No
+  unit or end-to-end test caught this while 1a-2 was being built: every
+  `https://` reference `tests/test-core.sh` had before this release was
+  for client-facing/downstream TLS termination, never for Magnus
+  originating a TLS connection outward, so the feature had literally
+  never been runtime-exercised before a live, manual end-to-end check
+  turned up the 502s. Fixed by threading the connecting `fd` into
+  `magnus_upstream_tls_new()` and calling `SSL_set_fd()` there; the
+  three real outcomes (`upstream_tls_verify = off` accepting a
+  self-signed cert, verification on rejecting an untrusted one with a
+  clean 502, verification on trusting it via `upstream_tls_ca_file`) are
+  now covered end-to-end by `tests/test-core.sh`'s own new
+  `tls-upstream` section, closing the coverage gap that let this ship
+  unverified in the first place.
+
 ## 2.1.0
 
 ### Added

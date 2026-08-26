@@ -15,6 +15,8 @@
  * rather than each maintaining its own copy, but magnus_quic.c calls
  * them across a real translation unit boundary rather than inline. */
 
+#include <openssl/ssl.h>
+
 #include "magnus_config.h"
 #include "magnus_policy.h"
 #include "magnus_route.h"
@@ -138,9 +140,21 @@ void magnus_encode_affinity_cookie(char *out, size_t out_capacity,
  * (MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION, magnus.c-internal), or
  * simply closes it -- caller must have already cleared its own
  * *_upstream_owner[]/epoll registration for `fd` first, since idle
- * connections are deliberately not registered with epoll at all. */
-int magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served);
+ * connections are deliberately not registered with epoll at all.
+ * `out_tls` (roadmap 1a-2, TLS-upstream connection support) receives the
+ * checked-out connection's live TLS session for a TLS upstream endpoint,
+ * or NULL for a plain-TCP one; magnus_quic.c's own HTTP/3 proxy dispatch
+ * always passes NULL here (that path is not TLS-upstream-aware in this
+ * increment -- see docs/development-roadmap.md), which is safe: a TLS
+ * slot is simply never handed to a NULL-out_tls caller (see
+ * magnus_pool_checkout()'s own magnus.c-side comment for exactly what
+ * happens to it instead). Passing a live SSL* into magnus_pool_checkin()
+ * for an endpoint that is not itself TLS should never happen and is not
+ * specially guarded against -- callers only ever pass back what
+ * magnus_pool_checkout() itself handed them. */
+int magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served,
+                         SSL **out_tls);
 void magnus_pool_checkin(size_t endpoint_index, int fd,
-                         unsigned requests_served);
+                         unsigned requests_served, SSL *tls);
 
 #endif

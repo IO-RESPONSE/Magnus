@@ -105,8 +105,16 @@ magnus_config_looks_like_hostname(const char *text)
     return true;
 }
 
+/* `allow_tls` gates an optional "https://" (or, as a no-op courtesy,
+ * "http://") scheme prefix (roadmap 1a-2): true only for the plain
+ * `upstream` directive -- every other upstream kind (grpc/fastcgi/scgi/
+ * uwsgi/stream/stream_sni_route/udp) passes false and gets a clean parse
+ * failure on a scheme prefix rather than silently ignoring it, since
+ * none of those proxy paths originate a TLS handshake to their own
+ * upstream. */
 static bool
-magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
+magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out,
+                             bool allow_tls)
 {
     char spec[96];
     char *saveptr = NULL;
@@ -117,7 +125,16 @@ magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
     unsigned long weight = 1;
     struct in_addr probe;
     bool is_hostname;
+    bool tls = false;
 
+    if (strncmp(value, "https://", 8) == 0) {
+        if (!allow_tls) return false;
+        tls = true;
+        value += 8;
+    } else if (strncmp(value, "http://", 7) == 0) {
+        if (!allow_tls) return false;
+        value += 7;
+    }
     if (strlen(value) >= sizeof(spec)) return false;
     strcpy(spec, value);
     address = strtok_r(spec, ":", &saveptr);
@@ -135,6 +152,7 @@ magnus_config_parse_upstream(const char *value, magnus_config_upstream_t *out)
     out->is_hostname = is_hostname;
     out->port = (unsigned) port;
     out->weight = (unsigned) weight;
+    out->tls = tls;
     return true;
 }
 
@@ -162,6 +180,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     config->cache_max_bytes = 64u * 1024 * 1024;
     config->cache_max_entry_bytes = 8u * 1024 * 1024;
     config->max_body_bytes = 1 * 1024 * 1024;
+    config->upstream_tls_verify = true;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
     file = fopen(path, "r");
@@ -249,6 +268,36 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             strcpy(field, value);
+        } else if (strcmp(key, "upstream_tls_verify") == 0) {
+            if (strcmp(value, "on") == 0) {
+                config->upstream_tls_verify = true;
+            } else if (strcmp(value, "off") == 0) {
+                config->upstream_tls_verify = false;
+            } else {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'upstream_tls_verify' must be 'on' "
+                                        "or 'off', got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+        } else if (strcmp(key, "upstream_tls_ca_file") == 0) {
+            if (*value == '\0'
+                || strlen(value) >= sizeof(config->upstream_tls_ca_file)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'upstream_tls_ca_file' path too "
+                                        "long or empty");
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            if (!magnus_config_file_exists(value)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'upstream_tls_ca_file' file not "
+                                        "found: '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            strcpy(config->upstream_tls_ca_file, value);
+            config->has_upstream_tls_ca_file = true;
         } else if (strcmp(key, "upstream") == 0) {
             magnus_config_upstream_t upstream;
             if (config->upstream_count == MAGNUS_CONFIG_MAX_UPSTREAMS) {
@@ -258,7 +307,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, true)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -276,7 +325,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'grpc_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -305,7 +354,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'fastcgi_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -353,7 +402,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'scgi_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -399,7 +448,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'uwsgi_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -454,7 +503,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'stream_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);
@@ -540,7 +589,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(upstream_text, &upstream)) {
+            if (!magnus_config_parse_upstream(upstream_text, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'stream_sni_route': endpoint must "
                                         "be ipv4:port[:weight], got '%s'",
@@ -616,7 +665,7 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
-            if (!magnus_config_parse_upstream(value, &upstream)) {
+            if (!magnus_config_parse_upstream(value, &upstream, false)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'udp_upstream' must be "
                                         "ipv4:port[:weight], got '%s'", value);

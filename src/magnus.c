@@ -355,6 +355,19 @@ typedef struct {
     size_t stream_compress_outbuf_length;
     size_t stream_compress_outbuf_sent;
     int upstream_fd;
+    /* TLS-upstream connection support (roadmap 1a-2). NULL whenever
+     * magnus_cluster.endpoints[proxy_endpoint_index].tls is false (the
+     * overwhelming common case, unchanged from before this field
+     * existed); otherwise the client-side TLS session Magnus itself
+     * originates to the upstream, mirroring `tls` above (the downstream/
+     * client-facing session), just in the opposite direction.
+     * upstream_tls_handshaking is true from the moment this SSL* is
+     * created for a *freshly* connected socket until
+     * magnus_upstream_tls_handshake() reports success -- false for a
+     * pooled connection whose TLS session was already established before
+     * checkin, since no new handshake is needed for those. */
+    SSL *upstream_tls;
+    bool upstream_tls_handshaking;
     bool proxy_active;
     bool proxy_connected;
     bool proxy_headers_sent;
@@ -942,6 +955,15 @@ static magnus_connection_t *magnus_connections[MAGNUS_MAX_FDS];
  * functions below it directly. */
 int magnus_root_fd = -1;
 static SSL_CTX *magnus_tls_context;
+/* TLS-upstream connection support (roadmap 1a-2): the client-side
+ * counterpart of magnus_tls_context above. NULL whenever the running
+ * config has no "https://" upstream endpoint at all (the common case,
+ * left completely untouched) -- built once per magnus_apply_config()
+ * exactly like magnus_tls_context itself, from upstream_tls_verify/
+ * upstream_tls_ca_file rather than tls_cert/tls_key, since Magnus is the
+ * one presenting no certificate of its own here (no upstream mTLS in
+ * this increment -- see docs/development-roadmap.md's own note). */
+static SSL_CTX *magnus_upstream_tls_context;
 /* Not `static` -- see src/magnus_static.h's own comment on why
  * magnus_quic.c (HTTP/3 proxy dispatch, roadmap Phase 4d) needs both. */
 magnus_cluster_t magnus_cluster;
@@ -1321,6 +1343,16 @@ typedef struct {
     int fd;
     time_t idle_since;
     unsigned requests_served;
+    /* TLS-upstream connection support (roadmap 1a-2): the still-live TLS
+     * session for this fd, or NULL for a plain-TCP one -- always NULL on
+     * every magnus_fastcgi_pool[] slot (FastCGI upstreams have no TLS
+     * support in this increment, out of scope per the same reasoning
+     * grpc/scgi/uwsgi/stream/udp upstreams do -- see
+     * magnus_config_parse_upstream()'s own `allow_tls` comment), sharing
+     * this one type with magnus_upstream_pool[] regardless since a plain
+     * fd+idle_since+requests_served+tls slot has nothing proxy-specific
+     * about its shape either. */
+    SSL *tls;
 } magnus_pool_slot_t;
 
 typedef struct {
@@ -1455,12 +1487,27 @@ magnus_fastcgi_pool_close_all(void)
  * most-recently-idled slot first (LIFO -- the warmest connection, most
  * likely to still be alive on a backend with its own idle timeout).
  * Returns -1 if none is available; the caller falls back to opening a
- * fresh connection exactly as it did before pooling existed. Not
+ * fresh connection exactly as it did before pooling existed. `*out_tls`
+ * is set to the slot's still-live TLS session (roadmap 1a-2) when the
+ * returned fd is a TLS upstream connection, NULL otherwise -- the caller
+ * must NOT re-handshake in that case, only magnus_upstream_socket_read()/
+ * _write() against it, exactly as if it had just finished a fresh
+ * handshake. QUIC's own HTTP/3 proxy dispatch (roadmap 4j, below) always
+ * passes NULL here: a TLS-marked endpoint is out of scope for that path
+ * in this increment (see docs/development-roadmap.md), so it never asks
+ * for one and would have no use for the SSL* if it got one anyway -- a
+ * slot whose tls is non-NULL is therefore discarded outright for a
+ * NULL-out_tls caller, exactly like an exhausted or dead one, rather
+ * than left in the pool for some hypothetical future TLS-capable caller;
+ * this is strictly a pool-efficiency question, never a correctness one,
+ * and it keeps this function's own LIFO pop-and-scan shape (unchanged
+ * since before 1a-2) exactly as simple as it was. Not
  * `static` -- see src/magnus_static.h's own comment on why
  * magnus_quic.c's HTTP/3 proxy dispatch (roadmap 4j) needs this and
  * magnus_pool_checkin() below across a real translation unit boundary. */
 int
-magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served)
+magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served,
+                     SSL **out_tls)
 {
     magnus_pool_t *pool;
     if (endpoint_index >= MAGNUS_MAX_UPSTREAMS) return -1;
@@ -1470,52 +1517,78 @@ magnus_pool_checkout(size_t endpoint_index, unsigned *out_requests_served)
         char probe;
         ssize_t peeked;
         pool->count--;
-        if (slot.requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+        if (slot.tls != NULL && out_tls == NULL) {
+            SSL_free(slot.tls);
             close(slot.fd);
             continue;
         }
+        if (slot.requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+            if (slot.tls != NULL) SSL_free(slot.tls);
+            close(slot.fd);
+            continue;
+        }
+        /* MSG_PEEK reads raw wire bytes regardless of whether `slot.tls`
+         * is set -- for a TLS connection this sees ciphertext, not
+         * decrypted application data, but that is enough for the same
+         * "the peer had no business sending anything while idle" check:
+         * any unsolicited byte at all (a close_notify alert, or a TLS 1.3
+         * post-handshake NewSessionTicket, itself a normal but here
+         * unwanted occurrence -- OpenSSL's client session-ticket cache is
+         * not used across a plain pooled fd the way a real session-reuse
+         * setup would) makes this connection's framing untrustworthy the
+         * same as it would for plaintext, so it is discarded exactly the
+         * same way; a TLS 1.3 upstream may therefore see pooled
+         * connections discarded a little more eagerly than a TLS 1.2 or
+         * plaintext one, a pool-efficiency cost only, never a
+         * correctness one (the caller falls back to a fresh connect,
+         * same as any other checkout miss). */
         peeked = recv(slot.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
         if (peeked == 0
             || (peeked < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            /* peer closed it, or it is otherwise unusable */
+            if (slot.tls != NULL) SSL_free(slot.tls);
             close(slot.fd);
             continue;
         }
         if (peeked > 0) {
-            /* Backend sent bytes with no request pending -- not something
-             * a well-behaved HTTP/1.1 server does while idle. Whatever it
-             * is, this connection's framing can no longer be trusted. */
+            if (slot.tls != NULL) SSL_free(slot.tls);
             close(slot.fd);
             continue;
         }
         *out_requests_served = slot.requests_served;
+        if (out_tls != NULL) *out_tls = slot.tls;
         return slot.fd;
     }
     return -1;
 }
 
-/* Returns fd to the idle pool for `endpoint_index` if there is room and it
- * has not yet hit its request budget; otherwise just closes it. Ownership
- * of fd (its magnus_upstream_owner[] entry, its epoll registration -- none
- * held while idle, per the type comment above) is entirely the caller's
- * responsibility to have already cleared before calling this. Not
- * `static` -- see magnus_pool_checkout()'s own comment just above. */
+/* Returns fd (and, for a TLS upstream connection, its still-live `tls`
+ * session -- roadmap 1a-2) to the idle pool for `endpoint_index` if there
+ * is room and it has not yet hit its request budget; otherwise just
+ * closes/frees it. Ownership of fd (its magnus_upstream_owner[] entry,
+ * its epoll registration -- none held while idle, per the type comment
+ * above) and of `tls` is entirely the caller's responsibility to have
+ * already cleared before calling this. Not `static` -- see
+ * magnus_pool_checkout()'s own comment just above. */
 void
-magnus_pool_checkin(size_t endpoint_index, int fd, unsigned requests_served)
+magnus_pool_checkin(size_t endpoint_index, int fd, unsigned requests_served,
+                    SSL *tls)
 {
     magnus_pool_t *pool;
     if (endpoint_index >= MAGNUS_MAX_UPSTREAMS) {
+        if (tls != NULL) SSL_free(tls);
         close(fd);
         return;
     }
     pool = &magnus_upstream_pool[endpoint_index];
     if (pool->count == MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT
         || requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
+        if (tls != NULL) SSL_free(tls);
         close(fd);
         return;
     }
     pool->slots[pool->count] = (magnus_pool_slot_t) {
-        .fd = fd, .idle_since = time(NULL), .requests_served = requests_served
+        .fd = fd, .idle_since = time(NULL), .requests_served = requests_served,
+        .tls = tls
     };
     pool->count++;
 }
@@ -1532,6 +1605,7 @@ magnus_pool_expire_idle(time_t now)
         for (size_t read_index = 0; read_index < pool->count; read_index++) {
             magnus_pool_slot_t slot = pool->slots[read_index];
             if (now - slot.idle_since > MAGNUS_POOL_IDLE_TIMEOUT_SECONDS) {
+                if (slot.tls != NULL) SSL_free(slot.tls);
                 close(slot.fd);
                 continue;
             }
@@ -1549,8 +1623,10 @@ magnus_pool_close_all(void)
 {
     for (size_t endpoint = 0; endpoint < MAGNUS_MAX_UPSTREAMS; endpoint++) {
         magnus_pool_t *pool = &magnus_upstream_pool[endpoint];
-        for (size_t index = 0; index < pool->count; index++)
+        for (size_t index = 0; index < pool->count; index++) {
+            if (pool->slots[index].tls != NULL) SSL_free(pool->slots[index].tls);
             close(pool->slots[index].fd);
+        }
         pool->count = 0;
     }
 }
@@ -1924,6 +2000,16 @@ static ssize_t magnus_socket_write(magnus_connection_t *connection,
                                    const void *buffer, size_t length);
 static ssize_t magnus_socket_read(magnus_connection_t *connection,
                                   void *buffer, size_t length);
+/* TLS-upstream connection support (roadmap 1a-2) -- see these functions'
+ * own definitions, just past magnus_tls_handshake(), for the full
+ * comment. */
+static ssize_t magnus_upstream_socket_read(int fd, SSL *tls, void *buffer,
+                                           size_t length);
+static ssize_t magnus_upstream_socket_write(int fd, SSL *tls,
+                                            const void *buffer, size_t length);
+static int magnus_upstream_tls_handshake(int epoll_fd, int fd, SSL *tls);
+static SSL *magnus_upstream_tls_new(size_t endpoint_index,
+                                    const char *address, int fd);
 static void magnus_prepare_response(magnus_connection_t *connection,
                                     unsigned status, const char *reason,
                                     const char *content_type, const char *body,
@@ -2131,6 +2217,10 @@ magnus_close_connection(int epoll_fd, magnus_connection_t *connection)
     if (connection->upstream_fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->upstream_fd, NULL);
         magnus_upstream_owner[connection->upstream_fd] = NULL;
+        if (connection->upstream_tls != NULL) {
+            SSL_free(connection->upstream_tls);
+            connection->upstream_tls = NULL;
+        }
         close(connection->upstream_fd);
     }
     if (connection->fastcgi_upstream_fd >= 0) {
@@ -2306,18 +2396,22 @@ magnus_endpoint_sockaddr(size_t index, struct sockaddr_in *out)
 static int
 magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
                              size_t endpoint_index, int fd, bool connected,
-                             unsigned requests_served)
+                             unsigned requests_served, SSL *tls,
+                             bool tls_handshaking)
 {
     struct epoll_event event;
 
     if (connection->proxy_buffer == NULL) {
         connection->proxy_buffer = malloc(MAGNUS_PROXY_BUFFER);
         if (connection->proxy_buffer == NULL) {
+            if (tls != NULL) SSL_free(tls);
             close(fd);
             return -1;
         }
     }
     connection->upstream_fd = fd;
+    connection->upstream_tls = tls;
+    connection->upstream_tls_handshaking = tls_handshaking;
     connection->proxy_active = true;
     connection->proxy_connected = connected;
     connection->proxy_request_sent = 0;
@@ -2351,6 +2445,10 @@ magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
                                    .data.fd = fd };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
         magnus_upstream_owner[fd] = NULL;
+        if (connection->upstream_tls != NULL) {
+            SSL_free(connection->upstream_tls);
+            connection->upstream_tls = NULL;
+        }
         close(fd);
         connection->upstream_fd = -1;
         connection->proxy_active = false;
@@ -2360,10 +2458,11 @@ magnus_proxy_attach_upstream(int epoll_fd, magnus_connection_t *connection,
 }
 
 /* A pooled idle connection for this endpoint is tried first -- skipping
- * the TCP handshake (and, for a TLS upstream in a future phase, its
- * handshake too) entirely -- before falling back to opening a fresh one,
- * exactly as before this pool existed. Every caller of this function
- * (including retries against a different endpoint after a connect
+ * the TCP handshake (and, for a TLS upstream endpoint, roadmap 1a-2, its
+ * handshake too, since a pooled TLS session was already fully established
+ * before it was checked in) entirely -- before falling back to opening a
+ * fresh one, exactly as before this pool existed. Every caller of this
+ * function (including retries against a different endpoint after a connect
  * failure) benefits automatically; none of them needed to change. */
 static int
 magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
@@ -2373,16 +2472,20 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
     int result;
     int fd;
     unsigned pooled_requests_served;
-    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served);
+    SSL *pooled_tls = NULL;
+    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served,
+                                         &pooled_tls);
 
     if (pooled_fd >= 0) {
         if (magnus_proxy_attach_upstream(epoll_fd, connection, endpoint_index,
                                          pooled_fd, true,
-                                         pooled_requests_served) == 0)
+                                         pooled_requests_served, pooled_tls,
+                                         false) == 0)
             return 0;
         /* attach itself failed (buffer allocation, or epoll_ctl) -- the fd
-         * is already closed; fall through to a fresh connection rather
-         * than giving up the whole attempt over what the pool offered. */
+         * (and pooled_tls, if any) is already closed/freed; fall through
+         * to a fresh connection rather than giving up the whole attempt
+         * over what the pool offered. */
     }
 
     if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
@@ -2396,8 +2499,27 @@ magnus_proxy_connect_endpoint(int epoll_fd, magnus_connection_t *connection,
         close(fd);
         return -1;
     }
-    return magnus_proxy_attach_upstream(epoll_fd, connection, endpoint_index,
-                                        fd, result == 0, 0);
+    {
+        /* TLS-upstream connection support (roadmap 1a-2): a fresh
+         * connection to a `tls`-marked endpoint gets its client-side SSL*
+         * created here, right after the TCP connect is opened -- SNI/
+         * hostname verification is armed immediately, but the actual
+         * handshake (SSL_connect()) itself waits until the TCP connect is
+         * confirmed complete, magnus_handle_upstream()'s own TLS block. */
+        SSL *tls = NULL;
+        if (endpoint_index < MAGNUS_MAX_UPSTREAMS
+            && magnus_cluster.endpoints[endpoint_index].tls) {
+            tls = magnus_upstream_tls_new(endpoint_index,
+                                          magnus_cluster.endpoints[endpoint_index].address, fd);
+            if (tls == NULL) {
+                close(fd);
+                return -1;
+            }
+        }
+        return magnus_proxy_attach_upstream(epoll_fd, connection, endpoint_index,
+                                            fd, result == 0, 0, tls,
+                                            tls != NULL);
+    }
 }
 
 /* The MAGNUS_AFFINITY cookie value this gateway issues encodes the target
@@ -2887,6 +3009,10 @@ magnus_proxy_teardown_upstream(int epoll_fd, magnus_connection_t *connection)
     if (connection->upstream_fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->upstream_fd, NULL);
         magnus_upstream_owner[connection->upstream_fd] = NULL;
+        if (connection->upstream_tls != NULL) {
+            SSL_free(connection->upstream_tls);
+            connection->upstream_tls = NULL;
+        }
         close(connection->upstream_fd);
         connection->upstream_fd = -1;
     }
@@ -3415,7 +3541,9 @@ magnus_proxy_flush(int epoll_fd, magnus_connection_t *connection)
             magnus_upstream_owner[fd] = NULL;
             connection->upstream_fd = -1;
             magnus_pool_checkin(connection->proxy_endpoint_index, fd,
-                connection->proxy_upstream_requests_served + 1);
+                connection->proxy_upstream_requests_served + 1,
+                connection->upstream_tls);
+            connection->upstream_tls = NULL;
             /* Advanced load balancing (roadmap 2e-1): the one release
              * site magnus_proxy_teardown_upstream()'s own does not cover
              * -- see that function's own comment. */
@@ -3461,9 +3589,10 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
     size_t cacheable_prefix_length = 0;
 
     while (connection->proxy_header_accum < MAGNUS_PROXY_BUFFER) {
-        ssize_t received = recv(connection->upstream_fd,
+        ssize_t received = magnus_upstream_socket_read(connection->upstream_fd,
+            connection->upstream_tls,
             connection->proxy_buffer + connection->proxy_header_accum,
-            MAGNUS_PROXY_BUFFER - connection->proxy_header_accum, 0);
+            MAGNUS_PROXY_BUFFER - connection->proxy_header_accum);
         if (received > 0) {
             connection->proxy_header_accum += (size_t) received;
             connection->last_active = time(NULL);
@@ -3554,7 +3683,9 @@ magnus_proxy_receive_headers(int epoll_fd, magnus_connection_t *connection)
             magnus_upstream_owner[fd] = NULL;
             connection->upstream_fd = -1;
             magnus_pool_checkin(connection->proxy_endpoint_index, fd,
-                connection->proxy_upstream_requests_served + 1);
+                connection->proxy_upstream_requests_served + 1,
+                connection->upstream_tls);
+            connection->upstream_tls = NULL;
             /* Advanced load balancing (roadmap 2e-1): same release-site
              * gap as magnus_proxy_flush()'s own pool-checkin branch --
              * see that one's own comment. */
@@ -3964,8 +4095,8 @@ magnus_ws_pump_direction(magnus_connection_t *connection, bool from_client)
     for (;;) {
         while (*sent < *length) {
             ssize_t written = from_client
-                ? send(connection->upstream_fd, buffer + *sent,
-                      *length - *sent, MSG_NOSIGNAL)
+                ? magnus_upstream_socket_write(connection->upstream_fd,
+                      connection->upstream_tls, buffer + *sent, *length - *sent)
                 : magnus_socket_write(connection, buffer + *sent,
                                      *length - *sent);
             if (written > 0) {
@@ -3983,7 +4114,8 @@ magnus_ws_pump_direction(magnus_connection_t *connection, bool from_client)
         {
             ssize_t received = from_client
                 ? magnus_socket_read(connection, buffer, MAGNUS_PROXY_BUFFER)
-                : recv(connection->upstream_fd, buffer, MAGNUS_PROXY_BUFFER, 0);
+                : magnus_upstream_socket_read(connection->upstream_fd,
+                      connection->upstream_tls, buffer, MAGNUS_PROXY_BUFFER);
             if (received > 0) {
                 *length = (size_t) received;
                 connection->last_active = time(NULL);
@@ -4043,11 +4175,28 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
         connection->proxy_connected = true;
         connection->proxy_last_activity = time(NULL);
     }
+    /* TLS-upstream connection support (roadmap 1a-2). Runs exactly once
+     * per fresh TLS upstream connection, right after the TCP connect
+     * itself is confirmed above and before a single byte of the proxied
+     * request goes out -- a pooled connection's own already-established
+     * upstream_tls (see magnus_pool_checkout()'s own comment) leaves
+     * upstream_tls_handshaking false from the moment it is attached, so
+     * this block is simply a no-op for that case, same as it always is
+     * for a plain-TCP endpoint. */
+    if (connection->upstream_tls != NULL && connection->upstream_tls_handshaking) {
+        int handshake_result = magnus_upstream_tls_handshake(
+            epoll_fd, connection->upstream_fd, connection->upstream_tls);
+        if (handshake_result < 0)
+            return magnus_proxy_connect_failed(epoll_fd, connection, 502,
+                                               "Bad Gateway");
+        if (handshake_result == 0) return 0;
+        connection->upstream_tls_handshaking = false;
+    }
     while (!connection->proxy_headers_sent) {
-        ssize_t sent = send(connection->upstream_fd,
+        ssize_t sent = magnus_upstream_socket_write(connection->upstream_fd,
+            connection->upstream_tls,
             connection->proxy_request + connection->proxy_request_sent,
-            connection->proxy_request_length - connection->proxy_request_sent,
-            MSG_NOSIGNAL);
+            connection->proxy_request_length - connection->proxy_request_sent);
         if (sent > 0) {
             connection->proxy_request_sent += (size_t) sent;
             connection->proxy_last_activity = time(NULL);
@@ -4063,10 +4212,10 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
             connection->proxy_headers_sent = true;
     }
     while (connection->proxy_body_sent < connection->body_length) {
-        ssize_t sent = send(connection->upstream_fd,
+        ssize_t sent = magnus_upstream_socket_write(connection->upstream_fd,
+            connection->upstream_tls,
             connection->body + connection->proxy_body_sent,
-            connection->body_length - connection->proxy_body_sent,
-            MSG_NOSIGNAL);
+            connection->body_length - connection->proxy_body_sent);
         if (sent > 0) {
             connection->proxy_body_sent += (size_t) sent;
             connection->proxy_last_activity = time(NULL);
@@ -4110,7 +4259,8 @@ magnus_handle_upstream(int epoll_fd, magnus_connection_t *connection,
             if (remaining < want) want = remaining;
         }
         ssize_t received = want > 0
-            ? recv(connection->upstream_fd, connection->proxy_buffer, want, 0)
+            ? magnus_upstream_socket_read(connection->upstream_fd,
+                  connection->upstream_tls, connection->proxy_buffer, want)
             : 0;
         if (received > 0) {
             connection->proxy_buffer_length = (size_t) received;
@@ -4216,6 +4366,138 @@ magnus_tls_handshake(int epoll_fd, magnus_connection_t *connection)
     if (ssl_error == SSL_ERROR_WANT_WRITE)
         return magnus_update_interest(epoll_fd, connection, EPOLLOUT | EPOLLRDHUP);
     return -1;
+}
+
+/* TLS-upstream connection support (roadmap 1a-2). These three functions
+ * are the client-side (Magnus-originates) mirror of magnus_socket_read()/
+ * magnus_socket_write()/magnus_tls_handshake() just above, which are all
+ * server-side (Magnus-terminates, downstream/client-facing). Written to
+ * take a raw fd+SSL* pair rather than a magnus_connection_t* like their
+ * mirrors do, since both the h1 (magnus_connection_t's own upstream_fd/
+ * upstream_tls) and h2 (struct magnus_h2_stream's own identically-shaped
+ * fields) proxy dispatch paths share these unmodified -- there being
+ * nothing protocol-specific about a socket read/write/handshake means
+ * there is, unlike most of this codebase's own proxy-dispatch machinery,
+ * nothing for an h2-side copy to usefully duplicate. */
+static ssize_t
+magnus_upstream_socket_read(int fd, SSL *tls, void *buffer, size_t length)
+{
+    int result;
+    int ssl_error;
+    if (tls == NULL) return recv(fd, buffer, length, 0);
+    result = SSL_read(tls, buffer, (int) length);
+    if (result > 0) return result;
+    ssl_error = SSL_get_error(tls, result);
+    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (ssl_error == SSL_ERROR_ZERO_RETURN) return 0;
+    errno = EIO;
+    return -1;
+}
+
+static ssize_t
+magnus_upstream_socket_write(int fd, SSL *tls, const void *buffer,
+                             size_t length)
+{
+    int result;
+    int ssl_error;
+    if (tls == NULL) return send(fd, buffer, length, MSG_NOSIGNAL);
+    result = SSL_write(tls, buffer, (int) length);
+    if (result > 0) return result;
+    ssl_error = SSL_get_error(tls, result);
+    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        errno = EAGAIN;
+        return -1;
+    }
+    errno = EIO;
+    return -1;
+}
+
+/* Drives one step of the upstream handshake, exactly like
+ * magnus_tls_handshake() drives the downstream one. Returns 1 once the
+ * handshake (including certificate verification -- see
+ * magnus_upstream_tls_new()'s own comment on how the check itself is
+ * armed) completed successfully, 0 while still in progress (epoll
+ * interest on `fd` already updated to whatever OpenSSL asked for next),
+ * -1 on failure -- a rejected/expired/hostname-mismatched certificate
+ * surfaces here exactly like any other handshake failure, since
+ * SSL_connect() itself fails once SSL_VERIFY_PEER is set and the check
+ * armed by SSL_set1_host()/X509_VERIFY_PARAM_set1_ip_asc() does not
+ * pass. The caller must tear the connection down on -1, the same
+ * contract magnus_handle_upstream()'s own SO_ERROR check already has for
+ * a plain failed TCP connect. */
+static int
+magnus_upstream_tls_handshake(int epoll_fd, int fd, SSL *tls)
+{
+    int result = SSL_connect(tls);
+    int ssl_error;
+    struct epoll_event event;
+    if (result == 1) return 1;
+    ssl_error = SSL_get_error(tls, result);
+    event.data.fd = fd;
+    if (ssl_error == SSL_ERROR_WANT_READ) {
+        event.events = EPOLLIN | EPOLLRDHUP;
+        (void) epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event);
+        return 0;
+    }
+    if (ssl_error == SSL_ERROR_WANT_WRITE) {
+        event.events = EPOLLOUT | EPOLLRDHUP;
+        (void) epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &event);
+        return 0;
+    }
+    return -1;
+}
+
+/* Allocates and configures a fresh client-side SSL* for connecting to
+ * cluster endpoint `endpoint_index` (whose current, possibly
+ * DNS-resolved, literal address is `address`) over the already-opened
+ * (possibly still-connecting) socket `fd` -- NULL if
+ * magnus_upstream_tls_context itself is NULL (no https:// endpoint
+ * anywhere in the running config, so this should never actually be
+ * called, but a defensive NULL is cheaper than a reachable assert), if
+ * SSL_new() itself fails (OOM), or if SSL_set_fd() fails. Arms
+ * certificate verification two different ways depending on how this
+ * endpoint was originally written in config, exactly the distinction
+ * magnus_dns_hostname_endpoint[]/magnus_dns_endpoint_hostname[] already
+ * exist to make (1c): a hostname endpoint gets ordinary SNI
+ * (SSL_set_tlsext_host_name()) plus hostname-based verification
+ * (SSL_set1_host()) against the *original* configured hostname, never
+ * the resolved literal IP `address` itself (which would defeat the
+ * point -- a certificate is issued for a name, not for whatever IP that
+ * name currently resolves to); a literal-IP endpoint has no hostname to
+ * send as SNI at all, so it gets IP-based verification instead
+ * (X509_VERIFY_PARAM_set1_ip_asc()), the RFC 6125 / RFC 2818 "IP address
+ * in the URI" case every TLS client library supports for exactly this
+ * reason. SSL_set_fd() is what actually wires this SSL* to `fd`'s
+ * underlying socket -- skipping it left every upstream TLS handshake
+ * with no transport to speak over at all, SSL_connect() failing
+ * immediately (never even reaching the network) regardless of
+ * upstream_tls_verify; see CHANGELOG.md's 2.2.0 entry for the full
+ * writeup of this bug, caught only by live end-to-end verification,
+ * never by any existing unit test (none exercised a real TLS-upstream
+ * connect at all before this increment). */
+static SSL *
+magnus_upstream_tls_new(size_t endpoint_index, const char *address, int fd)
+{
+    SSL *tls;
+    if (magnus_upstream_tls_context == NULL) return NULL;
+    tls = SSL_new(magnus_upstream_tls_context);
+    if (tls == NULL) return NULL;
+    if (SSL_set_fd(tls, fd) != 1) {
+        SSL_free(tls);
+        return NULL;
+    }
+    if (endpoint_index < MAGNUS_MAX_UPSTREAMS
+        && magnus_dns_hostname_endpoint[endpoint_index]) {
+        const char *hostname = magnus_dns_endpoint_hostname[endpoint_index];
+        (void) SSL_set_tlsext_host_name(tls, hostname);
+        (void) SSL_set1_host(tls, hostname);
+    } else {
+        (void) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(tls), address);
+    }
+    return tls;
 }
 
 const char *
@@ -4614,6 +4896,10 @@ struct magnus_h2_stream {
     int upstream_fd;
     bool upstream_connected;
     bool upstream_headers_sent;
+    /* TLS-upstream connection support (roadmap 1a-2) -- the h2 analogue
+     * of magnus_connection_t's own identically-named/commented fields. */
+    SSL *upstream_tls;
+    bool upstream_tls_handshaking;
     size_t endpoint_index;
     /* Advanced load balancing (roadmap 2e-1) -- the h2 analogue of
      * magnus_connection_t's own identically-named field; see that one's
@@ -4929,6 +5215,10 @@ magnus_h2_stream_teardown_upstream(struct magnus_h2_stream *stream)
             epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_DEL,
                      stream->upstream_fd, NULL);
         magnus_h2_upstream_owner[stream->upstream_fd] = NULL;
+        if (stream->upstream_tls != NULL) {
+            SSL_free(stream->upstream_tls);
+            stream->upstream_tls = NULL;
+        }
         close(stream->upstream_fd);
         stream->upstream_fd = -1;
     }
@@ -6046,23 +6336,28 @@ static int
 magnus_h2_proxy_attach_upstream(magnus_connection_t *connection,
                                 struct magnus_h2_stream *stream,
                                 size_t endpoint_index, int fd, bool connected,
-                                unsigned requests_served)
+                                unsigned requests_served, SSL *tls,
+                                bool tls_handshaking)
 {
     struct epoll_event event;
     (void) connection;
     if (fd < 0 || fd >= MAGNUS_MAX_FDS) {
+        if (tls != NULL) SSL_free(tls);
         if (fd >= 0) close(fd);
         return -1;
     }
     if (stream->io_buffer == NULL) {
         stream->io_buffer = malloc(MAGNUS_PROXY_BUFFER);
         if (stream->io_buffer == NULL) {
+            if (tls != NULL) SSL_free(tls);
             close(fd);
             return -1;
         }
         stream->io_capacity = MAGNUS_PROXY_BUFFER;
     }
     stream->upstream_fd = fd;
+    stream->upstream_tls = tls;
+    stream->upstream_tls_handshaking = tls_handshaking;
     stream->upstream_connected = connected;
     stream->upstream_requests_served = requests_served;
     stream->endpoint_index = endpoint_index;
@@ -6078,6 +6373,10 @@ magnus_h2_proxy_attach_upstream(magnus_connection_t *connection,
                                    .data.fd = fd };
     if (epoll_ctl(magnus_global_epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
         magnus_h2_upstream_owner[fd] = NULL;
+        if (stream->upstream_tls != NULL) {
+            SSL_free(stream->upstream_tls);
+            stream->upstream_tls = NULL;
+        }
         close(fd);
         stream->upstream_fd = -1;
         return -1;
@@ -6100,12 +6399,15 @@ magnus_h2_proxy_connect_endpoint(magnus_connection_t *connection,
     int result;
     int fd;
     unsigned pooled_requests_served;
-    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served);
+    SSL *pooled_tls = NULL;
+    int pooled_fd = magnus_pool_checkout(endpoint_index, &pooled_requests_served,
+                                         &pooled_tls);
 
     if (pooled_fd >= 0) {
         if (magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
                                             pooled_fd, true,
-                                            pooled_requests_served) == 0)
+                                            pooled_requests_served, pooled_tls,
+                                            false) == 0)
             return 0;
     }
     if (!magnus_endpoint_sockaddr(endpoint_index, &address)) return -1;
@@ -6119,8 +6421,23 @@ magnus_h2_proxy_connect_endpoint(magnus_connection_t *connection,
         close(fd);
         return -1;
     }
-    return magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
-                                           fd, result == 0, 0);
+    {
+        /* TLS-upstream connection support (roadmap 1a-2) -- see
+         * magnus_proxy_connect_endpoint()'s own identical comment. */
+        SSL *tls = NULL;
+        if (endpoint_index < MAGNUS_MAX_UPSTREAMS
+            && magnus_cluster.endpoints[endpoint_index].tls) {
+            tls = magnus_upstream_tls_new(endpoint_index,
+                                          magnus_cluster.endpoints[endpoint_index].address, fd);
+            if (tls == NULL) {
+                close(fd);
+                return -1;
+            }
+        }
+        return magnus_h2_proxy_attach_upstream(connection, stream, endpoint_index,
+                                               fd, result == 0, 0, tls,
+                                               tls != NULL);
+    }
 }
 
 /* The h2 analogue of magnus_proxy_connect_failed(): records a
@@ -6800,7 +7117,9 @@ magnus_h2_proxy_maybe_complete(struct magnus_h2_stream *stream)
         magnus_h2_upstream_owner[fd] = NULL;
         stream->upstream_fd = -1;
         magnus_pool_checkin(stream->endpoint_index, fd,
-                            stream->upstream_requests_served + 1);
+                            stream->upstream_requests_served + 1,
+                            stream->upstream_tls);
+        stream->upstream_tls = NULL;
         /* Advanced load balancing (roadmap 2e-1): the one release site
          * magnus_h2_stream_teardown_upstream()'s own does not cover --
          * see magnus_proxy_flush()'s own identical HTTP/1.1 comment. */
@@ -6837,9 +7156,10 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
     size_t cacheable_prefix_length = 0;
 
     while (stream->header_accum < MAGNUS_PROXY_BUFFER) {
-        ssize_t received = recv(stream->upstream_fd,
+        ssize_t received = magnus_upstream_socket_read(stream->upstream_fd,
+            stream->upstream_tls,
             stream->io_buffer + stream->header_accum,
-            MAGNUS_PROXY_BUFFER - stream->header_accum, 0);
+            MAGNUS_PROXY_BUFFER - stream->header_accum);
         if (received > 0) {
             stream->header_accum += (size_t) received;
             stream->last_activity = time(NULL);
@@ -6908,7 +7228,9 @@ magnus_h2_proxy_receive_headers(magnus_connection_t *connection,
             magnus_h2_upstream_owner[fd] = NULL;
             stream->upstream_fd = -1;
             magnus_pool_checkin(stream->endpoint_index, fd,
-                stream->upstream_requests_served + 1);
+                stream->upstream_requests_served + 1,
+                stream->upstream_tls);
+            stream->upstream_tls = NULL;
             /* Advanced load balancing (roadmap 2e-1): same release-site
              * gap as magnus_h2_proxy_maybe_complete()'s own pool-checkin
              * branch -- see that one's own comment. */
@@ -7146,7 +7468,8 @@ magnus_h2_proxy_stream_response(struct magnus_h2_stream *stream)
         magnus_h2_proxy_maybe_complete(stream);
         return;
     }
-    received = recv(stream->upstream_fd, stream->io_buffer, want, 0);
+    received = magnus_upstream_socket_read(stream->upstream_fd,
+        stream->upstream_tls, stream->io_buffer, want);
     if (received > 0) {
         stream->io_length = (size_t) received;
         stream->io_sent = 0;
@@ -7216,8 +7539,9 @@ magnus_h2_proxy_stream_compress_response(struct magnus_h2_stream *stream)
         if (stream->proxy_stream_compress_inbuf_sent
             == stream->proxy_stream_compress_inbuf_length
             && !complete_by_length && !stream->upstream_eof) {
-            ssize_t received = recv(stream->upstream_fd,
-                stream->proxy_stream_compress_inbuf, MAGNUS_PROXY_BUFFER, 0);
+            ssize_t received = magnus_upstream_socket_read(stream->upstream_fd,
+                stream->upstream_tls,
+                stream->proxy_stream_compress_inbuf, MAGNUS_PROXY_BUFFER);
             if (received > 0) {
                 stream->proxy_stream_compress_inbuf_length = (size_t) received;
                 stream->proxy_stream_compress_inbuf_sent = 0;
@@ -7315,11 +7639,24 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
         stream->upstream_connected = true;
         stream->last_activity = time(NULL);
     }
+    /* TLS-upstream connection support (roadmap 1a-2) -- the h2 analogue
+     * of magnus_handle_upstream()'s own identical block; see that one's
+     * own comment. */
+    if (stream->upstream_tls != NULL && stream->upstream_tls_handshaking) {
+        int handshake_result = magnus_upstream_tls_handshake(
+            epoll_fd, stream->upstream_fd, stream->upstream_tls);
+        if (handshake_result < 0) {
+            magnus_h2_proxy_connect_failed(connection, stream, "502");
+            return magnus_h2_push(epoll_fd, connection);
+        }
+        if (handshake_result == 0) return 0;
+        stream->upstream_tls_handshaking = false;
+    }
     while (!stream->upstream_headers_sent) {
-        ssize_t sent = send(stream->upstream_fd,
+        ssize_t sent = magnus_upstream_socket_write(stream->upstream_fd,
+            stream->upstream_tls,
             stream->proxy_request + stream->proxy_request_sent,
-            stream->proxy_request_length - stream->proxy_request_sent,
-            MSG_NOSIGNAL);
+            stream->proxy_request_length - stream->proxy_request_sent);
         if (sent > 0) {
             stream->proxy_request_sent += (size_t) sent;
             stream->last_activity = time(NULL);
@@ -7335,9 +7672,10 @@ magnus_h2_handle_upstream(struct magnus_h2_stream *stream, uint32_t flags)
             stream->upstream_headers_sent = true;
     }
     while (stream->body_sent < stream->body_length) {
-        ssize_t sent = send(stream->upstream_fd,
+        ssize_t sent = magnus_upstream_socket_write(stream->upstream_fd,
+            stream->upstream_tls,
             stream->body + stream->body_sent,
-            stream->body_length - stream->body_sent, MSG_NOSIGNAL);
+            stream->body_length - stream->body_sent);
         if (sent > 0) {
             stream->body_sent += (size_t) sent;
             stream->last_activity = time(NULL);
@@ -14028,6 +14366,7 @@ magnus_apply_config(const magnus_config_t *config)
 {
     int new_root_fd = -1;
     SSL_CTX *new_tls_context = NULL;
+    SSL_CTX *new_upstream_tls_context;
     magnus_cluster_t new_cluster;
     magnus_cluster_t new_grpc_cluster;
     magnus_cluster_t new_fastcgi_cluster;
@@ -14060,6 +14399,54 @@ magnus_apply_config(const magnus_config_t *config)
         SSL_CTX_set_options(new_tls_context, SSL_OP_NO_COMPRESSION);
         magnus_h2_configure_alpn(new_tls_context);
     }
+    /* TLS-upstream connection support (roadmap 1a-2): built whenever at
+     * least one "upstream" endpoint was written with an "https://" scheme
+     * (see magnus_config_parse_upstream()'s own `allow_tls` argument --
+     * this is the only upstream kind that can ever set .tls at all), never
+     * unconditionally the way new_tls_context above depends only on
+     * config->has_tls -- there is no equivalent "upstream_tls enabled"
+     * config flag of its own; the presence of even one https:// endpoint
+     * is what turns this on. Client-side: no certificate of Magnus's own
+     * is presented (no upstream mTLS in this increment), only peer
+     * verification -- SSL_VERIFY_PEER unless upstream_tls_verify is
+     * explicitly off, and either the configured CA bundle or the system
+     * trust store otherwise. */
+    new_upstream_tls_context = NULL;
+    for (index = 0; index < config->upstream_count; index++) {
+        if (config->upstreams[index].tls) {
+            new_upstream_tls_context = SSL_CTX_new(TLS_client_method());
+            break;
+        }
+    }
+    if (new_upstream_tls_context != NULL) {
+        if (SSL_CTX_set_min_proto_version(new_upstream_tls_context,
+                                          TLS1_2_VERSION) != 1) {
+            SSL_CTX_free(new_upstream_tls_context);
+            if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+            if (new_root_fd >= 0) close(new_root_fd);
+            return -1;
+        }
+        if (!config->upstream_tls_verify) {
+            SSL_CTX_set_verify(new_upstream_tls_context, SSL_VERIFY_NONE, NULL);
+        } else {
+            SSL_CTX_set_verify(new_upstream_tls_context, SSL_VERIFY_PEER, NULL);
+            if (config->has_upstream_tls_ca_file) {
+                if (SSL_CTX_load_verify_locations(new_upstream_tls_context,
+                        config->upstream_tls_ca_file, NULL) != 1) {
+                    SSL_CTX_free(new_upstream_tls_context);
+                    if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+                    if (new_root_fd >= 0) close(new_root_fd);
+                    return -1;
+                }
+            } else if (SSL_CTX_set_default_verify_paths(
+                           new_upstream_tls_context) != 1) {
+                SSL_CTX_free(new_upstream_tls_context);
+                if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
+                if (new_root_fd >= 0) close(new_root_fd);
+                return -1;
+            }
+        }
+    }
     magnus_cluster_init(&new_cluster, config->health_check_failure_threshold,
                         (uint64_t) config->health_check_cooldown_seconds
                         * 1000, config->lb_policy);
@@ -14067,10 +14454,14 @@ magnus_apply_config(const magnus_config_t *config)
         if (magnus_cluster_add(&new_cluster, config->upstreams[index].address,
                                config->upstreams[index].port,
                                config->upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
         }
+        new_cluster.endpoints[new_cluster.count - 1].tls =
+            config->upstreams[index].tls;
     }
     /* The gRPC cluster's own load-balancing policy is never exposed to
      * config/CLI (roadmap 2e-1 is scoped to the h1/h2 proxy dispatch
@@ -14093,6 +14484,8 @@ magnus_apply_config(const magnus_config_t *config)
                                config->grpc_upstreams[index].address,
                                config->grpc_upstreams[index].port,
                                config->grpc_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14111,6 +14504,8 @@ magnus_apply_config(const magnus_config_t *config)
                                config->fastcgi_upstreams[index].address,
                                config->fastcgi_upstreams[index].port,
                                config->fastcgi_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14128,6 +14523,8 @@ magnus_apply_config(const magnus_config_t *config)
                                config->scgi_upstreams[index].address,
                                config->scgi_upstreams[index].port,
                                config->scgi_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14144,6 +14541,8 @@ magnus_apply_config(const magnus_config_t *config)
                                config->uwsgi_upstreams[index].address,
                                config->uwsgi_upstreams[index].port,
                                config->uwsgi_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14163,6 +14562,8 @@ magnus_apply_config(const magnus_config_t *config)
                                config->stream_upstreams[index].address,
                                config->stream_upstreams[index].port,
                                config->stream_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14188,6 +14589,8 @@ magnus_apply_config(const magnus_config_t *config)
                                    config->sni_routes[index].upstreams[j].port,
                                    config->sni_routes[index].upstreams[j].weight)
                 != 0) {
+                if (new_upstream_tls_context != NULL)
+                    SSL_CTX_free(new_upstream_tls_context);
                 if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
                 if (new_root_fd >= 0) close(new_root_fd);
                 return -1;
@@ -14207,6 +14610,8 @@ magnus_apply_config(const magnus_config_t *config)
         if (magnus_cluster_add(&new_udp_cluster, config->udp_upstreams[index].address,
                                config->udp_upstreams[index].port,
                                config->udp_upstreams[index].weight) != 0) {
+            if (new_upstream_tls_context != NULL)
+                SSL_CTX_free(new_upstream_tls_context);
             if (new_tls_context != NULL) SSL_CTX_free(new_tls_context);
             if (new_root_fd >= 0) close(new_root_fd);
             return -1;
@@ -14217,6 +14622,9 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_root_fd = new_root_fd;
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
     magnus_tls_context = new_tls_context;
+    if (magnus_upstream_tls_context != NULL)
+        SSL_CTX_free(magnus_upstream_tls_context);
+    magnus_upstream_tls_context = new_upstream_tls_context;
     if (config->has_tls) {
         strcpy(magnus_tls_cert_path, config->tls_cert);
         strcpy(magnus_tls_key_path, config->tls_key);
@@ -14573,8 +14981,16 @@ magnus_parse_options(int argc, char **argv)
         } else if (strcmp(argv[index], "--tls-key") == 0) {
             private_key = argv[index + 1];
         } else if (strcmp(argv[index], "--upstream") == 0) {
-            /* host:port or host:port:weight; repeatable to build a cluster. */
+            /* [https://|http://]host:port or host:port:weight; repeatable
+             * to build a cluster. An optional scheme prefix (roadmap
+             * 1a-2) mirrors magnus_config_parse_upstream()'s own identical
+             * rule for the config-file "upstream" directive: "https://"
+             * marks the endpoint for Magnus to originate a TLS handshake
+             * to; "http://" is accepted as a no-op courtesy (the default
+             * either way); anything else is left alone -- host:port with
+             * no prefix at all is still the overwhelmingly common case. */
             char spec[80];
+            const char *upstream_spec = argv[index + 1];
             char *saveptr = NULL;
             char *address;
             char *port_text;
@@ -14584,8 +15000,15 @@ magnus_parse_options(int argc, char **argv)
             unsigned long weight = 1;
             struct in_addr probe;
             bool is_hostname;
-            if (strlen(argv[index + 1]) >= sizeof(spec)) break;
-            strcpy(spec, argv[index + 1]);
+            bool upstream_tls = false;
+            if (strncmp(upstream_spec, "https://", 8) == 0) {
+                upstream_tls = true;
+                upstream_spec += 8;
+            } else if (strncmp(upstream_spec, "http://", 7) == 0) {
+                upstream_spec += 7;
+            }
+            if (strlen(upstream_spec) >= sizeof(spec)) break;
+            strcpy(spec, upstream_spec);
             address = strtok_r(spec, ":", &saveptr);
             port_text = strtok_r(NULL, ":", &saveptr);
             weight_text = strtok_r(NULL, ":", &saveptr);
@@ -14606,6 +15029,7 @@ magnus_parse_options(int argc, char **argv)
             if (magnus_cluster_add(&magnus_cluster, address,
                                    (unsigned) upstream_port,
                                    (unsigned) weight) != 0) break;
+            magnus_cluster.endpoints[magnus_cluster.count - 1].tls = upstream_tls;
             magnus_upstream_enabled = true;
             if (is_hostname)
                 magnus_dns_track(magnus_cluster.count - 1, address);
@@ -15257,6 +15681,32 @@ magnus_parse_options(int argc, char **argv)
             strcpy(magnus_tls_cert_path, certificate);
             strcpy(magnus_tls_key_path, private_key);
         }
+        /* TLS-upstream connection support (roadmap 1a-2): the CLI-flag
+         * path's own counterpart of magnus_apply_config()'s identical
+         * new_upstream_tls_context construction -- this mode never goes
+         * through that function at all (see this function's own top
+         * comment: --config replaces every other flag, and plain CLI
+         * flags build magnus_cluster directly), so it has no
+         * upstream_tls_verify/upstream_tls_ca_file flags of its own
+         * either; peer verification is simply always on here, against the
+         * system trust store, the same safe default magnus_config_load()
+         * itself starts from. */
+        for (index = 0; index < (int) magnus_cluster.count; index++) {
+            if (!magnus_cluster.endpoints[index].tls) continue;
+            magnus_upstream_tls_context = SSL_CTX_new(TLS_client_method());
+            if (magnus_upstream_tls_context == NULL
+                || SSL_CTX_set_min_proto_version(magnus_upstream_tls_context,
+                                                 TLS1_2_VERSION) != 1
+                || SSL_CTX_set_default_verify_paths(
+                       magnus_upstream_tls_context) != 1) {
+                fprintf(stderr, "magnus: --upstream https://: TLS context "
+                                "setup failed\n");
+                exit(2);
+            }
+            SSL_CTX_set_verify(magnus_upstream_tls_context, SSL_VERIFY_PEER,
+                               NULL);
+            break;
+        }
         return port;
     }
     fprintf(stderr, "usage: %s --port <1-65535> [--root <directory>] "
@@ -15903,6 +16353,8 @@ main(int argc, char **argv)
     }
     if (magnus_root_fd >= 0) close(magnus_root_fd);
     if (magnus_tls_context != NULL) SSL_CTX_free(magnus_tls_context);
+    if (magnus_upstream_tls_context != NULL)
+        SSL_CTX_free(magnus_upstream_tls_context);
     magnus_access_log_flush();
     fprintf(stderr, "magnus: stopped\n");
     return 0;

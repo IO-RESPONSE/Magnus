@@ -113,12 +113,56 @@ checkpoint from the prior sub-phase being green.
    M2, regardless of what the client asked for; both legs are now decided
    independently (see CHANGELOG.md 1.2.0). No config schema change yet;
    pool size/timeout/request-budget stay fixed constants for now,
-   revisited if real usage shows the defaults wrong. Not yet done:
-   TLS-upstream connection reuse (no TLS upstream support exists at all
-   yet -- out of this sub-phase's scope) and connection draining as a
-   distinct state (a connection mid-response when its budget is hit is
-   simply not pooled afterward, not actively drained early).
-2. **1b — Advanced routing. Shipped in 1.3.0.** `host`/`path_prefix`/
+   revisited if real usage shows the defaults wrong. Not yet done at the
+   time: TLS-upstream connection reuse (no TLS upstream support existed
+   at all yet -- out of this sub-phase's scope; closed in 1a-2 below) and
+   connection draining as a distinct state (a connection mid-response
+   when its budget is hit is simply not pooled afterward, not actively
+   drained early -- still open).
+2. **1a-2 — TLS-upstream connections.** Closes the gap 1a's own paragraph
+   above named: `upstream`/`--upstream` may now be written with an
+   `https://` scheme prefix (`http://` is also accepted, as a no-op
+   courtesy -- either way is still the overwhelmingly common case) to
+   mark that endpoint for Magnus to originate its own TLS handshake to
+   the backend, rather than only ever speaking plain TCP to it -- Magnus
+   already terminates TLS from the client side (1e-1 onward); this is
+   the same capability in the other direction. Every other upstream kind
+   (`grpc_upstream`/`fastcgi_upstream`/`scgi_upstream`/`uwsgi_upstream`/
+   `stream_upstream`/`stream_sni_route`/`udp_upstream`) rejects the
+   scheme prefix outright rather than silently ignoring it, since none of
+   those proxy paths originate a TLS handshake of their own. Two new
+   directives, `upstream_tls_verify` (default `on`) and
+   `upstream_tls_ca_file` (falls back to this host's own system trust
+   store when unset, exactly like a browser or curl would for an
+   ordinary public HTTPS backend), apply uniformly to every TLS-marked
+   endpoint in the one `upstream` cluster -- there is no per-endpoint
+   override, matching the "one cluster" precedent `magnus_static.h`'s own
+   comment on `magnus_cluster` already establishes. 1a's own connection
+   pool (checkout/checkin) now carries a live `SSL*` alongside the fd for
+   a TLS-marked endpoint's pooled connections, so a reused connection
+   skips its TLS handshake exactly as it already skipped its TCP one; the
+   h2 proxy dispatch path (1e-2) reuses this unchanged, the same
+   reasoning `magnus_h2_proxy_connect_endpoint()`'s own comment already
+   gives for reusing the pool itself unmodified. QUIC's own HTTP/3 proxy
+   dispatch (4j) is deliberately not TLS-upstream-aware in this
+   increment -- it always passes a NULL `out_tls`/`tls` at its three
+   pool/connect call sites, meaning a TLS-marked endpoint is silently out
+   of scope for an HTTP/3-received request forwarded onward (falls back
+   to a fresh plain-TCP attempt to that same address:port, which will
+   simply fail against a TLS-only backend) rather than a build-time or
+   config-time error; revisit if that gap matters in practice before 4j
+   is considered fully done. Active health checking (2f) is likewise not
+   TLS-upstream-aware: its probe speaks a real HTTP/1.1 GET, but always
+   in plaintext (`magnus_health_tick()`'s own comment), so a TLS-marked
+   endpoint gets probed with a plaintext request against what is now a
+   TLS-only socket -- consistently rejected/timed-out, not a flaky
+   false-negative, but still wrong; a deployment with both features
+   enabled together should raise `health_check_interval_seconds`/rely on
+   passive (traffic-driven) health instead until 2f is made TLS-aware.
+   Connection draining as its own distinct pool state (named above as
+   1a's other remaining gap) is still open, unaffected by this
+   sub-phase.
+3. **1b — Advanced routing. Shipped in 1.3.0.** `host`/`path_prefix`/
    `method`/`header:<name>`/`cookie:<name>`/`query:<name>`/`source_cidr`
    match conditions, combinable with AND (up to 8 per route), evaluated
    in file order (first match wins) ahead of the built-in dispatch. New
@@ -144,7 +188,7 @@ checkpoint from the prior sub-phase being green.
    codebase has always had; per-route upstream selection is a natural
    follow-up, likely worth bundling with the eventual canary/traffic-split
    work in Section 26's routing list rather than doing it twice.
-3. **1c — DNS resolver. Shipped in 1.4.0.** An `upstream` entry may be a
+4. **1c — DNS resolver. Shipped in 1.4.0.** An `upstream` entry may be a
    hostname; resolved on a dedicated background thread (this codebase's
    first thread) running the system's own `getaddrinfo()`, completion
    delivered to the main thread over an eventfd registered in the normal
@@ -167,7 +211,7 @@ checkpoint from the prior sub-phase being green.
    first genuinely concurrent code -- the worker thread never touches
    anything outside its own module, so that is also the only place a
    race could exist, and TSan confirms none does.
-4. **1d — WebSocket. Shipped in 1.5.0.** Handshake relay (Upgrade/
+5. **1d — WebSocket. Shipped in 1.5.0.** Handshake relay (Upgrade/
    Connection/Sec-WebSocket-* headers forwarded verbatim, a 101 response
    relayed byte-exact) plus a raw bidirectional byte-pipe relay once
    upgraded — turned out not to need live per-frame parsing at all for
@@ -185,7 +229,7 @@ checkpoint from the prior sub-phase being green.
    pre-existing response-header sanitizer tokenizes its buffer in place,
    and the new code was building the verbatim 101 relay from that
    now-corrupted buffer (see CHANGELOG.md 1.5.0).
-5. **1e — HTTP/2.** Expected to be the largest single piece of work in
+6. **1e — HTTP/2.** Expected to be the largest single piece of work in
    Phase 1, and sub-scoped rather than attempted whole (per Section 27's
    own instruction to proceed one bounded phase at a time) into:
    - **1e-1 — ALPN + nghttp2 integration, static files only. Shipped in

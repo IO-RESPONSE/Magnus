@@ -73,7 +73,24 @@ build/magnus: $(OBJECTS)
 
 build/%.o: src/%.c
 	mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# Header-dependency tracking for the rule above: without this, editing a
+# .h with no matching same-day .c change left `make` reporting "Nothing
+# to be done" while a stale .o (compiled against the old struct layout)
+# stayed linked into build/magnus -- a real incident, not a hypothetical
+# one: magnus_policy.h's magnus_endpoint_t gained a field (TLS-upstream
+# support, roadmap 1e-3) while magnus_policy.c itself never mentions TLS
+# and so was never touched, and `make` alone did not know to recompile
+# it -- silently corrupting every offset src/magnus_policy.c and
+# src/magnus.c compute into the shared magnus_cluster_t global relative
+# to each other. -MMD -MP emits build/%.d alongside build/%.o listing
+# every header a given .c actually pulled in; `-include` below folds
+# those back in as extra prerequisites so a header-only edit now forces
+# exactly the .o files that need it, same as a .c edit always has.
+# Silently ignored (`-include`, not `include`) before any .o has been
+# built once to generate a first .d.
+-include $(OBJECTS:.o=.d)
 
 build/magnusd: src/magnusd.c src/magnus_config.c src/magnus_config.h \
 		src/magnus_route.c src/magnus_http.c src/magnusd_protocol.h

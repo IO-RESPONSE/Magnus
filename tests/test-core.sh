@@ -5506,3 +5506,142 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 echo "quic: handshake + HTTP/3 static/healthz/metrics GET/404, admin isolation, proxy dispatch GET/404/502 + byte-exact streamed payloads, static-file gzip compression, route table proxy/deny/grpc-505 dispatch, connect-failure retry, cookie-based session affinity, reverse-proxy response caching, upstream connection pooling, retry-based stateless address validation, connection migration/reactive path validation, proxy dispatch response compression, Real-IP-aware source_cidr matching ok (Phase 4b/4c/4d/4e/4f/4g/4h/4i/4j/4k/4l/2a-4/2b, see src/magnus_quic.h)"
+
+# TLS-upstream connections (1a-2): Magnus originating TLS itself while
+# proxying to a "https://"-marked upstream endpoint, not merely
+# terminating TLS on the client-facing side the way every other https://
+# reference in this file does. Exercises all three configurable
+# outcomes: verification off entirely, verification on against an
+# untrusted self-signed certificate (must be rejected, a clean 502, not
+# a hang or crash), and verification on with that same certificate
+# explicitly trusted via upstream_tls_ca_file (must succeed). This is a
+# real, previously-uncovered gap: no prior version of this file ever
+# exercised Magnus originating a TLS connection outward, and doing so
+# for the first time here caught a genuine bug during development (see
+# CHANGELOG.md's 2.2.0 entry) -- magnus_upstream_tls_new() built the
+# client-side SSL* correctly (SNI/hostname or IP verification armed as
+# appropriate) but never called SSL_set_fd(), leaving it with no
+# transport to actually speak over; SSL_connect() failed immediately,
+# before a single byte reached the network, regardless of
+# upstream_tls_verify -- a defect purely static review of the otherwise
+# fully-correct-looking connect/handshake code missed twice over.
+# health_check_interval_seconds is pushed out to keep roadmap 2f's own
+# active health-check prober (HTTP/1.1 plaintext only, see
+# magnus_health_tick()'s own comment) from ever firing during this short
+# test: probing a TLS-only endpoint in plaintext is itself a known,
+# documented scope gap of 2f, not something 1a-2 fixes.
+tls_upstream_root="$web_root/tls-upstream"
+mkdir -p "$tls_upstream_root"
+printf '%s\n' 'tls upstream backend ok' >"$tls_upstream_root/hello.txt"
+# -addext subjectAltName is required, not cosmetic: magnus_upstream_tls_new()
+# verifies a literal-IP endpoint via X509_VERIFY_PARAM_set1_ip_asc(), which
+# (RFC 6125) checks the certificate's IP SAN entry only -- it never falls
+# back to CN the way legacy hostname checking sometimes does -- so a cert
+# with a matching CN but no IP SAN still fails verification even against
+# its own trusted CA. Case 3 below exists specifically to prove
+# upstream_tls_ca_file's trust actually gets exercised, so this SAN is
+# what makes that case meaningful rather than accidentally always-502.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=127.0.0.1' \
+  -addext 'subjectAltName=IP:127.0.0.1' \
+  -keyout "$web_root/tls-upstream-server.key" \
+  -out "$web_root/tls-upstream-server.crt" >/dev/null 2>&1
+upstream_tls=$((port + 136))
+cat > "$web_root/tls-upstream-backend.py" <<PYEOF
+import http.server, ssl, sys, os
+os.chdir(sys.argv[2])
+httpd = http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])),
+                               http.server.SimpleHTTPRequestHandler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(certfile=sys.argv[3], keyfile=sys.argv[4])
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PYEOF
+python3 "$web_root/tls-upstream-backend.py" "$upstream_tls" \
+  "$tls_upstream_root" "$web_root/tls-upstream-server.crt" \
+  "$web_root/tls-upstream-server.key" >/dev/null 2>&1 &
+backend_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl -k --fail --silent "https://127.0.0.1:$upstream_tls/hello.txt" \
+    >/dev/null && break
+  sleep 1
+done
+
+# Case 1: upstream_tls_verify = off -- the self-signed cert is accepted
+# without question.
+port_tls_upstream_off=$((port + 137))
+cat > "$web_root/tls-upstream-off.conf" <<EOF
+port = $port_tls_upstream_off
+root = $tls_upstream_root
+upstream = https://127.0.0.1:$upstream_tls
+upstream_tls_verify = off
+health_check_interval_seconds = 3600
+EOF
+"$binary" --config "$web_root/tls-upstream-off.conf" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_tls_upstream_off/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+test "$(curl --fail --silent \
+  "http://127.0.0.1:$port_tls_upstream_off/proxy/hello.txt")" \
+  = 'tls upstream backend ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Case 2: verification on (the default), no CA configured -- the
+# self-signed cert is untrusted and the handshake must fail, surfacing
+# as a clean 502.
+port_tls_upstream_untrusted=$((port + 138))
+cat > "$web_root/tls-upstream-untrusted.conf" <<EOF
+port = $port_tls_upstream_untrusted
+root = $tls_upstream_root
+upstream = https://127.0.0.1:$upstream_tls
+health_check_interval_seconds = 3600
+EOF
+"$binary" --config "$web_root/tls-upstream-untrusted.conf" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_tls_upstream_untrusted/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+test "$(curl --silent --max-time 5 --output /dev/null \
+  --write-out '%{http_code}' \
+  "http://127.0.0.1:$port_tls_upstream_untrusted/proxy/hello.txt")" = 502
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+
+# Case 3: verification on, upstream_tls_ca_file explicitly trusts this
+# self-signed certificate -- must succeed, proving upstream_tls_ca_file
+# is actually wired into the handshake, not just accepted by the config
+# parser (tests/test-config.c already covers the parser side alone).
+port_tls_upstream_cafile=$((port + 139))
+cat > "$web_root/tls-upstream-cafile.conf" <<EOF
+port = $port_tls_upstream_cafile
+root = $tls_upstream_root
+upstream = https://127.0.0.1:$upstream_tls
+upstream_tls_ca_file = $web_root/tls-upstream-server.crt
+health_check_interval_seconds = 3600
+EOF
+"$binary" --config "$web_root/tls-upstream-cafile.conf" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent \
+    "http://127.0.0.1:$port_tls_upstream_cafile/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+test "$(curl --fail --silent \
+  "http://127.0.0.1:$port_tls_upstream_cafile/proxy/hello.txt")" \
+  = 'tls upstream backend ok'
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+echo "tls-upstream: verify=off accepts self-signed, verify=on rejects untrusted (502), verify=on+upstream_tls_ca_file trusts it (1a-2, see CHANGELOG.md 2.2.0)"

@@ -49,6 +49,11 @@ main(void)
     assert(!config.has_root);
     assert(!config.has_tls);
     assert(config.upstream_count == 0);
+    /* upstream_tls_verify (roadmap 1a-2) defaults true -- the "safe
+     * choice" precedent magnus_config.h's own comment on this field
+     * describes, same as every other config default in this block. */
+    assert(config.upstream_tls_verify);
+    assert(!config.has_upstream_tls_ca_file);
     assert(!config.has_rate_limit);
     assert(config.access_log_enabled);
     assert(config.access_log_sample == 1);
@@ -86,6 +91,9 @@ main(void)
             "tls_key = %s\n"
             "upstream = 10.0.0.1:8001:2\n"
             "upstream = 10.0.0.2:8002\n"
+            "upstream = https://10.0.0.3:8443\n"
+            "upstream_tls_verify = off\n"
+            "upstream_tls_ca_file = %s\n"
             "rate_limit_rps = 50\n"
             "rate_limit_burst = 100\n"
             "access_log = off\n"
@@ -116,7 +124,7 @@ main(void)
             "max_body_bytes = 2097152\n"
             "quic_listen = 9093\n"
             "admin_socket = %s/admin.sock\n",
-            scratch_dir, cert_path, key_path, scratch_dir);
+            scratch_dir, cert_path, key_path, cert_path, scratch_dir);
         write_file(config_path, content);
     }
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
@@ -131,12 +139,23 @@ main(void)
     assert(strcmp(config.tls_key, key_path) == 0);
     assert(config.has_quic_listen);
     assert(config.quic_listen_port == 9093);
-    assert(config.upstream_count == 2);
+    assert(config.upstream_count == 3);
     assert(strcmp(config.upstreams[0].address, "10.0.0.1") == 0);
     assert(!config.upstreams[0].is_hostname);
     assert(config.upstreams[0].port == 8001);
     assert(config.upstreams[0].weight == 2);
+    assert(!config.upstreams[0].tls);
     assert(config.upstreams[1].weight == 1);
+    assert(!config.upstreams[1].tls);
+    /* TLS-upstream connection support (roadmap 1a-2): an "https://"
+     * scheme prefix on the plain `upstream` directive sets .tls, and is
+     * stripped back out of .address same as a bare entry. */
+    assert(strcmp(config.upstreams[2].address, "10.0.0.3") == 0);
+    assert(config.upstreams[2].port == 8443);
+    assert(config.upstreams[2].tls);
+    assert(!config.upstream_tls_verify);
+    assert(config.has_upstream_tls_ca_file);
+    assert(strcmp(config.upstream_tls_ca_file, cert_path) == 0);
     assert(config.has_rate_limit);
     assert(config.rate_limit_rps == 50.0);
     assert(config.rate_limit_burst == 100.0);
@@ -178,6 +197,39 @@ main(void)
     assert(config.cache_max_bytes == 134217728);
     assert(config.cache_max_entry_bytes == 16777216);
     assert(config.max_body_bytes == 2097152);
+
+    /* TLS-upstream connection support (roadmap 1a-2): the "https://" (and
+     * "http://", as a no-op courtesy) scheme prefix is only accepted on
+     * the plain `upstream` directive -- every other upstream kind
+     * (grpc_upstream/fastcgi_upstream/scgi_upstream/uwsgi_upstream/
+     * stream_upstream/stream_sni_route/udp_upstream) rejects it outright,
+     * since none of those proxy paths originate a TLS handshake of their
+     * own. */
+    write_file(config_path,
+        "port = 8080\ngrpc_upstream = https://10.0.0.1:9000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "grpc_upstream") != NULL);
+    write_file(config_path,
+        "port = 8080\nstream_listen = 9091\n"
+        "stream_upstream = https://10.0.0.1:6000\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "stream_upstream") != NULL);
+
+    /* upstream_tls_verify only accepts on/off (same as access_log), and
+     * upstream_tls_ca_file must name a file that actually exists (same
+     * validation tls_cert/tls_key already get). */
+    write_file(config_path,
+        "port = 8080\nupstream_tls_verify = maybe\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "upstream_tls_verify") != NULL);
+    write_file(config_path,
+        "port = 8080\nupstream_tls_ca_file = /no/such/file-ca.pem\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "upstream_tls_ca_file") != NULL);
 
     /* stream_listen/stream_upstream: each requires the other, the port
      * must differ from the main listener, a hostname is rejected (same
