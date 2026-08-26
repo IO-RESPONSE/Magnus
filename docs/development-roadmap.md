@@ -151,14 +151,17 @@ checkpoint from the prior sub-phase being green.
    to a fresh plain-TCP attempt to that same address:port, which will
    simply fail against a TLS-only backend) rather than a build-time or
    config-time error; revisit if that gap matters in practice before 4j
-   is considered fully done. Active health checking (2f) is likewise not
-   TLS-upstream-aware: its probe speaks a real HTTP/1.1 GET, but always
-   in plaintext (`magnus_health_tick()`'s own comment), so a TLS-marked
-   endpoint gets probed with a plaintext request against what is now a
-   TLS-only socket -- consistently rejected/timed-out, not a flaky
-   false-negative, but still wrong; a deployment with both features
-   enabled together should raise `health_check_interval_seconds`/rely on
-   passive (traffic-driven) health instead until 2f is made TLS-aware.
+   is considered fully done. Active health checking (2f) is now
+   TLS-upstream-aware as of 2.3.0: a probe against a `tls`-marked
+   endpoint creates its `SSL*` via `magnus_upstream_tls_new()` right
+   after `connect()`, drives it through a new
+   `MAGNUS_HEALTH_PROBE_TLS_HANDSHAKE` stage
+   (`magnus_upstream_tls_handshake()`, non-blocking, self-rearming) ahead
+   of `SENDING`, and does its request/response I/O through
+   `magnus_upstream_socket_write()`/`magnus_upstream_socket_read()` --
+   the same transparent plaintext-or-TLS helpers the live proxy path
+   already used, so a plaintext endpoint's probe is unchanged. See
+   CHANGELOG.md's 2.3.0 entry for the live-verification details.
    Connection draining as its own distinct pool state (named above as
    1a's other remaining gap) is still open, unaffected by this
    sub-phase.

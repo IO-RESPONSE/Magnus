@@ -5645,3 +5645,66 @@ kill -TERM "$backend_pid"
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=
 echo "tls-upstream: verify=off accepts self-signed, verify=on rejects untrusted (502), verify=on+upstream_tls_ca_file trusts it (1a-2, see CHANGELOG.md 2.2.0)"
+
+# Active health checking (2f) against a TLS-marked upstream endpoint: closes
+# a gap documented (not fixed) alongside 1a-2 above and now fixed in the
+# same 2.2.0 line -- magnus_health_tick()'s probe used to always speak
+# plaintext HTTP/1.1, so it got no further than a garbled handshake against
+# a TLS-only backend and every probe simply failed, forever, regardless of
+# how healthy that backend actually was. Mirrors the existing M3 "active
+# health check finds a dead endpoint, and recovers it, purely in the
+# background" test above exactly -- no proxy traffic sent at all during
+# this block, so only the periodic active probe (not passive,
+# traffic-driven health) can move magnus_upstream_endpoints_healthy -- the
+# one difference being the endpoint this points at is `https://`, and the
+# backend that eventually comes up speaks TLS only. Reuses this file's own
+# tls-upstream-server.crt/.key (SAN already covers 127.0.0.1) generated
+# above; default health_check_interval_seconds/health_check_failure_threshold
+# (5s/3), same ~11-15s margin as M3.
+probe_upstream_tls_health=$((port + 140))
+port_health_tls=$((port + 141))
+cat > "$web_root/health-tls.conf" <<EOF
+port = $port_health_tls
+root = $tls_upstream_root
+upstream = https://127.0.0.1:$probe_upstream_tls_health
+upstream_tls_ca_file = $web_root/tls-upstream-server.crt
+EOF
+"$binary" --config "$web_root/health-tls.conf" 2>>"$log" &
+server_pid=$!
+for attempt in 1 2 3 4 5; do
+  curl --fail --silent "http://127.0.0.1:$port_health_tls/healthz" \
+    >/dev/null && break
+  sleep 1
+done
+unhealthy_seen=0
+for attempt in $(seq 1 18); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_health_tls/metrics" \
+      | grep -Eq '^magnus_upstream_endpoints_healthy 0$'; then
+    unhealthy_seen=1
+    break
+  fi
+done
+test "$unhealthy_seen" = 1
+
+python3 "$web_root/tls-upstream-backend.py" "$probe_upstream_tls_health" \
+  "$tls_upstream_root" "$web_root/tls-upstream-server.crt" \
+  "$web_root/tls-upstream-server.key" >/dev/null 2>&1 &
+backend_pid=$!
+recovered=0
+for attempt in $(seq 1 10); do
+  sleep 1
+  if curl --fail --silent "http://127.0.0.1:$port_health_tls/metrics" \
+      | grep -Eq '^magnus_upstream_endpoints_healthy 1$'; then
+    recovered=1
+    break
+  fi
+done
+test "$recovered" = 1
+kill -TERM "$server_pid"
+wait "$server_pid"
+server_pid=
+kill -TERM "$backend_pid"
+wait "$backend_pid" 2>/dev/null || true
+backend_pid=
+echo "health-check tls-awareness: active probe against a TLS-marked upstream finds it dead, then recovers it, purely via periodic probing (2f, see CHANGELOG.md 2.2.0)"

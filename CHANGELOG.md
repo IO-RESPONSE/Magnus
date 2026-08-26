@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.3.0
+
+### Added
+
+- **Active health checking (roadmap 2f) is now TLS-upstream-aware.**
+  Until this release, `magnus_health_tick()`'s prober always spoke
+  plaintext HTTP/1.1 to the probe target, regardless of whether the
+  cluster's endpoint was marked `https://` (1a-2, 2.2.0). Against a
+  TLS-only backend this meant the health-check state machine could
+  never see a real success: the plaintext request either hung until
+  timeout or was rejected outright by the backend's TLS listener, so a
+  perfectly healthy TLS-upstream endpoint was permanently reported
+  unhealthy by `/metrics`' `magnus_upstream_endpoints_healthy` gauge
+  even while real proxied traffic (which does go through
+  `magnus_upstream_tls_new()`/`magnus_upstream_tls_handshake()`
+  correctly) succeeded the whole time. This was a known, explicitly
+  documented gap from 2.2.0, not a newly discovered bug -- see that
+  section's TLS-upstream entry below and the 1a-2 note it points to in
+  docs/development-roadmap.md.
+
+  Fixed by reusing the same TLS machinery the live proxy path already
+  relies on: a probe against a `tls`-marked endpoint now creates its
+  `SSL*` via `magnus_upstream_tls_new()` right after `connect()`
+  returns, and the probe state machine gained a new
+  `MAGNUS_HEALTH_PROBE_TLS_HANDSHAKE` stage (between `CONNECTING` and
+  `SENDING`) that drives `magnus_upstream_tls_handshake()`
+  non-blockingly to completion before any HTTP bytes are sent; the
+  `SENDING`/`READING` stages now go through
+  `magnus_upstream_socket_write()`/`magnus_upstream_socket_read()`,
+  which already transparently do plaintext-or-TLS I/O for the live
+  proxy path. `magnus_health_close_probe()` now also calls `SSL_free()`
+  so a probe cycle never leaks the TLS session, on every exit path
+  (success, failure, and config-reload-triggered close). A plaintext
+  (non-`https://`) endpoint is entirely unaffected -- the new stage is
+  simply skipped, exactly as before.
+
+  Verified live against the host binary: a TLS-marked upstream
+  endpoint starts unhealthy (probe TLS handshake fails against an
+  untrusted cert, as expected), is brought healthy purely by periodic
+  background probing once a trusted cert is in place (zero real client
+  traffic sent, confirmed via the backend's own access log showing
+  only the prober's repeated TLS `GET`s), and probing across many
+  cycles leaks no fds (`/proc/<pid>/fd` count stable). Also covered
+  end-to-end in `tests/test-core.sh`.
+
 ## 2.2.0
 
 ### Added

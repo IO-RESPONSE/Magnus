@@ -1766,13 +1766,21 @@ static char magnus_health_check_path[MAGNUS_HEALTH_CHECK_PATH_MAX] = "/";
 static unsigned magnus_health_check_expected_status = 200;
 
 /* Per-endpoint active-probe state. A probe walks CONNECTING -> (HTTP mode
- * only) SENDING -> READING; a TCP-only probe (the gRPC cluster's own,
- * see below) resolves the instant CONNECTING succeeds, never entering the
- * other two stages. `response` accumulates just enough of the reply to
+ * only, and only for a `tls`-marked endpoint, roadmap 1a-2/2f)
+ * TLS_HANDSHAKE -> SENDING -> READING; a TCP-only probe (the gRPC cluster's
+ * own, see below) resolves the instant CONNECTING succeeds, never entering
+ * any of the other stages, and a plain-TCP HTTP-mode probe (the overwhelming
+ * common case) skips straight from CONNECTING to SENDING exactly as before
+ * TLS-awareness existed. `response` accumulates just enough of the reply to
  * read its status line -- this is a liveness probe, not a real HTTP
- * client, so the body is never read. */
+ * client, so the body is never read. `tls` is NULL for every probe except
+ * a TLS-marked endpoint's, in which case it is this probe's own client-side
+ * SSL* (see magnus_health_start_probe()'s own comment on why a probe needs
+ * its own SSL* rather than ever touching a pooled connection's) -- freed by
+ * magnus_health_close_probe() alongside the fd it rides on. */
 typedef enum {
     MAGNUS_HEALTH_PROBE_CONNECTING,
+    MAGNUS_HEALTH_PROBE_TLS_HANDSHAKE,
     MAGNUS_HEALTH_PROBE_SENDING,
     MAGNUS_HEALTH_PROBE_READING
 } magnus_health_probe_stage_t;
@@ -1781,6 +1789,7 @@ typedef struct {
     int fd;
     time_t started;
     magnus_health_probe_stage_t stage;
+    SSL *tls;
     char request[MAGNUS_HEALTH_CHECK_PATH_MAX + 64];
     size_t request_length;
     size_t request_sent;
@@ -13057,8 +13066,30 @@ magnus_expire_proxies(int epoll_fd, time_t now)
  * would just get every probe rejected by a perfectly healthy backend --
  * a false-negative regression, not real coverage. Still real coverage
  * over the pre-2f state, which ran no active probe against this cluster
- * at all. Both modes share one parameterized state machine below,
- * dispatched twice (once per cluster) from magnus_health_tick(). */
+ * at all. Both modes (plus the `stream_upstream` cluster's own
+ * TCP-connect-only probe, dispatched the same way as the gRPC one for the
+ * same reason) share one parameterized state machine below, dispatched
+ * once per cluster from magnus_health_tick().
+ *
+ * TLS-upstream awareness (closing the gap CHANGELOG.md's 2.2.0 entry and
+ * this file's own roadmap doc left open): a `tls`-marked `upstream`
+ * cluster endpoint (roadmap 1a-2) now gets its own client-side TLS
+ * handshake -- mirroring magnus_handle_upstream()'s real-proxy-traffic
+ * handshake exactly, same magnus_upstream_tls_new()/
+ * magnus_upstream_tls_handshake() helpers, same certificate verification
+ * behavior (upstream_tls_verify/upstream_tls_ca_file apply here
+ * identically) -- inserted as a new stage between CONNECTING and SENDING.
+ * Before this, an active probe against a TLS-only backend spoke plaintext
+ * HTTP/1.1 straight into what the backend's TLS listener saw as garbage,
+ * so the probe would time out (never a clean success or a clean
+ * rejection) every single tick -- a deployment relying on TLS-upstream
+ * and active health checking together got a permanently-marked-unhealthy
+ * endpoint even while it served real proxied traffic correctly. A probe
+ * never reuses a pooled connection's already-established TLS session (or
+ * its plain-TCP connection either, for that matter, same as before this
+ * increment) -- deliberately: an active probe's own connect attempt is
+ * itself part of what is being measured, so folding in a pool hit would
+ * silently skip the very handshake step this change exists to exercise. */
 
 static void
 magnus_health_close_probe(int epoll_fd, magnus_health_probe_t *probes,
@@ -13070,6 +13101,10 @@ magnus_health_close_probe(int epoll_fd, magnus_health_probe_t *probes,
     owner[fd] = 0;
     close(fd);
     probes[index].fd = -1;
+    if (probes[index].tls != NULL) {
+        SSL_free(probes[index].tls);
+        probes[index].tls = NULL;
+    }
 }
 
 static void
@@ -13149,12 +13184,32 @@ magnus_health_advance(int epoll_fd, magnus_cluster_t *cluster,
             magnus_health_succeed(epoll_fd, cluster, probes, owner, index);
             return;
         }
+        if (probe->tls != NULL) {
+            probe->stage = MAGNUS_HEALTH_PROBE_TLS_HANDSHAKE;
+            /* No rearm here -- magnus_upstream_tls_handshake() below sets
+             * epoll interest itself, exactly like magnus_handle_upstream()'s
+             * own real-proxy-traffic TLS block never rearms ahead of
+             * calling it either. */
+        } else {
+            probe->stage = MAGNUS_HEALTH_PROBE_SENDING;
+            magnus_health_rearm(epoll_fd, fd, EPOLLOUT | EPOLLRDHUP);
+        }
+    }
+    if (probe->stage == MAGNUS_HEALTH_PROBE_TLS_HANDSHAKE) {
+        int handshake_result = magnus_upstream_tls_handshake(epoll_fd, fd,
+                                                              probe->tls);
+        if (handshake_result < 0) {
+            magnus_health_fail(epoll_fd, cluster, probes, owner, index);
+            return;
+        }
+        if (handshake_result == 0) return;
         probe->stage = MAGNUS_HEALTH_PROBE_SENDING;
         magnus_health_rearm(epoll_fd, fd, EPOLLOUT | EPOLLRDHUP);
     }
     if (probe->stage == MAGNUS_HEALTH_PROBE_SENDING) {
         while (probe->request_sent < probe->request_length) {
-            ssize_t written = write(fd, probe->request + probe->request_sent,
+            ssize_t written = magnus_upstream_socket_write(fd, probe->tls,
+                                    probe->request + probe->request_sent,
                                     probe->request_length
                                     - probe->request_sent);
             if (written < 0) {
@@ -13175,7 +13230,8 @@ magnus_health_advance(int epoll_fd, magnus_cluster_t *cluster,
                 magnus_health_fail(epoll_fd, cluster, probes, owner, index);
                 return;
             }
-            received = read(fd, probe->response + probe->response_length,
+            received = magnus_upstream_socket_read(fd, probe->tls,
+                            probe->response + probe->response_length,
                             sizeof(probe->response) - probe->response_length);
             if (received < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -13226,9 +13282,36 @@ magnus_health_start_probe(int epoll_fd, magnus_cluster_t *cluster,
         magnus_cluster_result(cluster, index, false, magnus_now_ms());
         return;
     }
+    {
+        /* TLS-upstream-aware active health checking (roadmap 2f, closing
+         * the gap 1a-2 left open -- see this function's own block comment
+         * above magnus_health_close_probe()). Mirrors
+         * magnus_proxy_connect_endpoint()'s own ordering exactly: the SSL*
+         * is built right here, right after connect() opens (or starts
+         * opening) the TCP leg, before the fd is ever registered with
+         * epoll -- so a creation failure needs nothing but close(fd) to
+         * unwind, no epoll_ctl(DEL) required. Only ever true for `http_mode`
+         * (the gRPC/stream clusters' own endpoints never carry `tls` --
+         * grpc_upstream/stream_upstream reject the https:// scheme prefix
+         * outright, roadmap 1a-2). */
+        SSL *tls = NULL;
+        if (http_mode && index < cluster->count && cluster->endpoints[index].tls) {
+            tls = magnus_upstream_tls_new(index, cluster->endpoints[index].address,
+                                          fd);
+            if (tls == NULL) {
+                close(fd);
+                return;
+            }
+        }
+        probe->tls = tls;
+    }
     event = (struct epoll_event) { .events = EPOLLOUT | EPOLLRDHUP,
                                    .data.fd = fd };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        if (probe->tls != NULL) {
+            SSL_free(probe->tls);
+            probe->tls = NULL;
+        }
         close(fd);
         return;
     }
