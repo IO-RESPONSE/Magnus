@@ -117,8 +117,15 @@ checkpoint from the prior sub-phase being green.
    time: TLS-upstream connection reuse (no TLS upstream support existed
    at all yet -- out of this sub-phase's scope; closed in 1a-2 below) and
    connection draining as a distinct state (a connection mid-response
-   when its budget is hit is simply not pooled afterward, not actively
-   drained early -- still open).
+   when its budget is hit was simply not pooled afterward, not actively
+   drained early -- closed in 2.4.0: once a checkout attaches a specific
+   endpoint, magnus now knows immediately whether this request is that
+   connection's last permitted one under `MAGNUS_POOL_MAX_REQUESTS_PER_
+   CONNECTION`, and if so builds the outbound request with `Connection:
+   close` instead of the `keep-alive` every attempt starts out with, so
+   the backend can clean up right away rather than being surprised by an
+   abrupt close once magnus simply declines to re-pool it. See
+   CHANGELOG.md 2.4.0.).
 2. **1a-2 — TLS-upstream connections.** Closes the gap 1a's own paragraph
    above named: `upstream`/`--upstream` may now be written with an
    `https://` scheme prefix (`http://` is also accepted, as a no-op

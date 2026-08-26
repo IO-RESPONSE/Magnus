@@ -2024,6 +2024,8 @@ static void magnus_prepare_response(magnus_connection_t *connection,
                                     const char *content_type, const char *body,
                                     bool head_only, bool close_connection,
                                     magnus_request_t *request);
+static void magnus_proxy_teardown_upstream(int epoll_fd,
+                                           magnus_connection_t *connection);
 static char *magnus_find_header_end(char *buffer, size_t length);
 static int magnus_process_input(int epoll_fd, magnus_connection_t *connection);
 static int magnus_handle_write(int epoll_fd, magnus_connection_t *connection);
@@ -2770,6 +2772,52 @@ magnus_serve_cached_response(magnus_connection_t *connection,
  * instead of actually finding a working endpoint. A fresh cookie is minted
  * (for magnus_proxy_receive_headers() to issue via Set-Cookie once headers
  * arrive) whenever the client did not already carry a usable one. */
+
+/* Connection draining (roadmap 1a's other remaining gap, closed in 2.4.0):
+ * builds the h1 upstream request line + headers with `connection_directive`
+ * ("keep-alive" or "close") as the Connection header's value. Before this,
+ * every upstream request unconditionally offered keep-alive -- even one
+ * magnus already knew, before sending a single byte of it, would be the
+ * connection's last allowed use under MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION
+ * (magnus_pool_checkin() simply declined to re-pool it afterward, silently,
+ * once the response was already done). Sending "close" on that final
+ * request instead lets the backend clean up its own state immediately
+ * rather than finding out only when magnus hangs up on it -- "actively
+ * drained early" rather than "not pooled afterward". Shared by
+ * magnus_proxy_pick_and_start() (the fresh-request build, always
+ * "keep-alive" -- the budget for whichever endpoint ends up selected isn't
+ * known yet) and its own retry loop (which knows the selected endpoint's
+ * exact requests_served and rebuilds with "close" when this attempt is
+ * that connection's last one). Returns 0 and fills connection->proxy_request
+ * (+_length) on success, -1 if the formatted request would not fit (same
+ * as any other snprintf-into-fixed-buffer failure in this codebase --
+ * essentially unreachable given the header set involved, but never
+ * silently truncated). */
+static int
+magnus_proxy_build_request(magnus_connection_t *connection,
+                           const magnus_request_t *request,
+                           const char *forward_path,
+                           const char *conditional_headers,
+                           const char *connection_directive)
+{
+    int written = connection->body_length > 0
+        ? snprintf(connection->proxy_request, sizeof(connection->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: %s\r\nContent-Length: %zu\r\n"
+                   "X-Magnus-Request-Id: %s\r\n\r\n",
+                   request->method, forward_path, connection_directive,
+                   connection->body_length, request->request_id)
+        : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: %s\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
+                   request->method, forward_path, connection_directive,
+                   conditional_headers, request->request_id);
+    if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
+        return -1;
+    connection->proxy_request_length = (size_t) written;
+    return 0;
+}
+
 static int
 magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
                             magnus_request_t *request,
@@ -2956,21 +3004,9 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
             if (w > 0 && (size_t) w < sizeof(conditional_headers) - off) off += (size_t) w;
         }
     }
-    written = connection->body_length > 0
-        ? snprintf(connection->proxy_request, sizeof(connection->proxy_request),
-                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\nContent-Length: %zu\r\n"
-                   "X-Magnus-Request-Id: %s\r\n\r\n",
-                   request->method, forward_path,
-                   connection->body_length, request->request_id)
-        : snprintf(connection->proxy_request, sizeof(connection->proxy_request),
-                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
-                   request->method, forward_path, conditional_headers,
-                   request->request_id);
-    if (written < 0 || (size_t) written >= sizeof(connection->proxy_request))
+    if (magnus_proxy_build_request(connection, request, forward_path,
+                                   conditional_headers, "keep-alive") != 0)
         return -1;
-    connection->proxy_request_length = (size_t) written;
     connection->proxy_client_wants_close = client_wants_close;
     memcpy(connection->proxy_request_id, request->request_id,
           sizeof(connection->proxy_request_id));
@@ -2999,6 +3035,23 @@ magnus_proxy_pick_and_start(int epoll_fd, magnus_connection_t *connection,
         connection->proxy_attempt++;
         if (magnus_proxy_connect_endpoint(epoll_fd, connection,
                                           (size_t) endpoint) == 0) {
+            /* Connection draining (roadmap 1a's other remaining gap): the
+             * endpoint just attached is now known, so is exactly how many
+             * requests it has already served -- if this attempt would be
+             * its last allowed one, rebuild with "Connection: close"
+             * instead of the "keep-alive" every attempt started out with
+             * above (see magnus_proxy_build_request()'s own comment). A
+             * fresh (non-pooled) connection has requests_served==0 and can
+             * never trip this until MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION
+             * itself is absurdly small, so the common case pays nothing
+             * extra. */
+            if (connection->proxy_upstream_requests_served + 1
+                >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION
+                && magnus_proxy_build_request(connection, request, forward_path,
+                                              conditional_headers, "close") != 0) {
+                magnus_proxy_teardown_upstream(epoll_fd, connection);
+                return -1;
+            }
             if (connection->proxy_issue_affinity_cookie) {
                 magnus_encode_affinity_cookie(connection->proxy_affinity_key,
                                               sizeof(connection->proxy_affinity_key),
@@ -6542,6 +6595,33 @@ magnus_h2_proxy_compress_capture(struct magnus_h2_stream *stream,
     return true;
 }
 
+/* h2 analogue of magnus_proxy_build_request() -- see that function's own
+ * comment for the connection-draining rationale (roadmap 1a's other
+ * remaining gap, closed in 2.4.0). */
+static int
+magnus_h2_proxy_build_request(struct magnus_h2_stream *stream,
+                              const char *forward_path,
+                              const char *conditional_headers,
+                              const char *connection_directive)
+{
+    int written = stream->body_length > 0
+        ? snprintf(stream->proxy_request, sizeof(stream->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: %s\r\nContent-Length: %zu\r\n"
+                   "X-Magnus-Request-Id: %s\r\n\r\n",
+                   stream->parsed.method, forward_path, connection_directive,
+                   stream->body_length, stream->request_id)
+        : snprintf(stream->proxy_request, sizeof(stream->proxy_request),
+                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
+                   "Connection: %s\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
+                   stream->parsed.method, forward_path, connection_directive,
+                   conditional_headers, stream->request_id);
+    if (written < 0 || (size_t) written >= sizeof(stream->proxy_request))
+        return -1;
+    stream->proxy_request_length = (size_t) written;
+    return 0;
+}
+
 /* Entry point from magnus_h2_dispatch(): builds the outbound proxy
  * request (an h2 analogue of magnus_proxy_pick_and_start(), minus the
  * WebSocket branch -- see this block's own top-of-section comment for
@@ -6564,7 +6644,6 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
     char conditional_headers[300] = "";
     bool sticky;
     size_t preferred_index;
-    int written;
 
     magnus_generate_token(stream->request_id);
     strncpy(stream->log_method, stream->parsed.method,
@@ -6643,23 +6722,11 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
         }
     }
 
-    written = stream->body_length > 0
-        ? snprintf(stream->proxy_request, sizeof(stream->proxy_request),
-                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\nContent-Length: %zu\r\n"
-                   "X-Magnus-Request-Id: %s\r\n\r\n",
-                   stream->parsed.method, forward_path, stream->body_length,
-                   stream->request_id)
-        : snprintf(stream->proxy_request, sizeof(stream->proxy_request),
-                   "%s %s HTTP/1.0\r\nHost: magnus-upstream\r\n"
-                   "Connection: keep-alive\r\n%sX-Magnus-Request-Id: %s\r\n\r\n",
-                   stream->parsed.method, forward_path, conditional_headers,
-                   stream->request_id);
-    if (written < 0 || (size_t) written >= sizeof(stream->proxy_request)) {
+    if (magnus_h2_proxy_build_request(stream, forward_path, conditional_headers,
+                                      "keep-alive") != 0) {
         magnus_h2_proxy_fail(connection, stream, "502");
         return;
     }
-    stream->proxy_request_length = (size_t) written;
     stream->is_proxy = true;
 
     if (cookie_header != NULL)
@@ -6691,6 +6758,17 @@ magnus_h2_proxy_start(magnus_connection_t *connection,
         stream->attempt++;
         if (magnus_h2_proxy_connect_endpoint(connection, stream,
                                              (size_t) endpoint) == 0) {
+            /* Connection draining (roadmap 1a's other remaining gap) --
+             * see magnus_proxy_build_request()'s own comment; identical
+             * reasoning, h2-to-h1 upstream leg. */
+            if (stream->upstream_requests_served + 1
+                >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION
+                && magnus_h2_proxy_build_request(stream, forward_path,
+                                                 conditional_headers,
+                                                 "close") != 0) {
+                magnus_h2_proxy_fail(connection, stream, "502");
+                return;
+            }
             if (stream->issue_affinity_cookie) {
                 magnus_encode_affinity_cookie(stream->affinity_key,
                                               sizeof(stream->affinity_key),

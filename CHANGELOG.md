@@ -1,5 +1,68 @@
 # Changelog
 
+## 2.4.0
+
+### Added
+
+- **Connection draining as a distinct pool state (roadmap 1a).** Until
+  this release, magnus always offered the upstream `Connection:
+  keep-alive` on every proxied request, even one it already knew --
+  before sending a single byte of it -- would be that connection's last
+  permitted use under `MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION` (100).
+  `magnus_pool_checkin()` simply declined to re-pool such a connection
+  afterward, silently, once the response had already completed; the
+  backend itself never found out its budget was up until magnus hung up
+  on it unannounced. This was a known, explicitly documented gap left
+  open by 1a's own 1.2.0 entry below ("connection draining as a distinct
+  state ... still open").
+
+  Fixed by teaching both the h1 direct-proxy path
+  (`magnus_proxy_pick_and_start()`) and the h2-to-h1 proxy-dispatch path
+  (`magnus_h2_proxy_start()`) to check, immediately after a successful
+  pool checkout or fresh connect, whether the request about to be sent
+  would push that connection's `requests_served` to its budget --
+  `requests_served + 1 >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION`. If
+  so, the outbound request (already built once with "keep-alive", since
+  which endpoint will end up selected -- and thus its exact
+  `requests_served` -- isn't known until checkout succeeds) is rebuilt
+  with `Connection: close` instead, via two new shared helpers
+  (`magnus_proxy_build_request()` / `magnus_h2_proxy_build_request()`)
+  parameterized on the connection-directive string. A fresh (non-pooled)
+  connection always has `requests_served == 0` and can never trip this
+  until the budget constant itself is absurdly small, so the ordinary
+  case pays nothing extra. This is a genuine protocol-level improvement,
+  not just an internal bookkeeping change: the backend now gets to clean
+  up its own connection state immediately on receiving the final
+  request, rather than being surprised by an abrupt close it had no way
+  to anticipate -- "actively drained early" rather than "not pooled
+  afterward".
+
+  Verified live against the host binary on both paths, with
+  `MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION` temporarily lowered to 3 for
+  a short manual run: a raw-socket test backend logging each request's
+  received `Connection:` header value and connection lifecycle showed
+  the expected budget-of-3 grouping on both the h1 path (plain HTTP) and
+  the h2-to-h1 path (`curl --http2` over TLS) -- two "keep-alive"
+  requests followed by one "close" per connection, with the next request
+  always landing on a fresh connection. Added permanent coverage to
+  tests/test-core.sh's existing 1a connection-pool test (the same
+  backend used for the pre-existing 100-request-rollover check now also
+  reports the `Connection:` header value it received back to the test,
+  which asserts request #99 on the baseline connection stays
+  "keep-alive" and request #100 -- its last permitted one -- is
+  "close").
+
+  Verified: `make test` x2 clean, `make sanitize` clean (an intermediate
+  `make sanitize` attempt hit the same pre-existing flaky H2
+  rapid-reset/new-stream-flood assertion under ASan/UBSan's CPU overhead
+  already noted in 2.3.0's own entry below; a clean rerun confirmed it
+  again as unrelated timing-sensitivity, not a regression from this
+  change. One `make test` pass separately hit a one-off failure in the
+  unrelated reverse-proxy-cache test's exact-hit-count assertion; three
+  further consecutive clean passes -- including on a stashed, unmodified
+  checkout of this same test -- confirmed that, too, was a pre-existing
+  timing flake, not caused by this change).
+
 ## 2.3.0
 
 ### Added

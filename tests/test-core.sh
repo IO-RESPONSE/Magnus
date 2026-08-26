@@ -890,7 +890,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             next_id[0] += 1
             self.conn_id = next_id[0]
     def do_GET(self):
-        payload = ('id=' + str(self.conn_id)).encode()
+        chdr = self.headers.get('Connection', '?')
+        payload = ('id=' + str(self.conn_id) + ';chdr=' + chdr).encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
@@ -922,6 +923,7 @@ headers=$(curl --fail --silent --dump-header - --output /dev/null \
   "http://127.0.0.1:$port_pool/proxy/x")
 printf '%s' "$headers" | grep -qi '^Connection: keep-alive'
 baseline=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+baseline_id=$(printf '%s' "$baseline" | grep -o 'id=[0-9]*')
 
 # 10 requests over one reused *client* connection must all land on that
 # same pooled upstream connection id.
@@ -931,24 +933,41 @@ pooled_ten=$(curl --fail --silent \
   "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
   "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x" \
   "http://127.0.0.1:$port_pool/proxy/x" "http://127.0.0.1:$port_pool/proxy/x")
-test "$(printf '%s' "$pooled_ten" | grep -o 'id=[0-9]*' | sort -u)" = "$baseline"
+test "$(printf '%s' "$pooled_ten" | grep -o 'id=[0-9]*' | sort -u)" = "$baseline_id"
 
 # A brand-new *client* connection reusing that same pooled *upstream*
 # connection id is the actual point of a pool scoped to the endpoint
 # rather than to one client connection.
 eleventh=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
-test "$eleventh" = "$baseline"
+test "$(printf '%s' "$eleventh" | grep -o 'id=[0-9]*')" = "$baseline_id"
 
 # MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION (100) retires a connection right
 # on schedule. 13 requests have gone through the baseline connection so
 # far (the two that set `headers`/`baseline`, the 10-batch, and the
-# eleventh); 87 more brings it to exactly 100, so the very next one must
-# land on a second, distinct upstream connection id.
-for _ in $(seq 1 87); do
+# eleventh); 85 more brings it to 98, leaving exactly #99 and #100 to
+# capture explicitly before the rollover request.
+for _ in $(seq 1 85); do
   curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x" >/dev/null
 done
+
+# Connection draining (roadmap 1a's other remaining gap, closed in 2.4.0):
+# magnus used to always offer "Connection: keep-alive" to the upstream and
+# only passively decline to re-pool a connection once its budget was
+# already spent, never telling the backend in advance. #100 is this
+# connection's last permitted request -- it must now proactively carry
+# "Connection: close" so the backend can tear down immediately instead of
+# being surprised by an abrupt close, while #99 (still budget to spare)
+# is unaffected and stays "keep-alive".
+req99=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+req100=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
+test "$(printf '%s' "$req99" | grep -o 'id=[0-9]*')" = "$baseline_id"
+test "$(printf '%s' "$req100" | grep -o 'id=[0-9]*')" = "$baseline_id"
+printf '%s' "$req99" | grep -q 'chdr=keep-alive'
+printf '%s' "$req100" | grep -q 'chdr=close'
+
 rollover=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
-test "$rollover" != "$baseline"
+rollover_id=$(printf '%s' "$rollover" | grep -o 'id=[0-9]*')
+test "$rollover_id" != "$baseline_id"
 
 # A config reload must flush the pool: reused connections are indexed by
 # endpoint *position*, and a reload does not guarantee position N is still
@@ -956,7 +975,8 @@ test "$rollover" != "$baseline"
 kill -HUP "$server_pid"
 sleep 0.5
 after_reload=$(curl --fail --silent "http://127.0.0.1:$port_pool/proxy/x")
-test "$after_reload" != "$baseline" && test "$after_reload" != "$rollover"
+after_reload_id=$(printf '%s' "$after_reload" | grep -o 'id=[0-9]*')
+test "$after_reload_id" != "$baseline_id" && test "$after_reload_id" != "$rollover_id"
 
 kill -TERM "$server_pid"
 wait "$server_pid"
