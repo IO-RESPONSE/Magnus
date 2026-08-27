@@ -284,21 +284,34 @@ typedef struct {
      * see magnus_quic.h. */
     bool has_quic_listen;
     unsigned quic_listen_port;
-    /* Operator-configurable memory budget (roadmap 2.1.0) -- the same
-     * role nginx's own `proxy_cache_path ... keys_zone=name:size
-     * max_size=size` and `client_max_body_size` directives play,
-     * replacing this codebase's own pre-2.1.0 fixed compile-time
-     * caps (MAGNUS_CACHE_MAX_ENTRIES/_BYTES/_ENTRY_BYTES in
-     * magnus_cache.h, magnus_max_body in magnus.c). Right-sizing these
-     * for a given deployment depends entirely on the host it runs on --
-     * a single compile-time constant can never be correct for both a
-     * 2GB box and a 32GB one. Each is validated against a hard ceiling
+    /* Operator-configurable memory budget (roadmap 2.1.0), replacing
+     * this codebase's own pre-2.1.0 fixed compile-time caps
+     * (MAGNUS_CACHE_MAX_ENTRIES/_BYTES/_ENTRY_BYTES in magnus_cache.h,
+     * magnus_max_body in magnus.c). Right-sizing these for a given
+     * deployment depends entirely on the host it runs on -- a single
+     * compile-time constant can never be correct for both a 2GB box
+     * and a 32GB one. Each is validated against a hard ceiling
      * (see magnus_config_load()'s own doc comment below) that this
      * struct's fields alone cannot exceed even on a config typo. */
     size_t cache_max_entries;
     size_t cache_max_bytes;
     size_t cache_max_entry_bytes;
     size_t max_body_bytes;
+    /* FD/pool-ceiling relaxation (roadmap 5) -- same "operator-
+     * configurable, validated against a hard compile-time ceiling"
+     * pattern as the cache/body fields just above, applied to the
+     * three remaining fixed-size caps this codebase still carried:
+     * concurrent QUIC connections (magnus_quic_configure(), called
+     * once at startup, never from a reload), and the two idle/pooled
+     * upstream-connection caps (magnus_apply_config() applies both on
+     * every reload, safe because the pools are unconditionally
+     * drained first -- see MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_CEILING's
+     * and MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING's own
+     * comments in magnus.c). Config-file only, no CLI flag mirror --
+     * same precedent the cache fields above already set. */
+    size_t quic_max_connections;
+    unsigned pool_max_idle_per_endpoint;
+    unsigned grpc_pool_max_conns_per_endpoint;
 } magnus_config_t;
 
 typedef enum {
@@ -334,7 +347,12 @@ typedef enum {
  *     cache_max_bytes is 1-MAGNUS_CACHE_MAX_BYTES_CEILING (4 GiB),
  *     cache_max_entry_bytes is 1-MAGNUS_CACHE_MAX_ENTRY_BYTES_CEILING
  *     (512 MiB), max_body_bytes is 1-MAGNUS_MAX_BODY_CEILING (magnus.c,
- *     1 GiB))
+ *     1 GiB); quic_max_connections is
+ *     1-MAGNUS_QUIC_MAX_CONNECTIONS_CEILING (magnus_quic.c, 4096),
+ *     pool_max_idle_per_endpoint is
+ *     1-MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_CEILING (magnus.c, 128),
+ *     grpc_pool_max_conns_per_endpoint is
+ *     1-MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING (magnus.c, 64))
  *   - `port` is required; access_log defaults to "on" and
  *     access_log_sample defaults to 1 (log every request) when omitted;
  *     lb_policy defaults to "round_robin" when omitted; health_check_path
@@ -354,7 +372,10 @@ typedef enum {
  *     cache_max_entry_bytes to 8 MiB (magnus_cache.h's own pre-2.1.0
  *     fixed values, unchanged when omitted); max_body_bytes defaults to
  *     1 MiB (magnus.c's own pre-2.1.0 fixed value, unchanged when
- *     omitted)
+ *     omitted); quic_max_connections defaults to 256, pool_max_idle_
+ *     per_endpoint to 8, grpc_pool_max_conns_per_endpoint to 4
+ *     (this codebase's own pre-relaxation fixed values, unchanged
+ *     when omitted)
  *
  * On success returns MAGNUS_CONFIG_OK with `config` fully populated. On
  * failure returns MAGNUS_CONFIG_ERROR and writes a human-readable reason

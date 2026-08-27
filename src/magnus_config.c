@@ -180,6 +180,13 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
     config->cache_max_bytes = 64u * 1024 * 1024;
     config->cache_max_entry_bytes = 8u * 1024 * 1024;
     config->max_body_bytes = 1 * 1024 * 1024;
+    /* Defaults match this codebase's pre-relaxation fixed values --
+     * MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT (magnus_quic.c),
+     * MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_DEFAULT, and
+     * MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_DEFAULT (magnus.c). */
+    config->quic_max_connections = 256;
+    config->pool_max_idle_per_endpoint = 8;
+    config->grpc_pool_max_conns_per_endpoint = 4;
     config->upstream_tls_verify = true;
     if (error != NULL && error_capacity > 0) error[0] = '\0';
 
@@ -710,15 +717,15 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
             config->udp_session_idle_seconds = (unsigned) seconds;
         } else if (strcmp(key, "udp_max_sessions") == 0) {
             unsigned long sessions;
-            /* 4096 duplicates MAGNUS_UDP_MAX_SESSIONS_CEILING (magnus.c) --
+            /* 65536 duplicates MAGNUS_UDP_MAX_SESSIONS_CEILING (magnus.c) --
              * the fixed session-table array size the runtime actually
              * allocates -- the same "no shared symbol between magnus.c
              * and magnus_config.c" precedent every other duplicated
              * default/bound in this file already follows. */
-            if (!magnus_config_parse_uint(value, 1, 4096, &sessions)) {
+            if (!magnus_config_parse_uint(value, 1, 65536, &sessions)) {
                 magnus_config_set_error(error, error_capacity, line_number,
                                         "'udp_max_sessions' must be "
-                                        "1-4096, got '%s'", value);
+                                        "1-65536, got '%s'", value);
                 fclose(file);
                 return MAGNUS_CONFIG_ERROR;
             }
@@ -775,6 +782,49 @@ magnus_config_load(const char *path, magnus_config_t *config, char *error,
                 return MAGNUS_CONFIG_ERROR;
             }
             config->max_body_bytes = (size_t) bytes;
+        } else if (strcmp(key, "quic_max_connections") == 0) {
+            unsigned long connections;
+            /* 4096 duplicates MAGNUS_QUIC_MAX_CONNECTIONS_CEILING
+             * (magnus_quic.c) -- the fixed magnus_quic_connections[]/
+             * magnus_quic_cids[] array size actually allocated -- same
+             * "no shared symbol" precedent udp_max_sessions's own
+             * comment above already follows. Config-file only, no CLI
+             * flag mirror, same precedent cache_max_entries et al. set. */
+            if (!magnus_config_parse_uint(value, 1, 4096, &connections)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'quic_max_connections' must be "
+                                        "1-4096, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->quic_max_connections = (size_t) connections;
+        } else if (strcmp(key, "pool_max_idle_per_endpoint") == 0) {
+            unsigned long slots;
+            /* 128 duplicates MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_CEILING
+             * (magnus.c) -- the fixed magnus_pool_t.slots[] array size
+             * actually allocated -- same precedent. Config-file only. */
+            if (!magnus_config_parse_uint(value, 1, 128, &slots)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'pool_max_idle_per_endpoint' must "
+                                        "be 1-128, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->pool_max_idle_per_endpoint = (unsigned) slots;
+        } else if (strcmp(key, "grpc_pool_max_conns_per_endpoint") == 0) {
+            unsigned long conns;
+            /* 64 duplicates
+             * MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING (magnus.c)
+             * -- the fixed magnus_grpc_pool[][] grid dimension actually
+             * allocated -- same precedent. Config-file only. */
+            if (!magnus_config_parse_uint(value, 1, 64, &conns)) {
+                magnus_config_set_error(error, error_capacity, line_number,
+                                        "'grpc_pool_max_conns_per_endpoint' "
+                                        "must be 1-64, got '%s'", value);
+                fclose(file);
+                return MAGNUS_CONFIG_ERROR;
+            }
+            config->grpc_pool_max_conns_per_endpoint = (unsigned) conns;
         } else if (strcmp(key, "rate_limit_rps") == 0) {
             if (!magnus_config_parse_double(value, &config->rate_limit_rps)) {
                 magnus_config_set_error(error, error_capacity, line_number,

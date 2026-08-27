@@ -7,8 +7,11 @@ services:
     read_only: true
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
+        # Matches MAGNUS_MAX_FDS/MAGNUS_QUIC_MAX_FDS (src/magnus.c,
+        # src/magnus_quic.c) -- see MAGNUS_MAX_FDS's own comment on why
+        # this must not exceed that compiled-in array bound.
+        soft: 262144
+        hard: 262144
     tmpfs:
       # mode=1777 explicit: a bare --tmpfs mount defaults to owner
       # root, and magnusd runs as USER 65534 (Dockerfile) -- without

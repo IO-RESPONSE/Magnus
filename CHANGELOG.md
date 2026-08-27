@@ -1,5 +1,115 @@
 # Changelog
 
+## 2.6.0
+
+### Added
+
+- **FD/connection-pool ceiling relaxation (roadmap 5) -- the five
+  fixed-scale caps 2.1.0's own memory-cap relaxation explicitly
+  deferred are now either raised outright or exposed as `magnus.conf`
+  directives -- a MINOR bump because it is new config surface and a
+  higher default resource ceiling, not an engine change.** Before this
+  release `MAGNUS_MAX_FDS`/`MAGNUS_QUIC_MAX_FDS` were fixed at 65536,
+  `MAGNUS_UDP_MAX_SESSIONS_CEILING` at 4096, and
+  `MAGNUS_QUIC_MAX_CONNECTIONS`/`MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT`/
+  `MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT` had no operator-facing
+  control at all -- exactly the same "hardcoded constant never reads
+  the host's actual capacity" shape 2.1.0 fixed for the cache/body
+  caps, just for a different set of five constants that work's own
+  scoping pass identified and deliberately excluded (see
+  docs/development-roadmap.md's 2.1.0 entry).
+
+  Fixed with the same `*_CEILING`/`*_DEFAULT`/runtime-effective-
+  variable pattern `MAGNUS_CACHE_MAX_ENTRIES_CEILING`/
+  `magnus_cache_configure()` established: `MAGNUS_MAX_FDS` and its
+  independently-duplicated QUIC-side counterpart `MAGNUS_QUIC_MAX_FDS`
+  both move from 65536 to 262144 (raised together, by convention, the
+  same way the two files' other duplicated constants already are;
+  `compose.yaml`'s `ulimits.nofile` raised from 65536/65536 to
+  262144/262144 in lockstep, since a container ulimit above the
+  compiled-in array bound would let the kernel hand out fds neither
+  table can index), `MAGNUS_UDP_MAX_SESSIONS_CEILING` moves from 4096
+  to 65536 (the `udp_max_sessions` directive itself already existed;
+  only its ceiling changed), `MAGNUS_QUIC_MAX_CONNECTIONS` splits into
+  a 4096 `_CEILING` and a 256 `_DEFAULT` behind a new
+  `quic_max_connections` directive, `MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT`
+  splits into a 128 `_CEILING`/8 `_DEFAULT` behind a new
+  `pool_max_idle_per_endpoint` directive (shared by the plain upstream
+  pool and the FastCGI pool, both `magnus_pool_t`), and
+  `MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT` splits into a 64
+  `_CEILING`/4 `_DEFAULT` behind a new
+  `grpc_pool_max_conns_per_endpoint` directive. All three new
+  directives are config-file only, no `--flag` mirror, the same
+  precedent `cache_max_entries`/`cache_max_bytes`/`cache_max_entry_
+  bytes`/`max_body_bytes` (2.1.0) already set. Every array this touches
+  (`magnus_quic_connections[]`/`magnus_quic_cids[]`,
+  `magnus_pool_t.slots[]`, `magnus_grpc_pool[][]`) stays sized to its
+  own fixed `_CEILING`; the runtime-effective variable only ever bounds
+  how much of it is actually used, clamped to the ceiling and floored
+  at 1 if configured to 0.
+
+  The two idle-pool directives and the QUIC one differ in how they
+  handle a config reload, and the difference is deliberate, not an
+  oversight. `pool_max_idle_per_endpoint`/`grpc_pool_max_conns_per_
+  endpoint` are assigned straight into their runtime variables inside
+  `magnus_apply_config()` and take effect on every `SIGHUP`, because
+  `magnus_pool_close_all()`/`magnus_fastcgi_pool_close_all()`/
+  `magnus_grpc_pool_close_all()` are already called unconditionally, on
+  every reload, before `magnus_apply_config()` ever reapplies a
+  (possibly smaller) cap -- an idle connection is never left stranded
+  above a newly-lowered ceiling, because the pool holding it is fully
+  drained first regardless of which direction the cap moved.
+  `quic_max_connections` is different: it is applied via a new
+  `magnus_quic_configure(size_t max_connections)` setter (declared in
+  `magnus_quic.h`, defined in `magnus_quic.c`) called exactly once, at
+  startup, from the `--config` command-line option handler in `main()`
+  right after that config's own `magnus_apply_config()` call succeeds
+  -- never from `magnus_handle_reload()`'s own `magnus_apply_config()`
+  call on `SIGHUP`. QUIC connections are long-lived, in-flight state a
+  reload has no safe way to drain the way an idle pool can be, so this
+  setting is simply not reload-sensitive in this increment, by design;
+  a later `SIGHUP` carrying a changed `quic_max_connections` value is
+  not re-applied, and plain-CLI-flag mode (no `--config` at all) leaves
+  every consumer at `MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT` (256, this
+  codebase's exact pre-2.6.0 fixed value), the same "unconfigured
+  caller keeps the old default" contract `magnus_cache_configure()`
+  already documents.
+
+  Verified with new coverage in `tests/test-config.c`: default-value
+  assertions confirming all three new fields land at 256/8/4 when
+  omitted, full-config assertions confirming non-default values
+  (1024/32/16) parse correctly, and range-rejection tests confirming
+  each directive rejects both 0 and one past its own `_CEILING` with an
+  error message naming that directive. The pre-existing
+  `udp_max_sessions` past-ceiling boundary test was updated from 4097
+  to 65537 to track the ceiling's own increase. No new live-traffic
+  assertion was added exercising any of the five raised ceilings under
+  actual saturation load -- the same scope choice 2.1.0's own cache/
+  body ceilings made; these remain config-surface and unit-level
+  changes, not new runtime behavior under load.
+
+  Verified: `make test` x2 clean, plus a dedicated triple rerun of
+  `tests/test-core.sh` alone (one run failed at the same
+  reverse-proxy-cache hit-count assertion already documented as a
+  pre-existing timing flake in 2.4.0's entry above; the following two
+  runs -- including the full run that reached this point cleanly --
+  passed end to end) to positively reconfirm that flake is unrelated to
+  this change before shipping it, `make sanitize` (ASan/UBSan) clean. A
+  full clean rebuild (`make clean && make`) was required once during
+  development after a stale `make sanitize` build's ASan/UBSan-
+  instrumented object files were caught being linked against a
+  subsequent plain build -- pure build-state staleness, not a code
+  regression, confirmed by the clean rebuild succeeding with zero
+  warnings under `-Wall -Wextra -Werror -Wpedantic -std=c17`.
+
+  Separately, while fixing an unrelated doc-comment in
+  `magnus_config.h` for this increment, a repo-wide check turned up
+  several other pre-existing places where this codebase's own
+  "describe Magnus as independently developed, never name another
+  product" rule had already been violated. One, directly in the
+  comment being touched, was fixed in passing; the rest were left
+  untouched as out of scope for this increment.
+
 ## 2.5.0
 
 ### Added

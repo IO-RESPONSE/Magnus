@@ -78,10 +78,15 @@ main(void)
     assert(config.cache_max_bytes == 64u * 1024 * 1024);
     assert(config.cache_max_entry_bytes == 8u * 1024 * 1024);
     assert(config.max_body_bytes == 1 * 1024 * 1024);
+    /* FD/pool-ceiling relaxation (roadmap 5) defaults -- this codebase's
+     * own pre-relaxation fixed values, unchanged when omitted. */
+    assert(config.quic_max_connections == 256);
+    assert(config.pool_max_idle_per_endpoint == 8);
+    assert(config.grpc_pool_max_conns_per_endpoint == 4);
 
     /* full config: comments, blank lines, all fields */
     {
-        char content[1280];
+        char content[1536];
         snprintf(content, sizeof(content),
             "# a comment\n"
             "\n"
@@ -122,6 +127,9 @@ main(void)
             "cache_max_bytes = 134217728\n"
             "cache_max_entry_bytes = 16777216\n"
             "max_body_bytes = 2097152\n"
+            "quic_max_connections = 1024\n"
+            "pool_max_idle_per_endpoint = 32\n"
+            "grpc_pool_max_conns_per_endpoint = 16\n"
             "quic_listen = 9093\n"
             "admin_socket = %s/admin.sock\n",
             scratch_dir, cert_path, key_path, cert_path, scratch_dir);
@@ -197,6 +205,9 @@ main(void)
     assert(config.cache_max_bytes == 134217728);
     assert(config.cache_max_entry_bytes == 16777216);
     assert(config.max_body_bytes == 2097152);
+    assert(config.quic_max_connections == 1024);
+    assert(config.pool_max_idle_per_endpoint == 32);
+    assert(config.grpc_pool_max_conns_per_endpoint == 16);
 
     /* TLS-upstream connection support (roadmap 1a-2): the "https://" (and
      * "http://", as a no-op courtesy) scheme prefix is only accepted on
@@ -363,7 +374,10 @@ main(void)
     assert(strstr(error, "udp_max_sessions") != NULL);
     write_file(config_path,
         "port = 8080\nudp_listen = 9092\n"
-        "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 4097\n");
+        /* FD/pool-ceiling relaxation (roadmap 5) raised
+         * MAGNUS_UDP_MAX_SESSIONS_CEILING from 4096 to 65536 -- 65537 is
+         * the new past-ceiling boundary. */
+        "udp_upstream = 10.0.0.1:9000\nudp_max_sessions = 65537\n");
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
 
@@ -398,6 +412,34 @@ main(void)
            == MAGNUS_CONFIG_ERROR);
     assert(strstr(error, "max_body_bytes") != NULL);
     write_file(config_path, "port = 8080\nmax_body_bytes = 1073741825\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+
+    /* FD/pool-ceiling relaxation (roadmap 5): quic_max_connections/
+     * pool_max_idle_per_endpoint/grpc_pool_max_conns_per_endpoint each
+     * reject 0 and anything past their own *_CEILING, same two-sided
+     * range check as every directive above. */
+    write_file(config_path, "port = 8080\nquic_max_connections = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "quic_max_connections") != NULL);
+    write_file(config_path, "port = 8080\nquic_max_connections = 4097\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path, "port = 8080\npool_max_idle_per_endpoint = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "pool_max_idle_per_endpoint") != NULL);
+    write_file(config_path, "port = 8080\npool_max_idle_per_endpoint = 129\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    write_file(config_path,
+        "port = 8080\ngrpc_pool_max_conns_per_endpoint = 0\n");
+    assert(magnus_config_load(config_path, &config, error, sizeof(error))
+           == MAGNUS_CONFIG_ERROR);
+    assert(strstr(error, "grpc_pool_max_conns_per_endpoint") != NULL);
+    write_file(config_path,
+        "port = 8080\ngrpc_pool_max_conns_per_endpoint = 65\n");
     assert(magnus_config_load(config_path, &config, error, sizeof(error))
            == MAGNUS_CONFIG_ERROR);
 

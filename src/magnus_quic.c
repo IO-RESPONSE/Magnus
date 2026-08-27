@@ -40,8 +40,18 @@
  * freed), so MAGNUS_QUIC_MAX_CIDS only needs enough headroom for a
  * handshake's own initial handful of issued CIDs per connection, not
  * an unbounded accumulation. */
-#define MAGNUS_QUIC_MAX_CONNECTIONS 256
-#define MAGNUS_QUIC_MAX_CIDS (MAGNUS_QUIC_MAX_CONNECTIONS * 8)
+/* FD/pool-ceiling relaxation: MAGNUS_QUIC_MAX_CONNECTIONS_CEILING is the
+ * fixed magnus_quic_connections[]/magnus_quic_cids[] array size actually
+ * allocated; magnus_quic_max_connections_effective (below) is the
+ * runtime-effective budget magnus_quic_configure() sets, clamped to this
+ * ceiling -- the same pattern MAGNUS_CACHE_MAX_ENTRIES_CEILING/
+ * magnus_cache_configure() (magnus_cache.h/.c) already established.
+ * MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT (256) is this codebase's
+ * pre-relaxation fixed value, unchanged as the default a config that
+ * omits quic_max_connections (magnus_config.h) still gets. */
+#define MAGNUS_QUIC_MAX_CONNECTIONS_CEILING 4096
+#define MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT 256
+#define MAGNUS_QUIC_MAX_CIDS (MAGNUS_QUIC_MAX_CONNECTIONS_CEILING * 8)
 #define MAGNUS_QUIC_RECV_BUFFER 65536
 #define MAGNUS_QUIC_SEND_BUFFER 65536
 /* One second on Magnus's own coarse per-tick clock (magnus_quic_tick()
@@ -107,8 +117,14 @@
  * magnus_static.h) to ever be serviced at all -- a QUIC connection has
  * no fd of its own for that epoll registration to piggyback on (see
  * magnus_quic.h's own top comment). Sized to match magnus.c's own
- * MAGNUS_MAX_FDS so every fd this process could ever open has a slot. */
-#define MAGNUS_QUIC_MAX_FDS 65536
+ * MAGNUS_MAX_FDS so every fd this process could ever open has a slot --
+ * raised to 262144 in lockstep with that macro (roadmap 5 FD/pool-
+ * ceiling relaxation); the two are independently duplicated by
+ * convention (see magnus_now_ms_local()'s own comment on why this
+ * codebase doesn't thread every such small constant across a shared
+ * header) rather than by a shared symbol, so this one must be kept in
+ * sync by hand whenever magnus.c's own MAGNUS_MAX_FDS changes. */
+#define MAGNUS_QUIC_MAX_FDS 262144
 
 typedef struct {
     bool in_use;
@@ -441,8 +457,24 @@ typedef struct {
     int slot;
 } magnus_quic_cid_entry_t;
 
-static magnus_quic_connection_t magnus_quic_connections[MAGNUS_QUIC_MAX_CONNECTIONS];
+static magnus_quic_connection_t
+    magnus_quic_connections[MAGNUS_QUIC_MAX_CONNECTIONS_CEILING];
 static magnus_quic_cid_entry_t magnus_quic_cids[MAGNUS_QUIC_MAX_CIDS];
+/* Runtime-effective budget -- see magnus_quic_configure()'s own doc
+ * comment in magnus_quic.h. Defaults to _DEFAULT so a caller that never
+ * calls magnus_quic_configure() at all (every test binary that links
+ * this module directly, for one) still gets this codebase's
+ * pre-relaxation fixed behavior unchanged. */
+static size_t magnus_quic_max_connections_effective =
+    MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT;
+
+void
+magnus_quic_configure(size_t max_connections)
+{
+    magnus_quic_max_connections_effective = max_connections == 0 ? 1
+        : (max_connections > MAGNUS_QUIC_MAX_CONNECTIONS_CEILING
+           ? MAGNUS_QUIC_MAX_CONNECTIONS_CEILING : max_connections);
+}
 static SSL_CTX *magnus_quic_ssl_ctx;
 static uint8_t magnus_quic_static_secret[32];
 static bool magnus_quic_initialized;
@@ -580,7 +612,7 @@ static int
 magnus_quic_slot_alloc(void)
 {
     int index;
-    for (index = 0; index < MAGNUS_QUIC_MAX_CONNECTIONS; index++) {
+    for (index = 0; index < (int)magnus_quic_max_connections_effective; index++) {
         if (!magnus_quic_connections[index].in_use) return index;
     }
     return -1;
@@ -4063,7 +4095,7 @@ void
 magnus_quic_tick(int listener_fd, time_t now)
 {
     int slot;
-    for (slot = 0; slot < MAGNUS_QUIC_MAX_CONNECTIONS; slot++) {
+    for (slot = 0; slot < (int)magnus_quic_max_connections_effective; slot++) {
         magnus_quic_connection_t *connection = &magnus_quic_connections[slot];
         ngtcp2_tstamp expiry;
         ngtcp2_tstamp ts;
@@ -4095,7 +4127,7 @@ void
 magnus_quic_shutdown(void)
 {
     int slot;
-    for (slot = 0; slot < MAGNUS_QUIC_MAX_CONNECTIONS; slot++) {
+    for (slot = 0; slot < (int)magnus_quic_max_connections_effective; slot++) {
         if (magnus_quic_connections[slot].in_use)
             magnus_quic_slot_free(slot);
     }

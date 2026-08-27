@@ -125,6 +125,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -137,7 +138,7 @@
  * shared string constant and this was the simplest way to give magnus.c
  * and magnus_quic.c one shared definition instead of two that could
  * drift. */
-#define MAGNUS_VERSION "2.5.0"
+#define MAGNUS_VERSION "2.6.0"
 
 /* One-time global setup: builds the QUIC-specific SSL_CTX (TLS 1.3
  * only, ALPN "h3", the same server certificate/key the HTTPS listener
@@ -146,6 +147,32 @@
  * magnus_quic_create_listener(), only when QUIC is actually enabled.
  * Returns 0 on success, -1 on failure (message already on stderr). */
 int magnus_quic_init(const char *tls_cert, const char *tls_key);
+
+/* Sets the runtime-effective concurrent-QUIC-connection budget (roadmap
+ * FD/pool-ceiling relaxation), clamped to MAGNUS_QUIC_MAX_CONNECTIONS_
+ * CEILING (magnus_quic.c -- the fixed magnus_quic_connections[]/
+ * magnus_quic_cids[] array size actually allocated), the same "runtime
+ * value <= a fixed *_CEILING array size" pattern
+ * MAGNUS_UDP_MAX_SESSIONS_CEILING/magnus_udp_max_sessions (magnus.c)
+ * and MAGNUS_CACHE_MAX_ENTRIES_CEILING/magnus_cache_configure()
+ * (magnus_cache.h/.c) already established. Unlike those two, this is
+ * called exactly once, at startup during --config option parsing
+ * (magnus.c, right after that same config's magnus_apply_config() call
+ * succeeds -- ordering relative to magnus_quic_init() itself, called
+ * later once listener setup begins, does not matter, since nothing
+ * allocates a QUIC connection slot before the event loop starts), never
+ * from magnus_handle_reload()'s own magnus_apply_config() call on
+ * SIGHUP -- QUIC connections are long-lived, in-flight state a reload
+ * cannot safely drain out from under (unlike the idle connection pools
+ * magnus_apply_config() already unconditionally flushes before
+ * reapplying their own analogous caps), so this setting simply isn't
+ * reload-sensitive, by design, in this increment. Never called at all
+ * (plain-CLI-flag mode, with no quic_max_connections directive to read
+ * at all) leaves every consumer at this file's own MAGNUS_QUIC_MAX_
+ * CONNECTIONS_DEFAULT (256, this codebase's pre-relaxation fixed
+ * behavior), same "unconfigured caller keeps the old default" contract
+ * magnus_cache_configure() documents. */
+void magnus_quic_configure(size_t max_connections);
 
 /* Creates, binds (0.0.0.0:`port`), and returns a non-blocking UDP
  * listener fd for the caller to register with epoll (EPOLLIN). Returns

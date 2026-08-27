@@ -46,7 +46,20 @@
 /* MAGNUS_VERSION itself now lives in magnus_quic.h (included below) --
  * see that header's own comment on why. */
 #define MAGNUS_MAX_EVENTS 1024
-#define MAGNUS_MAX_FDS 65536
+/* FD/pool-ceiling relaxation (roadmap 5): raised from this codebase's
+ * original 65536. Every magnus_*_owner[]/magnus_connections[]-shaped
+ * array in this file is sized directly off this one macro (grep
+ * confirms none hand-duplicate the old literal), so widening it here
+ * is the whole change on this side; magnus_quic.c's own, independently
+ * duplicated MAGNUS_QUIC_MAX_FDS must be raised in lockstep (see that
+ * macro's own cross-referencing comment), and compose.yaml's
+ * ulimits.nofile soft/hard must match this new value -- a process
+ * whose actual rlimit exceeds this array bound just silently drops any
+ * fd at or past MAGNUS_MAX_FDS (see the `client >= MAGNUS_MAX_FDS`
+ * check below), so a smaller container ulimit is safe (accept() itself
+ * caps how high an fd can even get) but a larger one would silently
+ * reintroduce that drop. */
+#define MAGNUS_MAX_FDS 262144
 #define MAGNUS_INPUT_LIMIT 8192
 /* Operator-configurable (roadmap 2.1.0), the same role nginx's own
  * `client_max_body_size` plays -- see magnus_config.h's own
@@ -233,7 +246,20 @@ static size_t magnus_max_body = MAGNUS_MAX_BODY_DEFAULT;
 #define MAGNUS_CLUSTER_FAILURE_THRESHOLD 3
 #define MAGNUS_CLUSTER_COOLDOWN_MS 5000
 #define MAGNUS_RATE_TABLE_SIZE 512
-#define MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT 8
+/* FD/pool-ceiling relaxation (roadmap 5): MAGNUS_POOL_MAX_IDLE_PER_
+ * ENDPOINT_CEILING sizes each pool's fixed slots[] array (magnus_pool_t,
+ * below); magnus_pool_max_idle_per_endpoint is the runtime-effective cap
+ * magnus_apply_config() sets from config->pool_max_idle_per_endpoint,
+ * clamped to this ceiling -- the same pattern MAGNUS_CACHE_MAX_ENTRIES_
+ * CEILING/magnus_cache_configure() (magnus_cache.h/.c) established.
+ * _DEFAULT (8) is this codebase's pre-relaxation fixed value, unchanged
+ * for a config that omits pool_max_idle_per_endpoint. Safe to substitute
+ * everywhere including sweep/close loops: magnus_pool_close_all() drains
+ * every pool unconditionally before magnus_apply_config() ever reapplies
+ * a (possibly smaller) cap, so a downward reload can never strand a slot
+ * a shrunk loop bound would no longer scan. */
+#define MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_CEILING 128
+#define MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_DEFAULT 8
 #define MAGNUS_POOL_IDLE_TIMEOUT_SECONDS 60
 #define MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION 100
 /* gRPC upstream connection pool + multiplexing (roadmap 2c-5): unlike the
@@ -252,7 +278,18 @@ static size_t magnus_max_body = MAGNUS_MAX_BODY_DEFAULT;
  * measure (picking up DNS/config changes, not letting one connection's
  * memory live forever) -- set far higher than the h1 pool's own 100,
  * since one h2 stream is far cheaper than one full HTTP/1.1 connection. */
-#define MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT 4
+/* FD/pool-ceiling relaxation (roadmap 5): MAGNUS_GRPC_POOL_MAX_CONNS_
+ * PER_ENDPOINT_CEILING sizes the fixed magnus_grpc_pool[][] grid (below);
+ * magnus_grpc_pool_max_conns_per_endpoint is the runtime-effective cap
+ * magnus_apply_config() sets from config->grpc_pool_max_conns_per_
+ * endpoint, clamped to this ceiling -- same pattern as MAGNUS_POOL_MAX_
+ * IDLE_PER_ENDPOINT_CEILING above. _DEFAULT (4) is this codebase's
+ * pre-relaxation fixed value. Safe to substitute everywhere including
+ * sweep loops for the same reason given there: magnus_grpc_pool_close_
+ * all() unconditionally drains every grid slot before magnus_apply_
+ * config() reapplies a (possibly smaller) cap. */
+#define MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING 64
+#define MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_DEFAULT 4
 #define MAGNUS_GRPC_POOL_IDLE_TIMEOUT_SECONDS 60
 #define MAGNUS_GRPC_POOL_MAX_REQUESTS_PER_CONNECTION 100000
 /* How often a hostname upstream is re-resolved. Fixed, not the record's
@@ -1065,7 +1102,15 @@ static size_t magnus_sni_cluster_count;
  * magnus_cluster_endpoint_begin()/_end() every other cluster's own
  * `active_requests` field already tracks, reused here unmodified for
  * "sessions currently pinned to this endpoint" instead of "requests". */
-#define MAGNUS_UDP_MAX_SESSIONS_CEILING 4096
+/* FD/pool-ceiling relaxation (roadmap 5): raised from this codebase's
+ * original 4096 -- magnus_udp_max_sessions itself was already fully
+ * runtime-configurable (config.c's udp_max_sessions directive/--udp-max-
+ * sessions flag) up to whatever this ceiling was; only the ceiling
+ * itself, and the fixed magnus_udp_sessions[] array it sizes, are
+ * changing here. magnus_udp_find_session()'s own doc comment already
+ * discloses the linear-scan cost this bounds -- raising the bound is
+ * the same already-accepted trade-off at a larger size, not a new one. */
+#define MAGNUS_UDP_MAX_SESSIONS_CEILING 65536
 #define MAGNUS_UDP_DATAGRAM_MAX MAGNUS_PROXY_BUFFER
 
 static magnus_cluster_t magnus_udp_cluster;
@@ -1318,12 +1363,17 @@ typedef struct magnus_grpc_conn {
 } magnus_grpc_conn_t;
 
 /* Fixed grid rather than a free list: MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS (8)
- * endpoints x MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT (4) is 32 slots at
- * most, trivial to scan linearly every time (magnus_grpc_conn_pick(),
- * magnus_grpc_pool_expire(), magnus_grpc_pool_close_all()) without any
+ * endpoints x MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING (64) is
+ * at most 512 slots, trivial to scan linearly every time
+ * (magnus_grpc_conn_pick(), magnus_grpc_pool_expire(),
+ * magnus_grpc_pool_close_all()) without any
  * allocation or bookkeeping beyond each slot's own `in_use`. */
 static magnus_grpc_conn_t
-    magnus_grpc_pool[MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS][MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT];
+    magnus_grpc_pool[MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS][MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING];
+/* Runtime-effective per-endpoint cap -- see MAGNUS_GRPC_POOL_MAX_CONNS_
+ * PER_ENDPOINT_CEILING's own comment above. */
+static size_t magnus_grpc_pool_max_conns_per_endpoint =
+    MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_DEFAULT;
 /* Parallel to magnus_h2_upstream_owner[] above, but keyed to a pooled
  * gRPC connection instead of a single stream -- one fd here can be
  * driving many concurrent client-side streams' upstream leg at once. */
@@ -1356,9 +1406,16 @@ typedef struct {
 } magnus_pool_slot_t;
 
 typedef struct {
-    magnus_pool_slot_t slots[MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT];
+    magnus_pool_slot_t slots[MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_CEILING];
     size_t count;
 } magnus_pool_t;
+
+/* Runtime-effective per-endpoint idle-slot cap, shared by both
+ * magnus_upstream_pool[] and magnus_fastcgi_pool[] below (both use this
+ * same magnus_pool_t shape) -- see MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_
+ * CEILING's own comment above. */
+static size_t magnus_pool_max_idle_per_endpoint =
+    MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT_DEFAULT;
 
 static magnus_pool_t magnus_upstream_pool[MAGNUS_MAX_UPSTREAMS];
 
@@ -1434,7 +1491,7 @@ magnus_fastcgi_pool_checkin(size_t endpoint_index, int fd,
         return;
     }
     pool = &magnus_fastcgi_pool[endpoint_index];
-    if (pool->count == MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT
+    if (pool->count >= magnus_pool_max_idle_per_endpoint
         || requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
         close(fd);
         return;
@@ -1580,7 +1637,7 @@ magnus_pool_checkin(size_t endpoint_index, int fd, unsigned requests_served,
         return;
     }
     pool = &magnus_upstream_pool[endpoint_index];
-    if (pool->count == MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT
+    if (pool->count >= magnus_pool_max_idle_per_endpoint
         || requests_served >= MAGNUS_POOL_MAX_REQUESTS_PER_CONNECTION) {
         if (tls != NULL) SSL_free(tls);
         close(fd);
@@ -8695,9 +8752,9 @@ magnus_grpc_conn_drain_send(magnus_grpc_conn_t *conn)
  * that pool's own comment), a pooled gRPC connection is a live nghttp2
  * session that can receive an unsolicited GOAWAY or PING at any moment,
  * and a genuinely idle connection sitting registered costs nothing
- * meaningful given how small this pool is (at most
- * MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS * MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT
- * fds total). */
+ * meaningful given how small this pool typically is (at most
+ * MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS * MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT_CEILING
+ * fds in the worst case, far fewer in practice at the _DEFAULT cap). */
 static int
 magnus_grpc_conn_update_interest(int epoll_fd, magnus_grpc_conn_t *conn)
 {
@@ -8894,7 +8951,7 @@ magnus_grpc_conn_open(size_t endpoint_index)
     int fd, result;
 
     if (endpoint_index >= MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS) return NULL;
-    for (size_t i = 0; i < MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT; i++) {
+    for (size_t i = 0; i < magnus_grpc_pool_max_conns_per_endpoint; i++) {
         if (!magnus_grpc_pool[endpoint_index][i].in_use) {
             conn = &magnus_grpc_pool[endpoint_index][i];
             break;
@@ -8985,7 +9042,7 @@ magnus_grpc_conn_open(size_t endpoint_index)
  * Deliberately prefers opening a brand-new connection over piling onto an
  * existing one whenever the pool still has room *and* the least-loaded
  * existing connection already has any real load on it at all: with
- * MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT connections available, the
+ * magnus_grpc_pool_max_conns_per_endpoint connections available, the
  * first few concurrent RPCs to a given endpoint each get their own
  * dedicated connection (maximum parallelism, no head-of-line blocking
  * between unrelated RPCs sharing one connection's own flow-control
@@ -9011,7 +9068,7 @@ magnus_grpc_conn_pick(size_t endpoint_index)
 {
     magnus_grpc_conn_t *best = NULL;
     if (endpoint_index >= MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS) return NULL;
-    for (size_t i = 0; i < MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT; i++) {
+    for (size_t i = 0; i < magnus_grpc_pool_max_conns_per_endpoint; i++) {
         magnus_grpc_conn_t *conn = &magnus_grpc_pool[endpoint_index][i];
         if (!conn->in_use || magnus_grpc_conn_retiring(conn)) continue;
         if (best == NULL || conn->active_streams < best->active_streams)
@@ -9280,7 +9337,7 @@ magnus_grpc_pool_close_all(void)
 {
     for (size_t endpoint = 0; endpoint < MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS;
          endpoint++) {
-        for (size_t i = 0; i < MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT; i++) {
+        for (size_t i = 0; i < magnus_grpc_pool_max_conns_per_endpoint; i++) {
             magnus_grpc_conn_t *conn = &magnus_grpc_pool[endpoint][i];
             if (!conn->in_use) continue;
             if (conn->active_streams > 0)
@@ -9315,7 +9372,7 @@ magnus_grpc_pool_expire(time_t now)
 {
     for (size_t endpoint = 0; endpoint < MAGNUS_CONFIG_MAX_GRPC_UPSTREAMS;
          endpoint++) {
-        for (size_t i = 0; i < MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT; i++) {
+        for (size_t i = 0; i < magnus_grpc_pool_max_conns_per_endpoint; i++) {
             magnus_grpc_conn_t *conn = &magnus_grpc_pool[endpoint][i];
             if (!conn->in_use) continue;
             if (!conn->connected) {
@@ -12835,9 +12892,9 @@ magnus_accept_connections(int epoll_fd, int listener, bool admin)
                  * CPU's time for as long as the pressure lasts. This is
                  * reachable by nothing more exotic than opening enough
                  * connections to hit RLIMIT_NOFILE (frequently 1024 by
-                 * default, well below MAGNUS_MAX_FDS's own 65536 array
-                 * bound above) and holding them open within the ordinary
-                 * idle timeout -- no malformed input of any kind needed.
+                 * default, well below MAGNUS_MAX_FDS's own array bound
+                 * above) and holding them open within the ordinary idle
+                 * timeout -- no malformed input of any kind needed.
                  *
                  * Fixed the same way nginx's own ngx_disable_accept_
                  * events() does: stop watching this listener at all
@@ -14908,6 +14965,15 @@ magnus_apply_config(const magnus_config_t *config)
     magnus_max_body = config->max_body_bytes;
     magnus_cache_configure(config->cache_max_entries, config->cache_max_bytes,
                            config->cache_max_entry_bytes);
+    /* FD/pool-ceiling relaxation (roadmap 5): safe as a straight
+     * overwrite here, same as magnus_cache_configure() just above --
+     * magnus_pool_close_all()/magnus_grpc_pool_close_all() already ran
+     * unconditionally earlier in this same function, so every slot
+     * this reload could possibly shrink a scan bound past has already
+     * been drained; there is nothing left for a smaller cap to strand. */
+    magnus_pool_max_idle_per_endpoint = config->pool_max_idle_per_endpoint;
+    magnus_grpc_pool_max_conns_per_endpoint =
+        config->grpc_pool_max_conns_per_endpoint;
     /* Same stale-by-position hazard once more (roadmap 2f): an in-flight
      * active-health probe for old position N belongs to whatever backend
      * used to be there, not necessarily the new cluster's position N.
@@ -15057,6 +15123,22 @@ magnus_parse_options(int argc, char **argv)
                             "resource could not be opened\n");
             exit(2);
         }
+        /* FD/pool-ceiling relaxation (roadmap 5): unlike pool_max_idle_
+         * per_endpoint/grpc_pool_max_conns_per_endpoint above (both
+         * reload-safe, wired into magnus_apply_config() itself), QUIC
+         * connections are long-lived, in-flight state a reload cannot
+         * safely drain -- so magnus_quic_configure() is called exactly
+         * once, here at startup, never from magnus_handle_reload()'s own
+         * magnus_apply_config() call. A later SIGHUP's quic_max_
+         * connections value (if changed) is simply not re-applied, the
+         * same "this setting isn't reload-sensitive" contract magnus_
+         * quic_configure()'s own doc comment (magnus_quic.h) documents.
+         * Plain-CLI-flag mode (no --config, no quic_max_connections
+         * directive to read at all) never calls this, leaving every
+         * consumer at MAGNUS_QUIC_MAX_CONNECTIONS_DEFAULT -- same
+         * "unconfigured caller keeps the old default" contract every
+         * other relaxed ceiling in this increment already follows. */
+        magnus_quic_configure(config.quic_max_connections);
         if (config.has_admin_socket) {
             strcpy(magnus_admin_socket_path, config.admin_socket);
             magnus_admin_enabled = true;

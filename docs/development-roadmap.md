@@ -2135,13 +2135,68 @@ connection-pool and common-request-model decisions).
   done for this increment (no Dockerfile-baked `magnus.conf` change was
   needed; the shipped image's defaults are unaffected).
 
-  **Deferred to a later increment, not started:** relaxing the
-  remaining fixed-scale caps this work's own initial scoping pass
-  identified but excluded — FD-table-scale limits (`MAGNUS_MAX_FDS`,
-  `MAGNUS_QUIC_MAX_CONNECTIONS`, `MAGNUS_UDP_MAX_SESSIONS_CEILING`) and
-  per-endpoint connection-pool sizes (`MAGNUS_POOL_MAX_IDLE_PER_
-  ENDPOINT`, `MAGNUS_GRPC_POOL_MAX_CONNS_PER_ENDPOINT`) — not yet
-  confirmed as in-scope with the user.
+- **FD/connection-pool ceiling relaxation (2.6.0) — the five fixed-scale
+  caps 2.1.0 above deliberately excluded.** Picked up once the user
+  chose it over the remaining 1e-6+ leftovers (response trailers/
+  WebSocket-over-h2/dispatch generalization) as the next increment.
+  Same "runtime value <= a fixed `*_CEILING` array-dimensioning size"
+  pattern 2.1.0 established, applied to all five: `MAGNUS_MAX_FDS`/
+  `MAGNUS_QUIC_MAX_FDS` (65536 → 262144, the epoll-events-table and
+  QUIC-side fd-tracking array bounds — raised in lockstep, and
+  `compose.yaml`'s `ulimits.nofile` raised to match, since a container
+  ulimit above the compiled-in array bound would let the kernel hand
+  out fds Magnus's own tables can't index), `MAGNUS_UDP_MAX_SESSIONS_
+  CEILING` (4096 → 65536; `udp_max_sessions` itself was already a
+  config directive since before this increment — only its ceiling
+  moved), `MAGNUS_QUIC_MAX_CONNECTIONS` (split into a 4096 `_CEILING`
+  and a 256 `_DEFAULT`, now settable via a new `quic_max_connections`
+  directive), and the two per-endpoint idle-pool sizes,
+  `MAGNUS_POOL_MAX_IDLE_PER_ENDPOINT` (128 `_CEILING`/8 `_DEFAULT`,
+  new `pool_max_idle_per_endpoint` directive, shared by both the plain
+  upstream pool and the FastCGI pool) and `MAGNUS_GRPC_POOL_MAX_CONNS_
+  PER_ENDPOINT` (64 `_CEILING`/4 `_DEFAULT`, new `grpc_pool_max_conns_
+  per_endpoint` directive). All three new directives are config-file
+  only, no `--flag` mirror — the same precedent `cache_max_entries` et
+  al. (2.1.0) already set.
+
+  The three new directives split cleanly into two different reload-
+  safety stories, and the difference is the interesting part of this
+  increment. `pool_max_idle_per_endpoint`/`grpc_pool_max_conns_per_
+  endpoint` are wired straight into `magnus_apply_config()` and take
+  effect on every `SIGHUP` reload, because `magnus_pool_close_all()`/
+  `magnus_fastcgi_pool_close_all()`/`magnus_grpc_pool_close_all()` are
+  already called unconditionally, on every reload, *before*
+  `magnus_apply_config()` ever reapplies a (possibly smaller) cap — an
+  idle pool is never holding a connection past a smaller ceiling taking
+  effect, because it's fully drained first regardless. `quic_max_
+  connections`, in contrast, is applied exactly once, via a new
+  `magnus_quic_configure()` call made at startup during `--config`
+  option parsing, never from `magnus_handle_reload()`'s own
+  `magnus_apply_config()` call — QUIC connections are long-lived,
+  in-flight state a reload cannot safely drain the way an idle pool
+  can, so this setting simply isn't reload-sensitive in this increment,
+  by design, and a later `SIGHUP` with a changed value is not
+  re-applied.
+
+  Verified with new range-rejection/default-value coverage in
+  `tests/test-config.c` (each of the three new directives rejects 0 and
+  one past its own `_CEILING`, and the full-config/default-config tests
+  both assert the right values land in `magnus_config_t`); no new
+  live-traffic assertion was added exercising any of the five raised
+  ceilings under actual saturation, the same choice 2.1.0's own cache/
+  body ceilings above made. See `CHANGELOG.md` 2.6.0 for the full
+  detail. `make test` x2 clean (plus a triple rerun of `test-core.sh`
+  alone to reconfirm a since-2.4.0 pre-existing reverse-proxy-cache
+  hit-count timing flake is still just that, not a regression from this
+  change) and `make sanitize` (ASan/UBSan) clean.
+
+  A repo-wide grep run while touching `magnus_config.h`'s cache-budget
+  struct comment for this increment turned up several other pre-
+  existing violations of this codebase's own "describe Magnus as
+  independently developed, never name another product" rule, scattered
+  across a handful of other files and one directory name; one directly
+  in the comment being edited was fixed in passing, the rest were left
+  untouched as out of scope for this increment and flagged separately.
 
 ## 4. Module structure
 
