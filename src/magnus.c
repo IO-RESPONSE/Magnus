@@ -5758,6 +5758,114 @@ magnus_h2_dispatch_static(magnus_connection_t *connection,
     }
 }
 
+/* Roadmap 1e-6+ (dispatch generalization): the route-matching decision
+ * magnus_dispatch_request() (HTTP/1.1) and magnus_h2_dispatch() (h2) each
+ * used to run as their own separate, hand-copied ~25-line loop over
+ * magnus_routes[] -- identical in every respect but syntax, since both
+ * always evaluate the exact same magnus_route_t[] against the exact same
+ * magnus_http_request_t shape (the "common internal request model" 1e-2's
+ * own comment already established for the request side; this is that
+ * same convergence applied to the routing *decision*). This struct plus
+ * magnus_route_decide() below is that loop, deduplicated: one routing
+ * decision both dispatch paths now call, so a future change to route-
+ * matching precedence, a new action type, or the literal "/proxy"
+ * prefix's own interaction with it never again needs to be kept in sync
+ * by hand across two copies.
+ *
+ * Every route action this project has ever added is decided here
+ * regardless of whether the calling protocol actually acts on it --
+ * magnus_h2_dispatch() has no branch for action=fastcgi/scgi/uwsgi
+ * (Phase 2 additions that arrived after 1e shipped, HTTP/1.1-only
+ * capabilities to date) -- it simply never reads is_fastcgi_route/
+ * is_scgi_route/is_uwsgi_route/their forward_path fields, exactly as if
+ * this function did not compute them at all: a pre-existing gap this
+ * refactor deliberately leaves exactly as it found it rather than
+ * silently growing h2's own capabilities as a side effect of a pure
+ * dispatch-decision extraction. magnus_quic_http_dispatch() (Phase 4,
+ * HTTP/3) has this identical loop a third time, in magnus_quic.c --
+ * left untouched here, since sharing this decision with it would mean
+ * exporting it across the magnus.c/magnus_quic.c translation-unit
+ * boundary, a larger structural change than what 1e-6+'s own note
+ * (generalizing 1e-1/1e-2/1e-4/1e-5, the h2 phase's sub-increments)
+ * asked for. */
+typedef struct {
+    bool is_proxy_route;
+    bool is_grpc_route;
+    bool is_fastcgi_route;
+    bool is_scgi_route;
+    bool is_uwsgi_route;
+    bool route_denied;
+    bool cache_route_enabled;
+    /* Always non-NULL: parsed->target itself when no proxy route (literal
+     * "/proxy" prefix or a matched action=proxy route) applies, so a
+     * caller that only ever reads this field when is_proxy_route is true
+     * never needs its own separate default. */
+    const char *proxy_forward_path;
+    const char *fastcgi_forward_path;
+    const char *scgi_forward_path;
+    const char *uwsgi_forward_path;
+    /* NULL unless a matched action=static route also set `root=` --
+     * roadmap 1b's per-route document-root override. */
+    const char *static_route_root;
+} magnus_route_decision_t;
+
+/* `skip_routing` is the one caller-specific input this needs: true for
+ * HTTP/1.1's admin channel (a plain, non-TLS Unix socket whose own file
+ * permissions already gate access -- magnus_dispatch_request()'s own
+ * `connection->admin_only`), which skips both the literal "/proxy" prefix
+ * and the magnus_routes[] loop entirely, exactly like the code this
+ * replaces did; h2 always passes false (an h2 connection is never the
+ * admin channel -- h2 requires TLS+ALPN, the admin channel is plain). */
+static void
+magnus_route_decide(const magnus_http_request_t *parsed,
+                    struct in_addr client_address, bool skip_routing,
+                    magnus_route_decision_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->proxy_forward_path = parsed->target;
+    if (!skip_routing && magnus_upstream_enabled
+        && strncmp(parsed->target, "/proxy", 6) == 0
+        && (parsed->target[6] == '/' || parsed->target[6] == '\0')) {
+        out->is_proxy_route = true;
+        out->proxy_forward_path = parsed->target + 6;
+    }
+    if (skip_routing) return;
+    for (size_t r = 0; r < magnus_route_count; r++) {
+        if (!magnus_route_matches(&magnus_routes[r], parsed, client_address))
+            continue;
+        switch (magnus_routes[r].action) {
+        case MAGNUS_ROUTE_ACTION_PROXY:
+            out->is_proxy_route = true;
+            out->proxy_forward_path = parsed->target;
+            out->cache_route_enabled = magnus_routes[r].cache_enabled;
+            break;
+        case MAGNUS_ROUTE_ACTION_DENY:
+            out->route_denied = true;
+            break;
+        case MAGNUS_ROUTE_ACTION_GRPC:
+            out->is_grpc_route = true;
+            break;
+        case MAGNUS_ROUTE_ACTION_FASTCGI:
+            out->is_fastcgi_route = true;
+            out->fastcgi_forward_path = parsed->target;
+            break;
+        case MAGNUS_ROUTE_ACTION_SCGI:
+            out->is_scgi_route = true;
+            out->scgi_forward_path = parsed->target;
+            break;
+        case MAGNUS_ROUTE_ACTION_UWSGI:
+            out->is_uwsgi_route = true;
+            out->uwsgi_forward_path = parsed->target;
+            break;
+        case MAGNUS_ROUTE_ACTION_STATIC:
+            if (magnus_routes[r].root_set)
+                out->static_route_root = magnus_routes[r].root;
+            break;
+        }
+        break;
+    }
+}
+
 /* Routes, then branches to either a proxied upstream request (1e-2), a
  * built-in /healthz//metrics response (1e-4), or a static-file response
  * (1e-1) -- deliberately kept close in shape to
@@ -5786,16 +5894,10 @@ static void
 magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *stream)
 {
     nghttp2_session *session = connection->h2_session;
-    bool literal_proxy_prefix;
-    bool is_proxy_route;
-    bool is_grpc_route = false;
-    bool route_denied = false;
-    bool cache_route_enabled = false;
+    magnus_route_decision_t decision;
     bool is_healthz_path;
     bool is_metrics_path;
     bool head_only;
-    const char *forward_path;
-    const char *static_route_root = NULL;
 
     if (stream->method_overflow) {
         stream->dispatched = true;
@@ -5826,36 +5928,8 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         }
     }
 
-    literal_proxy_prefix = magnus_upstream_enabled
-        && strncmp(stream->parsed.target, "/proxy", 6) == 0
-        && (stream->parsed.target[6] == '/' || stream->parsed.target[6] == '\0');
-    is_proxy_route = literal_proxy_prefix;
-    forward_path = literal_proxy_prefix ? stream->parsed.target + 6
-                                        : stream->parsed.target;
-
-    for (size_t r = 0; r < magnus_route_count; r++) {
-        if (!magnus_route_matches(&magnus_routes[r], &stream->parsed,
-                                  stream->effective_client_address))
-            continue;
-        if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
-            is_proxy_route = true;
-            forward_path = stream->parsed.target;
-            cache_route_enabled = magnus_routes[r].cache_enabled;
-        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
-            route_denied = true;
-        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
-            is_grpc_route = true;
-        } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_STATIC
-                  && magnus_routes[r].root_set) {
-            /* Roadmap 1b: not a dispatch decision (action=static falls
-             * through to the same static branch below a non-matching
-             * request gets) -- just captures a document-root override for
-             * that branch, exactly like the HTTP/1.1 path's own identical
-             * capture in magnus_dispatch_request(). */
-            static_route_root = magnus_routes[r].root;
-        }
-        break;
-    }
+    magnus_route_decide(&stream->parsed, stream->effective_client_address,
+                        false, &decision);
 
     /* Streaming (roadmap 2c-2): magnus_h2_on_frame_recv() now calls this
      * function as soon as the request HEADERS frame completes, not only
@@ -5873,7 +5947,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
      * side-effect-free duplicate work -- rate limiting below is what
      * must not run twice, and it never does, since only the committing
      * call ever reaches it. */
-    if (!is_grpc_route && !stream->request_end_stream_seen) return;
+    if (!decision.is_grpc_route && !stream->request_end_stream_seen) return;
     stream->dispatched = true;
 
     /* /healthz and /metrics stay exempt from rate limiting for the same
@@ -5890,13 +5964,13 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         return;
     }
 
-    if (route_denied) {
+    if (decision.route_denied) {
         magnus_h2_submit_status(session, stream->stream_id, "403");
         return;
     }
     head_only = strcmp(stream->parsed.method, "HEAD") == 0;
     if (strcmp(stream->parsed.method, "GET") != 0 && !head_only
-        && !is_proxy_route && !is_grpc_route) {
+        && !decision.is_proxy_route && !decision.is_grpc_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
          * the reverse proxy is the one route that has always been meant
          * to relay whatever method (and body) the client sent. */
@@ -5922,7 +5996,7 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
                               "text/plain; version=0.0.4", metrics, head_only);
         return;
     }
-    if (is_grpc_route) {
+    if (decision.is_grpc_route) {
         if (stream->body_overflow) {
             magnus_h2_submit_status(session, stream->stream_id, "413");
             return;
@@ -5930,15 +6004,16 @@ magnus_h2_dispatch(magnus_connection_t *connection, struct magnus_h2_stream *str
         magnus_h2_grpc_start(connection, stream);
         return;
     }
-    if (is_proxy_route) {
+    if (decision.is_proxy_route) {
         if (stream->body_overflow) {
             magnus_h2_submit_status(session, stream->stream_id, "413");
             return;
         }
-        magnus_h2_proxy_start(connection, stream, forward_path, cache_route_enabled);
+        magnus_h2_proxy_start(connection, stream, decision.proxy_forward_path,
+                              decision.cache_route_enabled);
         return;
     }
-    magnus_h2_dispatch_static(connection, stream, static_route_root);
+    magnus_h2_dispatch_static(connection, stream, decision.static_route_root);
 }
 
 /* Rolls `connection`'s Rapid-Reset-hardening window over to the current
@@ -11571,19 +11646,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     magnus_request_t request = {0};
     bool close_connection = parsed->close_connection;
     bool head_only = parsed->head_only;
-    bool is_proxy_route;
-    bool is_grpc_route = false;
-    bool is_fastcgi_route = false;
-    bool is_scgi_route = false;
-    bool is_uwsgi_route = false;
-    bool literal_proxy_prefix;
-    bool route_denied = false;
-    bool cache_route_enabled = false;
-    const char *proxy_forward_path;
-    const char *fastcgi_forward_path = NULL;
-    const char *scgi_forward_path = NULL;
-    const char *uwsgi_forward_path = NULL;
-    const char *static_route_root = NULL;
+    magnus_route_decision_t decision;
 
     memcpy(request.method, parsed->method, sizeof(request.method));
     memcpy(request.path, parsed->target, sizeof(request.path));
@@ -11606,55 +11669,21 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         }
     }
 
-    literal_proxy_prefix = magnus_upstream_enabled && !connection->admin_only
-        && strncmp(request.path, "/proxy", 6) == 0
-        && (request.path[6] == '/' || request.path[6] == '\0');
-    is_proxy_route = literal_proxy_prefix;
-    proxy_forward_path = literal_proxy_prefix ? request.path + 6 : request.path;
-
     /* Routes (advanced host/path/method/header/cookie/query/source-IP
      * matching -- see magnus_route.h) are evaluated in file order, first
-     * match wins, ahead of everything else below except the phase hooks.
-     * The admin channel is exempt outright, same as it already is from
-     * the literal "/proxy" prefix above -- its own routing is that
-     * socket's filesystem permissions, not this. An action=static match
-     * needs no dispatch branch of its own here: matching and being
+     * match wins, ahead of everything else below except the phase hooks
+     * -- see magnus_route_decide()'s own doc comment (roadmap 1e-6+, the
+     * shared decision magnus_h2_dispatch() now calls too). The admin
+     * channel is exempt outright (skip_routing=true below), same as it
+     * already is from the literal "/proxy" prefix -- its own routing is
+     * that socket's filesystem permissions, not this. An action=static
+     * match needs no dispatch branch of its own here: matching and being
      * neither deny nor proxy/grpc/fastcgi/scgi/uwsgi already falls
      * through to the same static-file dispatch a request with no
      * matching route at all gets, which is the point -- it lets a
-     * route's *conditions* gate access to it. Its own `root=` (roadmap
-     * 1b), if set, is still captured here -- not a dispatch decision, but
-     * a document-root override the static branch below needs to know
-     * about regardless of which dispatch path gets there. */
-    if (!connection->admin_only) {
-        for (size_t r = 0; r < magnus_route_count; r++) {
-            if (!magnus_route_matches(&magnus_routes[r], parsed,
-                                      connection->client_address))
-                continue;
-            if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_PROXY) {
-                is_proxy_route = true;
-                proxy_forward_path = request.path;
-                cache_route_enabled = magnus_routes[r].cache_enabled;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_DENY) {
-                route_denied = true;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_GRPC) {
-                is_grpc_route = true;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_FASTCGI) {
-                is_fastcgi_route = true;
-                fastcgi_forward_path = request.path;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_SCGI) {
-                is_scgi_route = true;
-                scgi_forward_path = request.path;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_UWSGI) {
-                is_uwsgi_route = true;
-                uwsgi_forward_path = request.path;
-            } else if (magnus_routes[r].action == MAGNUS_ROUTE_ACTION_STATIC
-                      && magnus_routes[r].root_set) {
-                static_route_root = magnus_routes[r].root;
-            }
-            break;
-        }
-    }
+     * route's *conditions* gate access to it. */
+    magnus_route_decide(parsed, connection->client_address,
+                        connection->admin_only, &decision);
 
     if (magnus_phase_run(&magnus_phases, MAGNUS_PHASE_INGRESS, &request) != 0
         || magnus_phase_run(&magnus_phases, MAGNUS_PHASE_ROUTE, &request) != 0) {
@@ -11680,13 +11709,14 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         return 0;
     }
 
-    if (route_denied) {
+    if (decision.route_denied) {
         magnus_prepare_response(connection, 403, "Forbidden", "text/plain",
                                 "forbidden\n", head_only, close_connection,
                                 &request);
-    } else if (strcmp(request.method, "GET") != 0 && !head_only && !is_proxy_route
-               && !is_grpc_route && !is_fastcgi_route && !is_scgi_route
-               && !is_uwsgi_route) {
+    } else if (strcmp(request.method, "GET") != 0 && !head_only
+               && !decision.is_proxy_route && !decision.is_grpc_route
+               && !decision.is_fastcgi_route && !decision.is_scgi_route
+               && !decision.is_uwsgi_route) {
         /* Static files, /healthz, and /metrics are inherently read-only;
          * the reverse proxy and the FastCGI/SCGI/uwsgi dispatch paths
          * are the routes that have always been meant to relay whatever
@@ -11727,7 +11757,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         magnus_prepare_response(connection, 404, "Not Found", "text/plain",
                                 "not found\n", head_only, close_connection,
                                 &request);
-    } else if (is_grpc_route) {
+    } else if (decision.is_grpc_route) {
         /* A real gRPC server requires HTTP/2 end to end (trailers alone
          * make it impossible over HTTP/1.1) -- explicit and immediate
          * here, per this codebase's standing convention of never silently
@@ -11745,13 +11775,13 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
                                 "gRPC requires HTTP/2 (TLS ALPN \"h2\" or "
                                 "h2c)\n", head_only, close_connection,
                                 &request);
-    } else if (is_fastcgi_route) {
+    } else if (decision.is_fastcgi_route) {
         /* Any method, with or without a body (roadmap 5a-2) -- see
          * magnus_fastcgi_build_request()'s own doc comment for how a
          * buffered request body is relayed as STDIN. */
         int start_result = magnus_fastcgi_pick_and_start(epoll_fd, connection,
                                                           &request, parsed,
-                                                          fastcgi_forward_path,
+                                                          decision.fastcgi_forward_path,
                                                           close_connection);
         if (start_result == 0) {
             /* Same "no access-log line yet" reasoning as is_proxy_route
@@ -11769,14 +11799,14 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         }
         magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
                                 "bad gateway\n", head_only, true, &request);
-    } else if (is_scgi_route) {
+    } else if (decision.is_scgi_route) {
         /* Any method, with or without a body -- see magnus_scgi_build_
          * request()'s own doc comment for why request-body support is
          * not deferred to a later increment here the way FastCGI's own
          * original 5a-1 cut deferred it. */
         int start_result = magnus_scgi_pick_and_start(epoll_fd, connection,
                                                        &request, parsed,
-                                                       scgi_forward_path,
+                                                       decision.scgi_forward_path,
                                                        close_connection);
         if (start_result == 0) {
             /* Same "no access-log line yet" reasoning as is_fastcgi_route
@@ -11794,13 +11824,13 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         }
         magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
                                 "bad gateway\n", head_only, true, &request);
-    } else if (is_uwsgi_route) {
+    } else if (decision.is_uwsgi_route) {
         /* Any method, with or without a body -- see MAGNUS_ROUTE_
          * ACTION_UWSGI's own doc comment for why this is not deferred
          * to a later increment. */
         int start_result = magnus_uwsgi_pick_and_start(epoll_fd, connection,
                                                         &request, parsed,
-                                                        uwsgi_forward_path,
+                                                        decision.uwsgi_forward_path,
                                                         close_connection);
         if (start_result == 0) {
             strncpy(connection->uwsgi_log_method, request.method,
@@ -11815,13 +11845,13 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
         }
         magnus_prepare_response(connection, 502, "Bad Gateway", "text/plain",
                                 "bad gateway\n", head_only, true, &request);
-    } else if (is_proxy_route) {
+    } else if (decision.is_proxy_route) {
         int start_result = magnus_proxy_pick_and_start(epoll_fd, connection,
                                                         &request, parsed,
-                                                        proxy_forward_path,
+                                                        decision.proxy_forward_path,
                                                         parsed->affinity_key,
                                                         close_connection,
-                                                        cache_route_enabled);
+                                                        decision.cache_route_enabled);
         if (start_result == 0) {
             /* No access-log line here: the request has not completed yet
              * (that happens later, asynchronously, once the upstream
@@ -11853,7 +11883,7 @@ magnus_dispatch_request(int epoll_fd, magnus_connection_t *connection,
     } else {
         struct stat metadata;
         int file_fd = magnus_open_static(request.path, &metadata,
-                                         static_route_root);
+                                         decision.static_route_root);
         if (file_fd >= 0)
             magnus_prepare_file_response(connection, file_fd, &metadata,
                                          head_only, close_connection, &request,

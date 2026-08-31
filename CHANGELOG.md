@@ -1,5 +1,54 @@
 # Changelog
 
+## 2.7.0
+
+### Changed
+
+- **Dispatch generalization (roadmap 1e-6+, part 1 of 3).** `magnus_
+  dispatch_request()` (HTTP/1.1) and `magnus_h2_dispatch()` (h2) each ran
+  their own hand-copied ~25-line loop over `magnus_routes[]` to decide
+  route action/denial/forward-path/cache-opt-in/static-root-override --
+  identical in every respect but syntax, since both evaluate the exact
+  same `magnus_route_t[]` against the exact same `magnus_http_request_t`
+  shape. A new `magnus_route_decision_t`/`magnus_route_decide()`
+  (magnus.c, immediately before `magnus_h2_dispatch()`) now makes that
+  decision once; both dispatch functions call it and read its fields
+  instead of maintaining their own copy of the loop. `skip_routing` (true
+  only for HTTP/1.1's admin channel) is the one caller-specific input.
+
+  Deliberately unchanged in scope: `magnus_h2_dispatch()` still has no
+  branch for action=fastcgi/scgi/uwsgi (it simply never reads those
+  decision fields, exactly as the old inline loop did), and
+  `magnus_quic_http_dispatch()`'s own third copy of this same loop
+  (magnus_quic.c, HTTP/3) is left untouched -- sharing across the
+  magnus.c/magnus_quic.c translation-unit boundary is a larger
+  structural change than this pass asked for.
+
+  Pure refactor, no intended behavior change. Verified with `make test`
+  (twice, clean). `make sanitize`'s own wrapped `test-core.sh` run hit
+  the already-documented pre-existing h2 stream-flood ASan-timing flake
+  (see 2a-14/2a-15's entries below) deterministically in this
+  environment, before ever reaching anything this change touches -- so,
+  following that same established precedent, verification instead used
+  a direct live run of the ASan/UBSan-instrumented build against all 7
+  route actions (static/proxy/grpc/deny/fastcgi/scgi/uwsgi) plus 404 and
+  405, over both HTTP/1.1 and h2c (`--http2-prior-knowledge`), including
+  a clean shutdown with leak detection on: zero ASan/UBSan findings.
+
+  Incidentally found while doing that live verification, left untouched
+  as out of scope for this change (pre-existing code this refactor does
+  not touch): `magnus_h2_submit_status()` and `magnus_h2_dispatch_
+  static()`'s early-return branches never call `magnus_access_log()` or
+  increment `magnus_requests_total`/`magnus_responses_4xx`/`magnus_
+  responses_5xx`, unlike every other dispatch path in this codebase --
+  so a static 200/404, a `deny` 403, a 405, and gRPC's h1.1-only 505
+  currently go completely unlogged and uncounted when served over h2.
+  See docs/development-roadmap.md's 1e-6+ entry.
+
+  Version: 2.6.0 -> 2.7.0 (MINOR, per this project's versioning policy:
+  not an engine change, and not a security/bug fix even though
+  behavior-preserving, so MINOR rather than MAJOR or PATCH).
+
 ## 2.6.0
 
 ### Added

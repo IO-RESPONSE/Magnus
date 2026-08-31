@@ -466,13 +466,45 @@ checkpoint from the prior sub-phase being green.
      plain listener is completely unaffected; `make sanitize`
      (ASan+UBSan) green against this exact live traffic across ~24
      connections cycling both entry points with no fd or memory leaks.
+   - **1e-6+ — dispatch generalization (done, 2.7.0).** `magnus_dispatch_
+     request()` (HTTP/1.1) and `magnus_h2_dispatch()` (h2) each ran their
+     own hand-copied ~25-line loop over `magnus_routes[]` -- identical in
+     every respect but syntax, since both evaluate the exact same
+     `magnus_route_t[]` against the exact same `magnus_http_request_t`
+     shape (the "common internal request model" 1e-2's own comment already
+     established for the request side; this is that same convergence
+     applied to the routing *decision*). Deduplicated into one shared
+     `magnus_route_decision_t`/`magnus_route_decide()` (magnus.c, right
+     before `magnus_h2_dispatch()`) that both call, taking the one
+     caller-specific input each needs (`skip_routing`, true only for
+     HTTP/1.1's admin channel) -- a future change to route-matching
+     precedence, a new action type, or the literal "/proxy" prefix's own
+     interaction with it never again needs to be kept in sync by hand
+     across two copies. Every route action is decided regardless of
+     whether the calling protocol acts on it -- `magnus_h2_dispatch()`
+     still has no branch for action=fastcgi/scgi/uwsgi, simply never
+     reading those fields, exactly as before this refactor -- and
+     `magnus_quic_http_dispatch()` (Phase 4, HTTP/3, magnus_quic.c) keeps
+     its own third copy untouched, since sharing across the magnus.c/
+     magnus_quic.c translation-unit boundary is a larger structural change
+     than this pass asked for. Pure refactor, no behavior change: verified
+     via `make test` (x2, clean) and a direct live ASan/UBSan run (the
+     known pre-existing h2 stream-flood ASan-timing flake, see 2a-14/
+     2a-15, reproduced deterministically here and was hit before test-
+     core.sh could reach anything new, so `make sanitize`'s own wrapped
+     run was skipped in favor of exercising the ASan/UBSan build directly)
+     against all 7 route actions plus 404/405, over both HTTP/1.1 and h2c.
+     Incidentally found, left untouched as out of scope: `magnus_h2_
+     submit_status()` and the early-return branches of `magnus_h2_
+     dispatch_static()` (pre-existing code, not touched by this refactor)
+     never call `magnus_access_log()` or increment `magnus_requests_
+     total`/`magnus_responses_4xx`/`magnus_responses_5xx` -- unlike every
+     other dispatch path in this codebase (HTTP/1.1's `magnus_prepare_
+     response()`, and h2's own proxy/grpc/fastcgi-style completion
+     functions) -- so a static 200/404, a `deny` 403, a 405, and gRPC's
+     h1.1-only 505 currently go completely unlogged and uncounted on h2.
    - **1e-6+ — remaining.** Response trailers; WebSocket-over-h2 (extended
-     CONNECT); and generalizing 1e-1/1e-2/1e-4/1e-5's still-
-     protocol-specific dispatch functions into the master prompt's actual
-     unified HTTP/1↔HTTP/2 request-model abstraction (Section 3.1) that
-     routing/proxy code can stay fully agnostic against, now that a
-     static, a proxy, and a built-in-endpoint path all exist to
-     generalize from.
+     CONNECT).
 
 Each sub-phase's own checkpoint report will name its new tests, confirm
 `make`/`make test`/`make sanitize` are green, and give the size/behavior
